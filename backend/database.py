@@ -1692,8 +1692,8 @@ def compute_project_kpis(project_id: str) -> Dict[str, Any]:
             row = con.execute("""
                 SELECT 
                     COUNT(*) as total_skus,
-                    SUM(i.on_hand * i.purchase_price) as total_inventory_value,
-                    SUM(i.order_now * i.purchase_price) as total_order_value,
+                    COALESCE(SUM(i.on_hand * COALESCE(NULLIF(i.purchase_price, 0.0), i.sales_price, 0.0)), 0.0) as total_inventory_value,
+                    COALESCE(SUM(i.order_now * COALESCE(NULLIF(i.purchase_price, 0.0), i.sales_price, 0.0)), 0.0) as total_order_value,
                     SUM(CASE WHEN i.days_of_supply > 90 THEN (i.days_of_supply - 90) * (i.purchase_price * i.mean_daily_demand) ELSE 0 END) as total_overstock,
                     SUM(CASE WHEN i.days_of_supply < 14 THEN (14 - i.days_of_supply) * (i.sales_price * i.mean_daily_demand) ELSE 0 END) as total_stockout_loss,
                     SUM(CASE WHEN i.model_type = 'zero' THEN i.on_hand * i.purchase_price ELSE 0 END) as total_dead_inv,
