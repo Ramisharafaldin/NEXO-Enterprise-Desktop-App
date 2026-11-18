@@ -1,6 +1,10 @@
 import sys, os
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import database as db
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+try:
+    from backend import database as db
+except (ImportError, ModuleNotFoundError):
+    import database as db
 
 projs = db.list_projects()
 print('Projects count:', len(projs))

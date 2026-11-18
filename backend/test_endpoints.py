@@ -373,9 +373,11 @@ async def run_tests():
         print(f'19. Multi-Project DuckDB Persistence & Restart PASSED (New project {new_proj_id} + rows completely restored from disk)')
 
         # 20. 25,000-Row Direct DuckDB Stream Ingestion Benchmark (< 3s & exact sums)
+        bench_tag = uuid.uuid4().hex[:6]
+        bench_prefix = f"SKU_B_{bench_tag}"
         bench_lines = ["CODE,LOCA,SALE_DATE,QTY_SOLD,REVENUE"]
         for i in range(25000):
-            sku = f"SKU_BENCH_{i % 100}"
+            sku = f"{bench_prefix}_{i % 100}"
             day = (i % 28) + 1
             bench_lines.append(f"{sku},Main Warehouse,2026-03-{day:02d},2.0,100.0")
         bench_csv_bytes = "\n".join(bench_lines).encode("utf-8")
@@ -396,20 +398,20 @@ async def run_tests():
 
         con_bench = get_connection()
         try:
-            ds_bench = con_bench.execute("""
+            ds_bench = con_bench.execute(f"""
                 SELECT COUNT(*), SUM(qty_sold), SUM(revenue)
                 FROM daily_sales
-                WHERE project_id = ? AND item_code LIKE 'SKU_BENCH_%'
+                WHERE project_id = ? AND item_code LIKE '{bench_prefix}_%'
             """, (pid,)).fetchone()
             assert ds_bench[0] == 25000, f"Expected 25,000 daily_sales records, found {ds_bench[0]}"
             assert abs(ds_bench[1] - 50000.0) < 1e-4, f"Expected 50000.0 total qty, got {ds_bench[1]}"
             assert abs(ds_bench[2] - 2500000.0) < 1e-4, f"Expected 2500000.0 total rev, got {ds_bench[2]}"
 
-            p_bench = con_bench.execute("""
+            p_bench = con_bench.execute(f"""
                 SELECT COUNT(DISTINCT i.code), SUM(p.actual), SUM(p.revenue)
                 FROM periods p
                 JOIN items i ON p.item_id = i.id
-                WHERE p.project_id = ? AND i.code LIKE 'SKU_BENCH_%' AND p.date = '2026-03'
+                WHERE p.project_id = ? AND i.code LIKE '{bench_prefix}_%' AND p.date = '2026-03'
             """, (pid,)).fetchone()
             assert p_bench[0] == 100, f"Expected 100 distinct SKUs in periods, got {p_bench[0]}"
             assert abs(p_bench[1] - 50000.0) < 1e-4, f"Expected 50000.0 aggregated actual, got {p_bench[1]}"
@@ -419,7 +421,36 @@ async def run_tests():
 
         print(f'20. 25,000-Row Direct DuckDB Stream Ingestion Benchmark PASSED (Processed in {bench_duration:.3f}s, Throughput: {25000/bench_duration:,.0f} rows/s, Exact Aggregation Verified)')
 
-        print('\n=== ALL 20 BACKEND & DATA HUB ENDPOINTS TESTED AND VERIFIED 100% OPERATIONAL! ===')
+        # 21. Live Upload & DuckDB Ingestion Progress Polling Test (GET /api/files/import-progress/{job_id})
+        test_job_id = f"job_test_{uuid.uuid4().hex[:8]}"
+        # Querying uninitialized job returns initial 45% running state
+        r_init = await client.get(f'/api/files/import-progress/{test_job_id}')
+        assert r_init.status_code == 200, f"Progress endpoint failed: {r_init.text}"
+        init_json = r_init.json()
+        assert init_json['percent'] == 45
+        assert init_json['status'] == 'running'
+
+        # Trigger import-typed with job_id
+        csv_sample = "CODE,LOCA,SALE_DATE,QTY_SOLD,REVENUE\nSKU_PROG_1,Wh1,2026-04-01,10.0,500.0".encode("utf-8")
+        r_import = await client.post(
+            '/api/files/import-typed',
+            files={'file': ('progress_test.csv', csv_sample, 'text/csv')},
+            data={'import_type': 'sales', 'project_id': pid, 'merge_mode': 'merge', 'job_id': test_job_id}
+        )
+        assert r_import.status_code == 200, f"Import with job_id failed: {r_import.text}"
+
+        # Progress should now be 100% done
+        r_done = await client.get(f'/api/files/import-progress/{test_job_id}')
+        assert r_done.status_code == 200, f"Progress polling failed: {r_done.text}"
+        done_json = r_done.json()
+        assert done_json['percent'] == 100, f"Expected 100%, got {done_json['percent']}"
+        assert done_json['status'] == 'done', f"Expected status 'done', got {done_json['status']}"
+        assert 'اكتمل الاستيراد بنجاح' in done_json['stage_ar']
+        assert done_json['rows_processed'] == 1
+
+        print(f'21. Live Upload & DuckDB Ingestion Progress Polling PASSED (Job {test_job_id} tracked to 100% done)')
+
+        print('\n=== ALL 21 BACKEND & DATA HUB ENDPOINTS TESTED AND VERIFIED 100% OPERATIONAL! ===')
 
 if __name__ == '__main__':
     asyncio.run(run_tests())

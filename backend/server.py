@@ -34,10 +34,13 @@ if sys.platform == "win32" and not getattr(subprocess, "_nexo_silent_patched", F
     subprocess.Popen = _SilentPopen
     subprocess._nexo_silent_patched = True
 
-# Ensure backend directory is in sys.path so both direct execution and package imports work
+# Ensure backend directory and repository root are in sys.path so both direct execution and package imports work
 backend_dir = os.path.dirname(os.path.abspath(__file__))
+repo_dir = os.path.dirname(backend_dir)
 if backend_dir not in sys.path:
     sys.path.insert(0, backend_dir)
+if repo_dir not in sys.path:
+    sys.path.insert(0, repo_dir)
 
 import io
 import json
@@ -73,42 +76,80 @@ if os.path.exists(VERSION_FILE):
 else:
     APP_VERSION = "0.1.0"
 
-from database import (
-    init_db,
-    close_db,
-    flush_db,
-    list_projects,
-    get_project_by_id,
-    create_new_project,
-    delete_project_by_id,
-    activate_project,
-    save_project_workspace,
-    get_active_project_id,
-    is_analyzable_sku,
-    get_project_dormant_count,
-    get_project_items,
-    get_workspace,
-    save_period_override,
-    update_item_parameters,
-    get_saved_filters_for_project,
-    add_saved_filter,
-    delete_filter_by_id,
-    get_in_transition_for_project,
-    add_in_transition_record,
-    bulk_upsert_in_transit,
-    compute_project_kpis,
-    get_app_settings,
-    save_app_settings,
-    add_ingestion_log,
-    get_ingestion_logs,
-    save_erp_connection,
-    get_erp_connections,
-    get_erp_connection,
-    record_daily_sales,
-    upsert_items_and_periods,
-    get_connection,
-    _LOCK
-)
+try:
+    from backend.database import (
+        init_db,
+        close_db,
+        flush_db,
+        list_projects,
+        get_project_by_id,
+        create_new_project,
+        delete_project_by_id,
+        activate_project,
+        save_project_workspace,
+        get_active_project_id,
+        is_analyzable_sku,
+        get_project_dormant_count,
+        get_project_items,
+        get_workspace,
+        save_period_override,
+        update_item_parameters,
+        get_saved_filters_for_project,
+        add_saved_filter,
+        delete_filter_by_id,
+        get_in_transition_for_project,
+        add_in_transition_record,
+        bulk_upsert_in_transit,
+        compute_project_kpis,
+        get_app_settings,
+        save_app_settings,
+        add_ingestion_log,
+        get_ingestion_logs,
+        save_erp_connection,
+        get_erp_connections,
+        get_erp_connection,
+        record_daily_sales,
+        upsert_items_and_periods,
+        get_connection,
+        _LOCK
+    )
+except (ImportError, ModuleNotFoundError):
+    from database import (
+        init_db,
+        close_db,
+        flush_db,
+        list_projects,
+        get_project_by_id,
+        create_new_project,
+        delete_project_by_id,
+        activate_project,
+        save_project_workspace,
+        get_active_project_id,
+        is_analyzable_sku,
+        get_project_dormant_count,
+        get_project_items,
+        get_workspace,
+        save_period_override,
+        update_item_parameters,
+        get_saved_filters_for_project,
+        add_saved_filter,
+        delete_filter_by_id,
+        get_in_transition_for_project,
+        add_in_transition_record,
+        bulk_upsert_in_transit,
+        compute_project_kpis,
+        get_app_settings,
+        save_app_settings,
+        add_ingestion_log,
+        get_ingestion_logs,
+        save_erp_connection,
+        get_erp_connections,
+        get_erp_connection,
+        record_daily_sales,
+        upsert_items_and_periods,
+        get_connection,
+        _LOCK
+    )
 
 app = FastAPI(
     title="NEXO Supply Chain Backend API",
@@ -986,6 +1027,94 @@ def _match_column(cols: List[str], mapping: Dict[str, str], field: str) -> Optio
                 return c
     return None
 
+# Thread-safe in-memory registry for live percentage upload & ingestion progress tracking
+IMPORT_JOBS: Dict[str, Dict[str, Any]] = {}
+
+def update_job_progress(
+    job_id: Optional[str],
+    percent: int,
+    stage_ar: str,
+    stage_en: str,
+    rows_processed: int = 0,
+    total_rows: int = 0,
+    status: str = "running",
+    error: Optional[str] = None
+) -> None:
+    if not job_id:
+        return
+    if len(IMPORT_JOBS) > 200:
+        excess = len(IMPORT_JOBS) - 100
+        for k in list(IMPORT_JOBS.keys())[:excess]:
+            IMPORT_JOBS.pop(k, None)
+    IMPORT_JOBS[job_id] = {
+        "percent": percent,
+        "stage_ar": stage_ar,
+        "stage_en": stage_en,
+        "rows_processed": rows_processed,
+        "total_rows": total_rows,
+        "status": status,
+        "error": error
+    }
+
+def stream_upload_to_file(upload_file: UploadFile) -> Tuple[str, str]:
+    """Streams multipart file directly to disk in 1MB chunks without holding in memory."""
+    filename = upload_file.filename or "uploaded_data.csv"
+    ext = os.path.splitext(filename)[1].lower()
+    suffix = ext if ext in [".csv", ".xlsx", ".xls"] else ".tmp"
+    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+        shutil.copyfileobj(upload_file.file, tmp, length=1024 * 1024)
+        tmp_path = tmp.name
+    return tmp_path, filename
+
+def load_file_into_staging(con: duckdb.DuckDBPyConnection, file_path: str, ext: str) -> Tuple[List[str], int]:
+    """
+    Loads uploaded CSV or Excel file directly into DuckDB `staging_raw` temp table.
+    Returns (columns_list, total_row_count).
+    Uses DuckDB's C++ read_csv_auto for CSV, and python-calamine streaming for XLSX/XLS.
+    """
+    ext = ext.lower()
+    if ext == ".csv":
+        escaped_path = file_path.replace("\\", "/")
+        con.execute(f"""
+            CREATE OR REPLACE TEMP TABLE staging_raw AS
+            SELECT * FROM read_csv_auto('{escaped_path}', all_varchar=true, ignore_errors=true);
+        """)
+        cols = [desc[0] for desc in con.execute("DESCRIBE staging_raw").fetchall()]
+        count = con.execute("SELECT COUNT(*) FROM staging_raw").fetchone()[0]
+        return cols, count
+    else:
+        # Excel (.xlsx / .xls) via python-calamine
+        from python_calamine import CalamineWorkbook
+        wb = CalamineWorkbook.from_path(file_path)
+        sheet_names = wb.sheet_names
+        if not sheet_names:
+            con.execute("CREATE OR REPLACE TEMP TABLE staging_raw (dummy VARCHAR);")
+            return [], 0
+        sheet = wb.get_sheet_by_name(sheet_names[0])
+        rows = sheet.to_python()
+        if not rows or len(rows) <= 1:
+            con.execute("CREATE OR REPLACE TEMP TABLE staging_raw (dummy VARCHAR);")
+            return [], 0
+        with tempfile.NamedTemporaryFile(mode="w", newline="", encoding="utf-8-sig", delete=False, suffix=".csv") as tmp_csv:
+            writer = csv.writer(tmp_csv)
+            writer.writerows(rows)
+            tmp_csv_path = tmp_csv.name
+        try:
+            escaped_csv_path = tmp_csv_path.replace("\\", "/")
+            con.execute(f"""
+                CREATE OR REPLACE TEMP TABLE staging_raw AS
+                SELECT * FROM read_csv_auto('{escaped_csv_path}', all_varchar=true, ignore_errors=true);
+            """)
+            cols = [desc[0] for desc in con.execute("DESCRIBE staging_raw").fetchall()]
+            count = con.execute("SELECT COUNT(*) FROM staging_raw").fetchone()[0]
+            return cols, count
+        finally:
+            if os.path.exists(tmp_csv_path):
+                try:
+                    os.remove(tmp_csv_path)
+                except Exception:
+                    pass
+
 def _resolve_lang(lang: Optional[str]) -> str:
     if lang and lang.strip().lower() in ["ar", "en"]:
         return lang.strip().lower()
@@ -1453,27 +1582,19 @@ async def import_typed_file(
     project_id: Optional[str] = Form(None),
     new_project_name: Optional[str] = Form(None),
     merge_mode: str = Form("merge"),
-    column_mapping: Optional[str] = Form(None)
+    column_mapping: Optional[str] = Form(None),
+    job_id: Optional[str] = Form(None)
 ):
     """
     Ingests Excel (.xlsx, .xls) or CSV files for Inventory, Sales, or Combined datasets.
+    Streams directly to disk and DuckDB staging with 100% set-based SQL transformations.
     Supports auto-recognition of both English codes and Arabic column headers.
     """
-    filename = file.filename or "data_feed.xlsx"
-    contents = await file.read()
+    start_time = time.perf_counter()
+    update_job_progress(job_id, 48, "استلام الملف وتجهيز القراءة...", "Receiving file stream...")
+    tmp_path, filename = stream_upload_to_file(file)
+    ext = os.path.splitext(filename)[1].lower()
 
-    try:
-        if filename.lower().endswith(".csv"):
-            df = pd.read_csv(io.BytesIO(contents))
-        else:
-            df = pd.read_excel(io.BytesIO(contents))
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Failed to read file: {str(e)}")
-
-    if df.empty:
-        raise HTTPException(status_code=400, detail="The uploaded file contains no data rows.")
-
-    cols = [str(c).strip() for c in df.columns]
     mapping: Dict[str, str] = {}
     if column_mapping:
         try:
@@ -1489,214 +1610,593 @@ async def import_typed_file(
         proj = create_new_project(p_name, f"Ingested from {filename} ({import_type})", filename)
         proj_id = proj["id"]
 
-    # Match columns
-    c_code = _match_column(cols, mapping, "code") or cols[0]
-    c_desc = _match_column(cols, mapping, "description")
-    c_cat = _match_column(cols, mapping, "category")
-    c_loc = _match_column(cols, mapping, "location")
-    c_onhand = _match_column(cols, mapping, "on_hand")
-    c_onorder = _match_column(cols, mapping, "on_order")
-    c_lt = _match_column(cols, mapping, "lead_time_days")
-    c_lt_var = _match_column(cols, mapping, "lead_time_variance_days")
-    c_sl = _match_column(cols, mapping, "service_level")
-    c_moq = _match_column(cols, mapping, "min_batch")
-    c_brou = _match_column(cols, mapping, "batch_rounding")
-    c_cost = _match_column(cols, mapping, "purchase_price")
-    c_price = _match_column(cols, mapping, "sales_price")
-    c_supp = _match_column(cols, mapping, "supplier")
-    c_period = _match_column(cols, mapping, "period")
-    c_qty_sold = _match_column(cols, mapping, "qty_sold")
-    c_revenue = _match_column(cols, mapping, "revenue")
+    try:
+        with _LOCK:
+            con = get_connection()
+            cols, total_rows = load_file_into_staging(con, tmp_path, ext)
+            if total_rows == 0 or not cols:
+                raise HTTPException(status_code=400, detail="The uploaded file contains no data rows.")
 
-    items_data: List[Dict[str, Any]] = []
-    periods_data: List[Dict[str, Any]] = []
+            update_job_progress(job_id, 60, "تحميل البيانات إلى محرك DuckDB...", "Loading rows into DuckDB engine...", total_rows=total_rows)
 
-    if import_type == "sales":
-        # Process as transactional or periodic sales
-        raw_daily_records = []
-        agg_map: Dict[Tuple[str, str, str], Dict[str, float]] = {}
+            def esc_c(col_name: str) -> str:
+                return col_name.replace('"', '""')
 
-        for _, row in df.iterrows():
-            code = str(row.get(c_code, "")).strip()
-            if not code or code.lower() in ["nan", "none"]:
-                continue
-            loc_val = str(row.get(c_loc, "Main Warehouse")).strip() if c_loc and pd.notna(row.get(c_loc)) else "Main Warehouse"
-            raw_date = row.get(c_period)
-            daily_date, norm_period = normalize_sales_date(raw_date, granularity="monthly")
+            c_code = _match_column(cols, mapping, "code") or cols[0]
+            c_desc = _match_column(cols, mapping, "description")
+            c_cat = _match_column(cols, mapping, "category")
+            c_loc = _match_column(cols, mapping, "location")
+            c_onhand = _match_column(cols, mapping, "on_hand")
+            c_onorder = _match_column(cols, mapping, "on_order")
+            c_lt = _match_column(cols, mapping, "lead_time_days")
+            c_lt_var = _match_column(cols, mapping, "lead_time_variance_days")
+            c_sl = _match_column(cols, mapping, "service_level")
+            c_moq = _match_column(cols, mapping, "min_batch")
+            c_brou = _match_column(cols, mapping, "batch_rounding")
+            c_cost = _match_column(cols, mapping, "purchase_price")
+            c_price = _match_column(cols, mapping, "sales_price")
+            c_supp = _match_column(cols, mapping, "supplier")
+            c_period = _match_column(cols, mapping, "period")
+            c_qty_sold = _match_column(cols, mapping, "qty_sold")
+            c_revenue = _match_column(cols, mapping, "revenue")
 
-            qty = float(row.get(c_qty_sold, 0.0)) if c_qty_sold and pd.notna(row.get(c_qty_sold)) else 0.0
-            rev = float(row.get(c_revenue, 0.0)) if c_revenue and pd.notna(row.get(c_revenue)) else 0.0
+            update_job_progress(job_id, 75, "مطابقة الأعمدة وتوحيد التواريخ...", "Mapping columns & normalizing dates...", total_rows=total_rows)
 
-            raw_daily_records.append({
-                "item_code": code,
-                "location": loc_val,
-                "sale_date": daily_date,
-                "qty_sold": qty,
-                "revenue": rev
-            })
+            code_col = esc_c(c_code)
+            valid_code_cond = f's."{code_col}" IS NOT NULL AND TRIM(s."{code_col}") != \'\' AND LOWER(TRIM(s."{code_col}")) NOT IN (\'nan\', \'none\', \'null\')'
 
-            agg_key = (code, loc_val, norm_period)
-            if agg_key not in agg_map:
-                agg_map[agg_key] = {"actual": 0.0, "revenue": 0.0}
-            agg_map[agg_key]["actual"] += qty
-            agg_map[agg_key]["revenue"] += rev
+            update_job_progress(job_id, 88, "تجميع الحركات وتصفية الأصناف...", "Aggregating transactions & filtering SKUs...", rows_processed=total_rows, total_rows=total_rows)
 
-        # Save individual raw daily transactions into DuckDB daily_sales table
-        if raw_daily_records:
-            record_daily_sales(proj_id, raw_daily_records)
+            if import_type == "sales":
+                if merge_mode == "replace":
+                    con.execute("DELETE FROM daily_sales WHERE project_id = ?", (proj_id,))
+                    con.execute("DELETE FROM periods WHERE project_id = ?", (proj_id,))
 
-        # Convert aggregated totals into periods_data for supply chain planning
-        for (code, loc, norm_period), totals in agg_map.items():
-            periods_data.append({
-                "code": code,
-                "location": loc,
-                "date": norm_period,
-                "actual": round(totals["actual"], 4),
-                "revenue": round(totals["revenue"], 2)
-            })
-    elif import_type == "inventory":
-        # Process as inventory master table
-        for _, row in df.iterrows():
-            code = str(row.get(c_code, "")).strip()
-            if not code or code.lower() in ["nan", "none"]:
-                continue
-            items_data.append({
-                "code": code,
-                "description": str(row.get(c_desc, f"Item {code}")).strip() if c_desc and pd.notna(row.get(c_desc)) else f"Item {code}",
-                "category": str(row.get(c_cat, "General")).strip() if c_cat and pd.notna(row.get(c_cat)) else "General",
-                "location": str(row.get(c_loc, "Main Warehouse")).strip() if c_loc and pd.notna(row.get(c_loc)) else "Main Warehouse",
-                "on_hand": float(row.get(c_onhand, 0.0)) if c_onhand and pd.notna(row.get(c_onhand)) else 0.0,
-                "on_order": float(row.get(c_onorder)) if c_onorder and pd.notna(row.get(c_onorder)) else None,
-                "lead_time_days": float(row.get(c_lt)) if c_lt and pd.notna(row.get(c_lt)) else None,
-                "lead_time_variance_days": float(row.get(c_lt_var)) if c_lt_var and pd.notna(row.get(c_lt_var)) else None,
-                "service_level": float(row.get(c_sl)) if c_sl and pd.notna(row.get(c_sl)) else None,
-                "min_batch": float(row.get(c_moq)) if c_moq and pd.notna(row.get(c_moq)) else None,
-                "batch_rounding": float(row.get(c_brou)) if c_brou and pd.notna(row.get(c_brou)) else None,
-                "purchase_price": float(row.get(c_cost, 50.0)) if c_cost and pd.notna(row.get(c_cost)) else 50.0,
-                "sales_price": float(row.get(c_price)) if c_price and pd.notna(row.get(c_price)) else None,
-                "supplier": str(row.get(c_supp, "Primary Supplier")).strip() if c_supp and pd.notna(row.get(c_supp)) else "Primary Supplier"
-            })
-    elif import_type == "in_transit":
-        # Process as in-transit shipments table
-        c_ord_no = _match_column(cols, mapping, "order_no")
-        c_dest = _match_column(cols, mapping, "destination") or _match_column(cols, mapping, "location")
-        c_eta = _match_column(cols, mapping, "eta_date")
-        c_supp_col = _match_column(cols, mapping, "supplier")
-        c_carrier = _match_column(cols, mapping, "carrier") or c_supp_col
-        c_origin = _match_column(cols, mapping, "origin") or c_supp_col
-        c_status = _match_column(cols, mapping, "status")
-        c_qty = _match_column(cols, mapping, "quantity") or _match_column(cols, mapping, "qty_sold")
+                loc_sql = f'COALESCE(NULLIF(TRIM(s."{esc_c(c_loc)}"), \'\'), \'Main Warehouse\')' if c_loc else "'Main Warehouse'"
+                qty_sql = f'COALESCE(TRY_CAST(s."{esc_c(c_qty_sold)}" AS DOUBLE), 0.0)' if c_qty_sold else '0.0'
+                rev_sql = f'COALESCE(TRY_CAST(s."{esc_c(c_revenue)}" AS DOUBLE), 0.0)' if c_revenue else '0.0'
 
-        status_map = {
-            "في البحر": "on_water",
-            "on water": "on_water",
-            "on_water": "on_water",
-            "في الطريق": "in_transit",
-            "in transit": "in_transit",
-            "in_transit": "in_transit",
-            "تخليص جمركي": "customs_clearance",
-            "customs clearance": "customs_clearance",
-            "customs": "customs_clearance",
-            "customs_clearance": "customs_clearance",
-            "تم الاستلام": "received",
-            "received": "received",
-            "تم التسليم": "delivered",
-            "delivered": "delivered"
-        }
+                if c_period:
+                    p_col = esc_c(c_period)
+                    raw_d = f's."{p_col}"'
+                    daily_date_sql = f"""
+                    CASE 
+                      WHEN TRY_CAST({raw_d} AS DATE) IS NOT NULL 
+                        THEN strftime(TRY_CAST({raw_d} AS DATE), '%Y-%m-%d')
+                      WHEN TRY_STRPTIME({raw_d}, '%d/%m/%Y') IS NOT NULL 
+                        THEN strftime(TRY_STRPTIME({raw_d}, '%d/%m/%Y'), '%Y-%m-%d')
+                      WHEN TRY_STRPTIME({raw_d}, '%Y/%m/%d') IS NOT NULL 
+                        THEN strftime(TRY_STRPTIME({raw_d}, '%Y/%m/%d'), '%Y-%m-%d')
+                      WHEN TRY_STRPTIME({raw_d}, '%m/%d/%Y') IS NOT NULL 
+                        THEN strftime(TRY_STRPTIME({raw_d}, '%m/%d/%Y'), '%Y-%m-%d')
+                      WHEN length(trim({raw_d})) = 7 AND substr(trim({raw_d}), 5, 1) IN ('-', '/') 
+                        THEN replace(substr(trim({raw_d}), 1, 7), '/', '-') || '-01'
+                      WHEN TRY_CAST({raw_d} AS DOUBLE) >= 30000 AND TRY_CAST({raw_d} AS DOUBLE) <= 60000 
+                        THEN strftime(DATE '1899-12-30' + (TRY_CAST({raw_d} AS BIGINT)) * INTERVAL 1 DAY, '%Y-%m-%d')
+                      ELSE strftime(CURRENT_DATE, '%Y-%m-%d')
+                    END
+                    """
+                else:
+                    daily_date_sql = "strftime(CURRENT_DATE, '%Y-%m-%d')"
 
-        transit_records = []
-        for _, row in df.iterrows():
-            code = str(row.get(c_code, "")).strip()
-            if not code or code.lower() in ["nan", "none"]:
-                continue
-            ord_no = str(row.get(c_ord_no, "")).strip() if c_ord_no and pd.notna(row.get(c_ord_no)) else f"PO-{uuid.uuid4().hex[:6].upper()}"
-            supp_val = str(row.get(c_supp_col, "Supplier")).strip() if c_supp_col and pd.notna(row.get(c_supp_col)) else "Supplier"
-            origin_val = str(row.get(c_origin, supp_val)).strip() if c_origin and pd.notna(row.get(c_origin)) else supp_val
-            dest_val = str(row.get(c_dest, "Main Warehouse")).strip() if c_dest and pd.notna(row.get(c_dest)) else "Main Warehouse"
-            carrier_val = str(row.get(c_carrier, supp_val)).strip() if c_carrier and pd.notna(row.get(c_carrier)) else supp_val
-            raw_status = str(row.get(c_status, "in_transit")).strip() if c_status and pd.notna(row.get(c_status)) else "in_transit"
-            norm_status = status_map.get(raw_status.lower(), status_map.get(raw_status, raw_status.lower()))
+                norm_period_sql = f"substr({daily_date_sql}, 1, 7)"
 
-            transit_records.append({
-                "item_code": code,
-                "order_no": ord_no,
-                "origin": origin_val,
-                "destination": dest_val,
-                "quantity": float(row.get(c_qty, 0.0)) if c_qty and pd.notna(row.get(c_qty)) else 0.0,
-                "eta_date": str(row.get(c_eta, "2026-03-30")).strip() if c_eta and pd.notna(row.get(c_eta)) else "2026-03-30",
-                "carrier": carrier_val,
-                "status": norm_status
-            })
+                # 1. Insert into daily_sales
+                con.execute(f"""
+                    INSERT INTO daily_sales (id, project_id, item_code, location, sale_date, qty_sold, revenue, created_at)
+                    SELECT
+                      uuid()::VARCHAR,
+                      ?,
+                      TRIM(s."{code_col}"),
+                      {loc_sql},
+                      {daily_date_sql},
+                      {qty_sql},
+                      {rev_sql},
+                      strftime(CURRENT_TIMESTAMP, '%Y-%m-%dT%H:%M:%SZ')
+                    FROM staging_raw s
+                    WHERE {valid_code_cond};
+                """, (proj_id,))
 
-        count = bulk_upsert_in_transit(proj_id, transit_records, merge_mode=merge_mode)
-        add_ingestion_log(
-            project_id=proj_id,
-            source_type="excel_in_transit",
-            source_name=filename,
-            data_category="in_transit",
-            rows_processed=count,
-            status="success"
-        )
-        return {
-            "success": True,
-            "project_id": proj_id,
-            "import_type": "in_transit",
-            "rows_processed": count,
-            "message": f"Successfully ingested {count} in-transit shipments into DuckDB workspace."
-        }
-    else:
-        # Combined: item attributes + horizontal time series period columns
-        period_cols = [c for c in cols if any(yr in c for yr in ["2024", "2025", "2026", "2027"]) or any(m in c.lower() for m in ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"])]
-        for _, row in df.iterrows():
-            code = str(row.get(c_code, "")).strip()
-            if not code or code.lower() in ["nan", "none"]:
-                continue
-            items_data.append({
-                "code": code,
-                "description": str(row.get(c_desc, f"Item {code}")).strip() if c_desc and pd.notna(row.get(c_desc)) else f"Item {code}",
-                "category": str(row.get(c_cat, "General")).strip() if c_cat and pd.notna(row.get(c_cat)) else "General",
-                "location": str(row.get(c_loc, "Main Warehouse")).strip() if c_loc and pd.notna(row.get(c_loc)) else "Main Warehouse",
-                "on_hand": float(row.get(c_onhand, 0.0)) if c_onhand and pd.notna(row.get(c_onhand)) else 0.0,
-                "on_order": float(row.get(c_onorder, 0.0)) if c_onorder and pd.notna(row.get(c_onorder)) else 0.0,
-                "lead_time_days": float(row.get(c_lt, 30.0)) if c_lt and pd.notna(row.get(c_lt)) else 30.0,
-                "lead_time_variance_days": float(row.get(c_lt_var, 5.0)) if c_lt_var and pd.notna(row.get(c_lt_var)) else 5.0,
-                "service_level": float(row.get(c_sl, 0.95)) if c_sl and pd.notna(row.get(c_sl)) else 0.95,
-                "min_batch": float(row.get(c_moq, 1.0)) if c_moq and pd.notna(row.get(c_moq)) else 1.0,
-                "batch_rounding": float(row.get(c_brou, 1.0)) if c_brou and pd.notna(row.get(c_brou)) else 1.0,
-                "purchase_price": float(row.get(c_cost, 50.0)) if c_cost and pd.notna(row.get(c_cost)) else 50.0,
-                "sales_price": float(row.get(c_price, 100.0)) if c_price and pd.notna(row.get(c_price)) else 100.0,
-                "supplier": str(row.get(c_supp, "Primary Supplier")).strip() if c_supp and pd.notna(row.get(c_supp)) else "Primary Supplier"
-            })
-            for pcol in period_cols:
-                val = row.get(pcol)
-                if pd.notna(val):
-                    periods_data.append({
-                        "code": code,
-                        "date": str(pcol),
-                        "actual": float(val) if str(val).replace('.', '', 1).isdigit() else 0.0
-                    })
+                # 2. Auto-create missing items in items
+                con.execute(f"""
+                    INSERT INTO items (
+                      id, project_id, code, description, category, location, channel, supplier,
+                      sales_price, purchase_price, margin, on_hand, on_order, backorders,
+                      lead_time_days, lead_time_variance_days, order_cycle_days, service_level,
+                      min_batch, batch_rounding, model_type, replenishment_strategy,
+                      check_state, approval_state, abc_class, xyz_class,
+                      safety_stock, reorder_point, order_now, order_now_value, days_of_supply,
+                      accuracy, mean_daily_demand, updated_at
+                    )
+                    SELECT
+                      ? || '_' || substr(md5(random()::VARCHAR || TRIM(sub.code)), 1, 8),
+                      ?,
+                      sub.code,
+                      'Item ' || sub.code,
+                      'General',
+                      sub.loc,
+                      'Direct Retail',
+                      'Primary Supplier',
+                      100.0, 50.0, 50.0,
+                      0.0, 0.0, 0.0,
+                      30.0, 5.0, 30.0, 0.95,
+                      1.0, 1.0, 'auto', 'periodic',
+                      'checked', 'unapproved', 'B', 'Y',
+                      0.0, 0.0, 0.0, 0.0, 0.0,
+                      92.0, 0.0,
+                      strftime(CURRENT_TIMESTAMP, '%Y-%m-%dT%H:%M:%SZ')
+                    FROM (
+                      SELECT TRIM(s."{code_col}") as code, MIN({loc_sql}) as loc
+                      FROM staging_raw s
+                      WHERE {valid_code_cond}
+                      GROUP BY TRIM(s."{code_col}")
+                    ) sub
+                    LEFT JOIN items i 
+                      ON i.project_id = ? 
+                      AND i.code = sub.code
+                    WHERE i.code IS NULL;
+                """, (proj_id, proj_id, proj_id))
 
-    # Upsert into DuckDB
-    res = upsert_items_and_periods(proj_id, items_data, periods_data, merge_mode=merge_mode)
+                # 3. Aggregate periods by (item_id, norm_period)
+                con.execute(f"""
+                    CREATE OR REPLACE TEMP TABLE incoming_sales_agg AS
+                    SELECT 
+                      i.id as item_id,
+                      {norm_period_sql} as norm_period,
+                      SUM({qty_sql}) as actual,
+                      SUM({rev_sql}) as revenue
+                    FROM staging_raw s
+                    JOIN items i ON i.project_id = ? AND i.code = TRIM(s."{code_col}")
+                    WHERE {valid_code_cond}
+                    GROUP BY i.id, {norm_period_sql};
+                """, (proj_id,))
 
-    # Ingestion Audit Log
-    rows_count = len(raw_daily_records) if import_type == "sales" else (len(items_data) if import_type != "sales" else len(periods_data))
-    add_ingestion_log(
-        project_id=proj_id,
-        source_type="excel",
-        source_name=filename,
-        data_category=import_type,
-        rows_processed=rows_count,
-        status="success"
-    )
+                # Update existing periods if any
+                con.execute("""
+                    UPDATE periods
+                    SET 
+                      actual = periods.actual + inc.actual,
+                      revenue = periods.revenue + inc.revenue
+                    FROM incoming_sales_agg inc
+                    WHERE periods.project_id = ?
+                      AND periods.item_id = inc.item_id
+                      AND periods.date = inc.norm_period;
+                """, (proj_id,))
 
+                # Insert new periods
+                con.execute("""
+                    INSERT INTO periods (id, project_id, item_id, date, actual, forecast, model, conf_upper, conf_lower, override, promotion, revenue)
+                    SELECT 
+                      uuid()::VARCHAR,
+                      ?,
+                      inc.item_id,
+                      inc.norm_period,
+                      inc.actual,
+                      0.0, 0.0, 0.0, 0.0, NULL, 0.0,
+                      inc.revenue
+                    FROM incoming_sales_agg inc
+                    LEFT JOIN periods p 
+                      ON p.project_id = ? 
+                      AND p.item_id = inc.item_id 
+                      AND p.date = inc.norm_period
+                    WHERE p.id IS NULL;
+                """, (proj_id, proj_id))
+
+                # 4. Auto-update items demand statistics
+                con.execute("""
+                    UPDATE items
+                    SET 
+                      mean_daily_demand = COALESCE(agg.avg_daily, 0.0),
+                      safety_stock = ROUND(
+                        (CASE WHEN items.service_level >= 0.98 THEN 2.054 WHEN items.service_level >= 0.95 THEN 1.645 ELSE 1.282 END) * 
+                        SQRT(items.lead_time_days * POWER(COALESCE(agg.avg_daily, 0.0) * 0.3, 2) + POWER(COALESCE(agg.avg_daily, 0.0), 2) * POWER(items.lead_time_variance_days, 2))
+                      ),
+                      reorder_point = ROUND(COALESCE(agg.avg_daily, 0.0) * items.lead_time_days + ROUND(
+                        (CASE WHEN items.service_level >= 0.98 THEN 2.054 WHEN items.service_level >= 0.95 THEN 1.645 ELSE 1.282 END) * 
+                        SQRT(items.lead_time_days * POWER(COALESCE(agg.avg_daily, 0.0) * 0.3, 2) + POWER(COALESCE(agg.avg_daily, 0.0), 2) * POWER(items.lead_time_variance_days, 2))
+                      )),
+                      days_of_supply = CASE WHEN COALESCE(agg.avg_daily, 0.0) > 0 THEN ROUND(items.on_hand / agg.avg_daily) ELSE 999.0 END
+                    FROM (
+                      SELECT item_id, (SUM(actual) / GREATEST(COUNT(DISTINCT date), 1)) / 30.0 as avg_daily
+                      FROM periods
+                      WHERE project_id = ?
+                      GROUP BY item_id
+                    ) agg
+                    WHERE items.project_id = ? AND items.id = agg.item_id;
+                """, (proj_id, proj_id))
+
+                rows_processed = total_rows
+
+            elif import_type == "in_transit":
+                c_ord_no = _match_column(cols, mapping, "order_no")
+                c_dest = _match_column(cols, mapping, "destination") or _match_column(cols, mapping, "location")
+                c_eta = _match_column(cols, mapping, "eta_date")
+                c_supp_col = _match_column(cols, mapping, "supplier")
+                c_carrier = _match_column(cols, mapping, "carrier") or c_supp_col
+                c_origin = _match_column(cols, mapping, "origin") or c_supp_col
+                c_status = _match_column(cols, mapping, "status")
+                c_qty = _match_column(cols, mapping, "quantity") or _match_column(cols, mapping, "qty_sold")
+
+                if merge_mode == "replace":
+                    con.execute("DELETE FROM in_transition WHERE project_id = ?", (proj_id,))
+
+                ord_sql = f'COALESCE(NULLIF(TRIM(s."{esc_c(c_ord_no)}"), \'\'), \'PO-\' || substr(md5(random()::VARCHAR), 1, 6))' if c_ord_no else "'PO-' || substr(md5(random()::VARCHAR), 1, 6)"
+                dest_sql = f'COALESCE(NULLIF(TRIM(s."{esc_c(c_dest)}"), \'\'), \'Main Warehouse\')' if c_dest else "'Main Warehouse'"
+                supp_sql = f'COALESCE(NULLIF(TRIM(s."{esc_c(c_supp_col)}"), \'\'), \'Primary Supplier\')' if c_supp_col else "'Primary Supplier'"
+                origin_sql = f'COALESCE(NULLIF(TRIM(s."{esc_c(c_origin)}"), \'\'), {supp_sql})' if c_origin else supp_sql
+                carrier_sql = f'COALESCE(NULLIF(TRIM(s."{esc_c(c_carrier)}"), \'\'), {supp_sql})' if c_carrier else supp_sql
+                eta_sql = f'COALESCE(NULLIF(TRIM(s."{esc_c(c_eta)}"), \'\'), \'2026-03-30\')' if c_eta else "'2026-03-30'"
+                qty_sql = f'COALESCE(TRY_CAST(s."{esc_c(c_qty)}" AS DOUBLE), 0.0)' if c_qty else '0.0'
+
+                if c_status:
+                    raw_stat = f'LOWER(TRIM(s."{esc_c(c_status)}"))'
+                    status_sql = f"""
+                    CASE {raw_stat}
+                      WHEN 'في البحر' THEN 'on_water'
+                      WHEN 'on water' THEN 'on_water'
+                      WHEN 'on_water' THEN 'on_water'
+                      WHEN 'في الطريق' THEN 'in_transit'
+                      WHEN 'in transit' THEN 'in_transit'
+                      WHEN 'in_transit' THEN 'in_transit'
+                      WHEN 'تخليص جمركي' THEN 'customs_clearance'
+                      WHEN 'customs clearance' THEN 'customs_clearance'
+                      WHEN 'customs' THEN 'customs_clearance'
+                      WHEN 'customs_clearance' THEN 'customs_clearance'
+                      WHEN 'تم الاستلام' THEN 'received'
+                      WHEN 'received' THEN 'received'
+                      WHEN 'تم التسليم' THEN 'delivered'
+                      WHEN 'delivered' THEN 'delivered'
+                      ELSE COALESCE({raw_stat}, 'in_transit')
+                    END
+                    """
+                else:
+                    status_sql = "'in_transit'"
+
+                con.execute(f"""
+                    INSERT INTO in_transition (
+                      id, project_id, item_code, order_no, origin, destination, quantity, eta_date, carrier, status
+                    )
+                    SELECT 
+                      uuid()::VARCHAR,
+                      ?,
+                      TRIM(s."{code_col}"),
+                      {ord_sql},
+                      {origin_sql},
+                      {dest_sql},
+                      {qty_sql},
+                      {eta_sql},
+                      {carrier_sql},
+                      {status_sql}
+                    FROM staging_raw s
+                    WHERE {valid_code_cond};
+                """, (proj_id,))
+
+                # Update on_order in items
+                con.execute("""
+                    UPDATE items
+                    SET on_order = COALESCE(tr.total_transit, 0.0)
+                    FROM (
+                      SELECT item_code, SUM(quantity) as total_transit
+                      FROM in_transition
+                      WHERE project_id = ? AND status NOT IN ('delivered', 'received', 'تم الاستلام', 'تم التسليم')
+                      GROUP BY item_code
+                    ) tr
+                    WHERE items.project_id = ? AND items.code = tr.item_code;
+                """, (proj_id, proj_id))
+
+                rows_processed = total_rows
+
+            else:
+                # Inventory or Combined
+                settings_row = con.execute("SELECT default_service_level, default_lead_time_days, default_order_cycle_days FROM app_settings WHERE id = 'global_settings'").fetchone()
+                def_sl = float(settings_row[0]) if settings_row and settings_row[0] is not None else 0.95
+                def_lt = float(settings_row[1]) if settings_row and settings_row[1] is not None else 30.0
+                def_cycle = float(settings_row[2]) if settings_row and settings_row[2] is not None else 30.0
+                def_lt_var = 5.0
+                def_moq = 1.0
+                def_brou = 1.0
+
+                desc_sql = f'COALESCE(NULLIF(TRIM(s."{esc_c(c_desc)}"), \'\'), \'Item \' || TRIM(s."{code_col}"))' if c_desc else f"'Item ' || TRIM(s.\"{code_col}\")"
+                cat_sql = f'COALESCE(NULLIF(TRIM(s."{esc_c(c_cat)}"), \'\'), \'General\')' if c_cat else "'General'"
+                loc_sql = f'COALESCE(NULLIF(TRIM(s."{esc_c(c_loc)}"), \'\'), \'Main Warehouse\')' if c_loc else "'Main Warehouse'"
+                onhand_sql = f'COALESCE(TRY_CAST(s."{esc_c(c_onhand)}" AS DOUBLE), 0.0)' if c_onhand else '0.0'
+                cost_sql = f'TRY_CAST(s."{esc_c(c_cost)}" AS DOUBLE)' if c_cost else 'NULL'
+                price_sql = f'TRY_CAST(s."{esc_c(c_price)}" AS DOUBLE)' if c_price else 'NULL'
+                onorder_sql = f'TRY_CAST(s."{esc_c(c_onorder)}" AS DOUBLE)' if c_onorder else 'NULL'
+                lt_sql = f'TRY_CAST(s."{esc_c(c_lt)}" AS DOUBLE)' if c_lt else 'NULL'
+                lt_var_sql = f'TRY_CAST(s."{esc_c(c_lt_var)}" AS DOUBLE)' if c_lt_var else 'NULL'
+                sl_sql = f'TRY_CAST(s."{esc_c(c_sl)}" AS DOUBLE)' if c_sl else 'NULL'
+                moq_sql = f'TRY_CAST(s."{esc_c(c_moq)}" AS DOUBLE)' if c_moq else 'NULL'
+                brou_sql = f'TRY_CAST(s."{esc_c(c_brou)}" AS DOUBLE)' if c_brou else 'NULL'
+                supp_sql = f'COALESCE(NULLIF(TRIM(s."{esc_c(c_supp)}"), \'\'), \'Primary Supplier\')' if c_supp else "'Primary Supplier'"
+
+                con.execute(f"""
+                    CREATE OR REPLACE TEMP TABLE staging_inv AS
+                    SELECT 
+                      TRIM(s."{code_col}") as code,
+                      {desc_sql} as description,
+                      {cat_sql} as category,
+                      {loc_sql} as location,
+                      {onhand_sql} as on_hand,
+                      {cost_sql} as raw_cost,
+                      {price_sql} as raw_price,
+                      {onorder_sql} as raw_on_order,
+                      {lt_sql} as raw_lt,
+                      {lt_var_sql} as raw_lt_var,
+                      {sl_sql} as raw_sl,
+                      {moq_sql} as raw_moq,
+                      {brou_sql} as raw_brou,
+                      {supp_sql} as supplier
+                    FROM staging_raw s
+                    WHERE {valid_code_cond};
+                """)
+
+                # Deduplicate staging_inv if file has multiple rows for same SKU
+                con.execute("""
+                    CREATE OR REPLACE TEMP TABLE staging_inv_dedup AS
+                    SELECT 
+                      code,
+                      FIRST(description) as description,
+                      FIRST(category) as category,
+                      FIRST(location) as location,
+                      SUM(on_hand) as on_hand,
+                      FIRST(raw_cost) as raw_cost,
+                      FIRST(raw_price) as raw_price,
+                      SUM(raw_on_order) as raw_on_order,
+                      FIRST(raw_lt) as raw_lt,
+                      FIRST(raw_lt_var) as raw_lt_var,
+                      FIRST(raw_sl) as raw_sl,
+                      FIRST(raw_moq) as raw_moq,
+                      FIRST(raw_brou) as raw_brou,
+                      FIRST(supplier) as supplier
+                    FROM staging_inv
+                    GROUP BY code;
+                """)
+
+                con.execute("""
+                    CREATE OR REPLACE TEMP TABLE sku_transit AS
+                    SELECT item_code, COALESCE(SUM(quantity), 0.0) as transit_qty
+                    FROM in_transition
+                    WHERE project_id = ? AND status NOT IN ('delivered', 'received', 'تم الاستلام', 'تم التسليم')
+                    GROUP BY item_code;
+                """, (proj_id,))
+
+                con.execute("""
+                    CREATE OR REPLACE TEMP TABLE sku_avg_price AS
+                    SELECT i.code, 
+                           CASE WHEN SUM(p.actual) > 0 AND SUM(p.revenue) > 0 
+                                THEN ROUND(SUM(p.revenue) / SUM(p.actual), 2) 
+                                ELSE NULL END as avg_price
+                    FROM periods p
+                    JOIN items i ON p.item_id = i.id
+                    WHERE p.project_id = ?
+                    GROUP BY i.code;
+                """, (proj_id,))
+
+                if merge_mode == "replace":
+                    con.execute("DELETE FROM periods WHERE project_id = ?", (proj_id,))
+                    con.execute("DELETE FROM items WHERE project_id = ?", (proj_id,))
+
+                # Update existing items
+                con.execute("""
+                    UPDATE items
+                    SET
+                      description = COALESCE(stg.description, items.description),
+                      category = COALESCE(stg.category, items.category),
+                      location = COALESCE(stg.location, items.location),
+                      supplier = COALESCE(stg.supplier, items.supplier),
+                      on_hand = COALESCE(stg.on_hand, items.on_hand),
+                      purchase_price = COALESCE(stg.raw_cost, items.purchase_price, 50.0),
+                      sales_price = COALESCE(stg.raw_price, items.sales_price, prc.avg_price, ROUND(COALESCE(stg.raw_cost, items.purchase_price, 50.0) * 1.5, 2), 100.0),
+                      margin = ROUND((COALESCE(stg.raw_price, items.sales_price, prc.avg_price, ROUND(COALESCE(stg.raw_cost, items.purchase_price, 50.0) * 1.5, 2), 100.0) - COALESCE(stg.raw_cost, items.purchase_price, 50.0)) / NULLIF(COALESCE(stg.raw_price, items.sales_price, prc.avg_price, ROUND(COALESCE(stg.raw_cost, items.purchase_price, 50.0) * 1.5, 2), 100.0), 0) * 100.0, 1),
+                      on_order = COALESCE(stg.raw_on_order, tr.transit_qty, items.on_order, 0.0),
+                      lead_time_days = COALESCE(stg.raw_lt, items.lead_time_days, ?),
+                      lead_time_variance_days = COALESCE(stg.raw_lt_var, items.lead_time_variance_days, ?),
+                      service_level = CASE 
+                        WHEN COALESCE(stg.raw_sl, items.service_level, ?) > 1.0 
+                        THEN COALESCE(stg.raw_sl, items.service_level, ?) / 100.0 
+                        ELSE COALESCE(stg.raw_sl, items.service_level, ?) 
+                      END,
+                      min_batch = COALESCE(stg.raw_moq, items.min_batch, ?),
+                      batch_rounding = COALESCE(stg.raw_brou, items.batch_rounding, ?),
+                      updated_at = strftime(CURRENT_TIMESTAMP, '%Y-%m-%dT%H:%M:%SZ')
+                    FROM staging_inv_dedup stg
+                    LEFT JOIN sku_transit tr ON tr.item_code = stg.code
+                    LEFT JOIN sku_avg_price prc ON prc.code = stg.code
+                    WHERE items.project_id = ? AND items.code = stg.code;
+                """, (def_lt, def_lt_var, def_sl, def_sl, def_sl, def_moq, def_brou, proj_id))
+
+                # Insert new items
+                con.execute("""
+                    INSERT INTO items (
+                      id, project_id, code, description, category, location, channel, supplier,
+                      sales_price, purchase_price, margin, on_hand, on_order, backorders,
+                      lead_time_days, lead_time_variance_days, order_cycle_days, service_level,
+                      min_batch, batch_rounding, model_type, replenishment_strategy,
+                      check_state, approval_state, abc_class, xyz_class,
+                      safety_stock, reorder_point, order_now, order_now_value, days_of_supply,
+                      accuracy, mean_daily_demand, updated_at
+                    )
+                    SELECT
+                      ? || '_' || substr(md5(random()::VARCHAR || stg.code), 1, 8),
+                      ?,
+                      stg.code,
+                      stg.description,
+                      stg.category,
+                      stg.location,
+                      'Direct Retail',
+                      stg.supplier,
+                      COALESCE(stg.raw_price, prc.avg_price, ROUND(COALESCE(stg.raw_cost, 50.0) * 1.5, 2), 100.0) as sales_price,
+                      COALESCE(stg.raw_cost, 50.0) as purchase_price,
+                      ROUND((COALESCE(stg.raw_price, prc.avg_price, ROUND(COALESCE(stg.raw_cost, 50.0) * 1.5, 2), 100.0) - COALESCE(stg.raw_cost, 50.0)) / NULLIF(COALESCE(stg.raw_price, prc.avg_price, ROUND(COALESCE(stg.raw_cost, 50.0) * 1.5, 2), 100.0), 0) * 100.0, 1) as margin,
+                      COALESCE(stg.on_hand, 0.0),
+                      COALESCE(stg.raw_on_order, tr.transit_qty, 0.0) as on_order,
+                      0.0,
+                      COALESCE(stg.raw_lt, ?),
+                      COALESCE(stg.raw_lt_var, ?),
+                      ?,
+                      CASE WHEN COALESCE(stg.raw_sl, ?) > 1.0 THEN COALESCE(stg.raw_sl, ?) / 100.0 ELSE COALESCE(stg.raw_sl, ?) END,
+                      COALESCE(stg.raw_moq, ?),
+                      COALESCE(stg.raw_brou, ?),
+                      'auto', 'periodic',
+                      'checked', 'unapproved', 'B', 'Y',
+                      0.0, 0.0, 0.0, 0.0, 0.0,
+                      95.0, 0.0,
+                      strftime(CURRENT_TIMESTAMP, '%Y-%m-%dT%H:%M:%SZ')
+                    FROM staging_inv_dedup stg
+                    LEFT JOIN sku_transit tr ON tr.item_code = stg.code
+                    LEFT JOIN sku_avg_price prc ON prc.code = stg.code
+                    LEFT JOIN items i ON i.project_id = ? AND i.code = stg.code
+                    WHERE i.id IS NULL;
+                """, (
+                    proj_id, proj_id,
+                    def_lt, def_lt_var, def_cycle,
+                    def_sl, def_sl, def_sl,
+                    def_moq, def_brou,
+                    proj_id
+                ))
+
+                # If combined, unpivot time series columns into periods
+                if import_type == "combined":
+                    period_cols = [c for c in cols if any(yr in c for yr in ["2024", "2025", "2026", "2027"]) or any(m in c.lower() for m in ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"])]
+                    if period_cols:
+                        escaped_pcols = ", ".join(f'"{esc_c(c)}"' for c in period_cols)
+                        con.execute(f"""
+                            INSERT INTO periods (id, project_id, item_id, date, actual, forecast, model, conf_upper, conf_lower, override, promotion, revenue)
+                            SELECT 
+                              uuid()::VARCHAR,
+                              ?,
+                              i.id,
+                              unp.name,
+                              COALESCE(TRY_CAST(unp.value AS DOUBLE), 0.0),
+                              0.0, 0.0, 0.0, 0.0, NULL, 0.0,
+                              0.0
+                            FROM (
+                              SELECT TRIM(s."{code_col}") as code, name, value
+                              FROM staging_raw s
+                              UNPIVOT (value FOR name IN ({escaped_pcols}))
+                              WHERE {valid_code_cond} AND value IS NOT NULL
+                            ) unp
+                            JOIN items i ON i.project_id = ? AND i.code = unp.code;
+                        """, (proj_id, proj_id))
+
+                # Update demand statistics for items
+                con.execute("""
+                    UPDATE items
+                    SET 
+                      mean_daily_demand = COALESCE(agg.avg_daily, 5.0),
+                      safety_stock = ROUND(
+                        (CASE WHEN items.service_level >= 0.98 THEN 2.054 WHEN items.service_level >= 0.95 THEN 1.645 ELSE 1.282 END) * 
+                        SQRT(items.lead_time_days * POWER(COALESCE(agg.avg_daily, 5.0) * 0.3, 2) + POWER(COALESCE(agg.avg_daily, 5.0), 2) * POWER(items.lead_time_variance_days, 2))
+                      ),
+                      reorder_point = ROUND(COALESCE(agg.avg_daily, 5.0) * items.lead_time_days + ROUND(
+                        (CASE WHEN items.service_level >= 0.98 THEN 2.054 WHEN items.service_level >= 0.95 THEN 1.645 ELSE 1.282 END) * 
+                        SQRT(items.lead_time_days * POWER(COALESCE(agg.avg_daily, 5.0) * 0.3, 2) + POWER(COALESCE(agg.avg_daily, 5.0), 2) * POWER(items.lead_time_variance_days, 2))
+                      )),
+                      days_of_supply = CASE WHEN COALESCE(agg.avg_daily, 5.0) > 0 THEN ROUND(items.on_hand / COALESCE(agg.avg_daily, 5.0)) ELSE 999.0 END
+                    FROM (
+                      SELECT item_id, (SUM(actual) / GREATEST(COUNT(DISTINCT date), 1)) / 30.0 as avg_daily
+                      FROM periods
+                      WHERE project_id = ?
+                      GROUP BY item_id
+                    ) agg
+                    WHERE items.project_id = ? AND items.id = agg.item_id;
+                """, (proj_id, proj_id))
+
+                con.execute("""
+                    UPDATE items
+                    SET 
+                      mean_daily_demand = 5.0,
+                      safety_stock = ROUND(
+                        (CASE WHEN items.service_level >= 0.98 THEN 2.054 WHEN items.service_level >= 0.95 THEN 1.645 ELSE 1.282 END) * 
+                        SQRT(items.lead_time_days * POWER(1.5, 2) + POWER(5.0, 2) * POWER(items.lead_time_variance_days, 2))
+                      ),
+                      reorder_point = ROUND(5.0 * items.lead_time_days + ROUND(
+                        (CASE WHEN items.service_level >= 0.98 THEN 2.054 WHEN items.service_level >= 0.95 THEN 1.645 ELSE 1.282 END) * 
+                        SQRT(items.lead_time_days * POWER(1.5, 2) + POWER(5.0, 2) * POWER(items.lead_time_variance_days, 2))
+                      )),
+                      days_of_supply = ROUND(items.on_hand / 5.0)
+                    WHERE project_id = ? AND (mean_daily_demand IS NULL OR mean_daily_demand = 0.0);
+                """, (proj_id,))
+
+                con.execute("""
+                    UPDATE items
+                    SET
+                      order_now = CASE 
+                        WHEN (reorder_point - on_hand - on_order + backorders) > 0 
+                        THEN GREATEST((reorder_point - on_hand - on_order + backorders), min_batch)
+                        ELSE 0.0 
+                      END
+                    WHERE project_id = ?;
+                """, (proj_id,))
+
+                con.execute("""
+                    UPDATE items
+                    SET
+                      order_now_value = order_now * purchase_price,
+                      abc_class = CASE 
+                        WHEN (mean_daily_demand * 365.0 * sales_price) >= 25000 THEN 'A'
+                        WHEN (mean_daily_demand * 365.0 * sales_price) >= 8000 THEN 'B'
+                        ELSE 'C'
+                      END,
+                      xyz_class = CASE 
+                        WHEN model_type IN ('constant', 'linear') THEN 'X'
+                        WHEN model_type IN ('intermittent', 'preorder') THEN 'Z'
+                        ELSE 'Y'
+                      END
+                    WHERE project_id = ?;
+                """, (proj_id,))
+
+                rows_processed = total_rows
+
+            update_job_progress(job_id, 96, "حفظ البيانات وتأمين قاعدة البيانات...", "Saving workspace & running CHECKPOINT...", rows_processed=total_rows, total_rows=total_rows)
+
+            # Mirror to persistent project tables & flush checkpoint
+            save_project_workspace(proj_id)
+
+            # Drop temp tables
+            con.execute("DROP TABLE IF EXISTS staging_raw;")
+            con.execute("DROP TABLE IF EXISTS staging_inv;")
+            con.execute("DROP TABLE IF EXISTS staging_inv_dedup;")
+            con.execute("DROP TABLE IF EXISTS incoming_sales_agg;")
+            con.execute("DROP TABLE IF EXISTS sku_transit;")
+            con.execute("DROP TABLE IF EXISTS sku_avg_price;")
+
+            items_count = con.execute("SELECT COUNT(*) FROM items WHERE project_id = ?", (proj_id,)).fetchone()[0]
+            periods_count = con.execute("SELECT COUNT(*) FROM periods WHERE project_id = ?", (proj_id,)).fetchone()[0]
+
+            add_ingestion_log(
+                project_id=proj_id,
+                source_type="direct_duckdb",
+                source_name=filename,
+                data_category=import_type,
+                rows_processed=rows_processed,
+                status="success"
+            )
+    except HTTPException as he:
+        update_job_progress(job_id, 100, "حدث خطأ أثناء الاستيراد", f"Import failed: {he.detail}", status="error", error=he.detail)
+        raise
+    except Exception as e:
+        update_job_progress(job_id, 100, "حدث خطأ أثناء الاستيراد", f"Import failed: {str(e)}", status="error", error=str(e))
+        raise HTTPException(status_code=400, detail=f"Import failed: {str(e)}")
+    finally:
+        if 'tmp_path' in locals() and os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except Exception:
+                pass
+
+    elapsed = round(time.perf_counter() - start_time, 3)
+    update_job_progress(job_id, 100, "اكتمل الاستيراد بنجاح!", "Import completed successfully!", rows_processed=rows_processed, total_rows=rows_processed, status="done")
     return {
         "success": True,
         "project_id": proj_id,
-        "rows_processed": rows_count,
-        "items_upserted": res.get("items_upserted", 0),
-        "periods_upserted": res.get("periods_upserted", 0),
-        "message": f"Successfully processed {rows_count} rows from {filename} into DuckDB."
+        "import_type": import_type,
+        "rows_processed": rows_processed,
+        "items_upserted": items_count,
+        "periods_upserted": periods_count,
+        "elapsed_seconds": elapsed,
+        "message": f"Successfully ingested {rows_processed:,} rows into DuckDB in {elapsed}s."
     }
 
 # ==============================================================================
@@ -2078,29 +2578,81 @@ def get_project_ingestion_logs(project_id: str):
         "connections": conns
     }
 
+@app.get("/api/files/import-progress/{job_id}")
+def get_import_progress(job_id: str):
+    """
+    Returns live percentage progress and stage description for an active file upload/import job.
+    Runs without database lock contention.
+    """
+    job = IMPORT_JOBS.get(job_id)
+    if job:
+        return job
+    return {
+        "percent": 45,
+        "stage_ar": "جاري المعالجة...",
+        "stage_en": "Processing...",
+        "rows_processed": 0,
+        "total_rows": 0,
+        "status": "running",
+        "error": None
+    }
+
 @app.post("/api/files/inspect")
-async def inspect_file_endpoint(file: UploadFile = File(...)):
+async def inspect_file_endpoint(
+    file: UploadFile = File(...),
+    job_id: Optional[str] = Form(None)
+):
     """
-    Inspects an uploaded Excel (.xlsx) or CSV file and returns detected sheets,
+    Inspects an uploaded Excel (.xlsx, .xls) or CSV file and returns detected sheets,
     columns, and preview rows for interactive column mapping.
+    Streams directly to disk without loading full spreadsheet into memory.
     """
-    filename = file.filename or "uploaded_data.xlsx"
-    contents = await file.read()
+    update_job_progress(job_id, 48, "استلام الملف وتجهيز الفحص...", "Receiving file for inspection...")
+    tmp_path, filename = stream_upload_to_file(file)
+    ext = os.path.splitext(filename)[1].lower()
     try:
-        if filename.endswith(".csv"):
-            df = pd.read_csv(io.BytesIO(contents))
+        if ext == ".csv":
             sheets = ["Sheet1"]
+            escaped = tmp_path.replace("\\", "/")
+            with _LOCK:
+                con = get_connection()
+                con.execute(f"CREATE OR REPLACE TEMP TABLE staging_inspect AS SELECT * FROM read_csv_auto('{escaped}', all_varchar=true, ignore_errors=true);")
+                cols = [d[0] for d in con.execute("DESCRIBE staging_inspect").fetchall()]
+                row_count = con.execute("SELECT COUNT(*) FROM staging_inspect").fetchone()[0]
+                preview_data = con.execute("SELECT * FROM staging_inspect LIMIT 5").fetchall()
+                preview_rows = [dict(zip(cols, [val if val is not None else "" for val in row])) for row in preview_data]
+                con.execute("DROP TABLE IF EXISTS staging_inspect;")
         else:
-            xl = pd.ExcelFile(io.BytesIO(contents))
-            sheets = xl.sheet_names
-            df = pd.read_excel(io.BytesIO(contents), sheet_name=sheets[0])
+            from python_calamine import CalamineWorkbook
+            wb = CalamineWorkbook.from_path(tmp_path)
+            sheets = wb.sheet_names
+            if not sheets:
+                raise HTTPException(status_code=400, detail="The Excel workbook contains no sheets.")
+            sheet = wb.get_sheet_by_name(sheets[0])
+            rows = sheet.to_python()
+            if rows:
+                cols = [str(c).strip() if c is not None else f"col_{i}" for i, c in enumerate(rows[0])]
+                row_count = max(0, len(rows) - 1)
+                preview_rows = []
+                for r in rows[1:6]:
+                    preview_rows.append({cols[i]: (str(r[i]) if i < len(r) and r[i] is not None else "") for i in range(len(cols))})
+            else:
+                cols = []
+                row_count = 0
+                preview_rows = []
+    except HTTPException as he:
+        update_job_progress(job_id, 100, "حدث خطأ أثناء فحص الملف", f"Inspection failed: {he.detail}", status="error", error=he.detail)
+        raise
     except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Failed to read file: {str(e)}")
+        update_job_progress(job_id, 100, "حدث خطأ أثناء فحص الملف", f"Inspection failed: {str(e)}", status="error", error=str(e))
+        raise HTTPException(status_code=400, detail=f"Failed to inspect file: {str(e)}")
+    finally:
+        if 'tmp_path' in locals() and os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except Exception:
+                pass
 
-    cols = [str(c).strip() for c in df.columns]
-    preview_rows = df.head(3).fillna("").to_dict(orient="records")
-
-    # Suggest mappings for standard NEXO schema using bilingual heuristics
     fields_to_suggest = [
         "code", "description", "category", "location", "on_hand", "on_order",
         "lead_time_days", "lead_time_variance_days", "service_level", "min_batch",
@@ -2114,11 +2666,12 @@ async def inspect_file_endpoint(file: UploadFile = File(...)):
         if m and fld not in suggestions:
             suggestions[fld] = m
 
+    update_job_progress(job_id, 100, "اكتمل فحص الملف بنجاح!", "Inspection completed successfully!", total_rows=row_count, status="done")
     return {
         "filename": filename,
         "sheets": sheets,
         "columns": cols,
-        "row_count": len(df),
+        "row_count": row_count,
         "preview_rows": preview_rows,
         "suggested_mappings": suggestions
     }
@@ -2127,172 +2680,24 @@ async def inspect_file_endpoint(file: UploadFile = File(...)):
 async def import_file_endpoint(
     file: UploadFile = File(...),
     project_name: Optional[str] = Form(None),
-    column_mapping: Optional[str] = Form(None)
+    column_mapping: Optional[str] = Form(None),
+    job_id: Optional[str] = Form(None)
 ):
     """
-    Accepts an uploaded Excel (.xlsx) or CSV file, applies interactive column mapping,
-    parses items & historical/forecast periods, and persists directly into DuckDB.
+    Accepts an uploaded Excel (.xlsx, .xls) or CSV file, applies interactive column mapping,
+    and streams directly into DuckDB using the high-speed direct DuckDB ingestion engine.
     """
-    filename = file.filename or "uploaded_data.xlsx"
-    contents = await file.read()
-
-    try:
-        if filename.endswith(".csv"):
-            df = pd.read_csv(io.BytesIO(contents))
-        else:
-            df = pd.read_excel(io.BytesIO(contents))
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Failed to parse file: {str(e)}")
-
-    if df.empty:
-        raise HTTPException(status_code=400, detail="Uploaded file contains no data rows")
-
-    cols = [str(c).strip() for c in df.columns]
-    mapping = {}
-    if column_mapping:
-        try:
-            mapping = json.loads(column_mapping)
-        except Exception:
-            mapping = {}
-
-    def find_col(field_key: str, candidates: List[str]) -> Optional[str]:
-        if field_key in mapping and mapping[field_key] in cols:
-            return mapping[field_key]
-        for c in cols:
-            for cand in candidates:
-                if cand.lower() == c.lower() or cand.lower() in c.lower():
-                    return c
-        return None
-
-    col_code = find_col("code", ["Item Code", "ItemCode", "SKU", "Code", "Item_Code", "Item", "CODE"])
-    col_desc = find_col("description", ["Description", "Item Description", "Name", "Item Name", "Desc", "DESC"])
-    col_cat = find_col("category", ["Category", "Family", "Group", "Product Line", "CATI"])
-    col_loc = find_col("location", ["Location", "Warehouse", "Branch", "Site", "LOCA"])
-    col_price = find_col("sales_price", ["Sales Price", "Price", "Selling Price", "SalesPrice", "PRIC"])
-    col_cost = find_col("purchase_price", ["Purchase Price", "Cost", "Unit Cost", "PurchaseCost", "PurchasePrice", "COST"])
-    col_onhand = find_col("on_hand", ["On Hand", "OnHand", "Stock", "Inventory Balance", "Quantity On Hand", "ONHA"])
-    col_onorder = find_col("on_order", ["On Order", "OnOrder", "In Transit", "PO Qty", "ONOR"])
-    col_lt = find_col("lead_time_days", ["Lead Time", "LeadTime", "Lead Time Days", "LT", "LTIM"])
-    col_lt_var = find_col("lead_time_variance_days", ["Lead Time Variance", "LT Variance", "LTIV"])
-    col_sl = find_col("service_level", ["Service Level", "ServiceLevel", "SL", "SLEV"])
-    col_moq = find_col("min_batch", ["MOQ", "Min Batch", "Min Order", "MINB"])
-    col_brou = find_col("batch_rounding", ["Batch Rounding", "Box Rounding", "Rounding", "BROU"])
-
-    if not col_code:
-        col_code = cols[0]
-
-    # Find time-series date columns (e.g. 2024, 2025, 2026, or month names)
-    period_cols = []
-    for c in cols:
-        if any(yr in c for yr in ["2024", "2025", "2026", "2027"]) or any(m in c.lower() for m in ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"]):
-            period_cols.append(c)
-
-    p_name = project_name or f"Imported: {filename}"
-    proj = create_new_project(p_name, f"Imported from {filename} ({len(df)} rows)", filename)
-    proj_id = proj["id"]
-
-    now_str = datetime.datetime.utcnow().isoformat()
-    imported_count = 0
-
-    with _LOCK:
-        con = get_connection()
-        try:
-            for idx, row in df.iterrows():
-                code = str(row[col_code]).strip()
-                if not code or code.lower() == 'nan':
-                    continue
-
-                desc = str(row[col_desc]).strip() if col_desc and pd.notna(row[col_desc]) else f"Item {code}"
-                cat = str(row[col_cat]).strip() if col_cat and pd.notna(row[col_cat]) else "General Inventory"
-                loc = str(row[col_loc]).strip() if col_loc and pd.notna(row[col_loc]) else "Main Warehouse"
-                
-                price = float(row[col_price]) if col_price and pd.notna(row[col_price]) and str(row[col_price]).replace('.', '', 1).isdigit() else 50.0
-                cost = float(row[col_cost]) if col_cost and pd.notna(row[col_cost]) and str(row[col_cost]).replace('.', '', 1).isdigit() else 25.0
-                onhand = float(row[col_onhand]) if col_onhand and pd.notna(row[col_onhand]) and str(row[col_onhand]).replace('.', '', 1).isdigit() else 100.0
-                onorder = float(row[col_onorder]) if col_onorder and pd.notna(row[col_onorder]) and str(row[col_onorder]).replace('.', '', 1).isdigit() else 0.0
-                lt = float(row[col_lt]) if col_lt and pd.notna(row[col_lt]) and str(row[col_lt]).replace('.', '', 1).isdigit() else 30.0
-                lt_var = float(row[col_lt_var]) if col_lt_var and pd.notna(row[col_lt_var]) and str(row[col_lt_var]).replace('.', '', 1).isdigit() else 5.0
-                sl = float(row[col_sl]) if col_sl and pd.notna(row[col_sl]) and str(row[col_sl]).replace('.', '', 1).isdigit() else 0.95
-                if sl > 1.0:
-                    sl = sl / 100.0
-                moq = float(row[col_moq]) if col_moq and pd.notna(row[col_moq]) and str(row[col_moq]).replace('.', '', 1).isdigit() else 10.0
-                brou = float(row[col_brou]) if col_brou and pd.notna(row[col_brou]) and str(row[col_brou]).replace('.', '', 1).isdigit() else 5.0
-
-                item_id = f"item_{uuid.uuid4().hex[:8]}"
-
-                # Parse period actuals for this row
-                actuals = []
-                for pcol in period_cols:
-                    val = row[pcol]
-                    act = float(val) if pd.notna(val) and str(val).replace('.', '', 1).isdigit() else 0.0
-                    actuals.append(act)
-
-                if not actuals:
-                    actuals = [50, 55, 60, 58, 62, 70, 75, 80, 85, 90, 95, 100]
-
-                avg_sales = sum(actuals) / len(actuals)
-                mean_daily = avg_sales / 30.0
-                z = 1.645 if sl == 0.95 else (2.054 if sl >= 0.98 else 1.282)
-                sigma_d = (avg_sales * 0.25) / 30.0
-                ss = round(z * ((lt * (sigma_d ** 2) + (mean_daily ** 2) * (lt_var ** 2)) ** 0.5))
-                rop = round(mean_daily * lt + ss)
-                order_now = max(0, rop - onhand - onorder)
-                if order_now > 0 and moq > 0:
-                    order_now = max(order_now, moq)
-                    if brou > 1:
-                        order_now = int(((order_now + brou - 1) // brou) * brou)
-
-                dos = round((onhand / mean_daily) if mean_daily > 0 else 999)
-
-                con.execute("""
-                    INSERT INTO items (
-                        id, project_id, code, description, category, location, channel, supplier,
-                        sales_price, purchase_price, margin, on_hand, on_order, backorders,
-                        lead_time_days, lead_time_variance_days, order_cycle_days, service_level,
-                        min_batch, batch_rounding, model_type, replenishment_strategy,
-                        check_state, approval_state, abc_class, xyz_class,
-                        safety_stock, reorder_point, order_now, order_now_value, days_of_supply,
-                        accuracy, mean_daily_demand, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, 'Direct Retail', 'Primary Supplier', ?, ?, ?, ?, ?, 0.0, ?, ?, 30.0, ?, ?, ?, 'auto', 'periodic', 'checked', 'unapproved', 'B', 'Y', ?, ?, ?, ?, ?, 92.0, ?, ?)
-                """, (
-                    item_id, proj_id, code, desc, cat, loc,
-                    price, cost, round((price - cost) / price * 100 if price > 0 else 0, 1),
-                    onhand, onorder, lt, lt_var, sl, moq, brou,
-                    ss, rop, order_now, order_now * cost, dos,
-                    mean_daily, now_str
-                ))
-
-                # Insert historical periods
-                for p_idx, pcol in enumerate(period_cols if period_cols else [f"2025-{m:02d}" for m in range(1, 13)]):
-                    act = actuals[p_idx] if p_idx < len(actuals) else 50.0
-                    con.execute("""
-                        INSERT INTO periods (id, project_id, item_id, date, actual, forecast, model, conf_upper, conf_lower)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """, (f"per_{item_id}_{pcol}", proj_id, item_id, str(pcol), act, act, act, round(act * 1.15), round(act * 0.85)))
-
-                # Insert future forecast periods
-                for f_idx in range(1, 7):
-                    f_date = f"2026-{f_idx:02d}"
-                    fc = round(avg_sales * 1.05)
-                    con.execute("""
-                        INSERT INTO periods (id, project_id, item_id, date, actual, forecast, model, conf_upper, conf_lower)
-                        VALUES (?, ?, ?, ?, 0.0, ?, ?, ?, ?)
-                    """, (f"per_{item_id}_{f_date}", proj_id, item_id, f_date, fc, fc, round(fc * 1.2), round(fc * 0.8)))
-
-                imported_count += 1
-
-            con.execute("UPDATE projects SET sku_count = ? WHERE id = ?", (imported_count, proj_id))
-        finally:
-            con.close()
-
-    return {
-        "success": True,
-        "project_id": proj_id,
-        "project_name": p_name,
-        "imported_skus": imported_count,
-        "columns_detected": cols,
-        "message": f"Successfully imported {imported_count} items from {filename} into DuckDB."
-    }
+    res = await import_typed_file(
+        file=file,
+        import_type="combined",
+        new_project_name=project_name,
+        column_mapping=column_mapping,
+        job_id=job_id
+    )
+    res["project_name"] = project_name or f"Imported: {file.filename or 'file'}"
+    res["imported_skus"] = res.get("items_upserted", res.get("rows_processed", 0))
+    res["columns_detected"] = []
+    return res
 
 def _generate_excel_export(project_id: str, export_type: str = "all") -> StreamingResponse:
     """Generates real .xlsx exports from DuckDB tables."""

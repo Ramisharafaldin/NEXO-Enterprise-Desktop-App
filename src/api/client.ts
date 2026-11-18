@@ -18,6 +18,186 @@ const getApiBase = (): string => {
 
 const API_BASE = getApiBase();
 
+export interface UploadProgressInfo {
+  percent: number;
+  stage_ar: string;
+  stage_en: string;
+  bytesUploaded?: number;
+  bytesTotal?: number;
+  rows_processed?: number;
+  total_rows?: number;
+  status: 'uploading' | 'running' | 'done' | 'error';
+  error?: string | null;
+}
+
+/**
+ * Real-Time File Upload and DuckDB Ingestion Tracking
+ * Combines XMLHttpRequest byte transfer (0% -> 45%) with live backend DuckDB stage polling (45% -> 100%)
+ */
+export async function uploadFileWithProgress<T = any>(
+  url: string,
+  formData: FormData,
+  onProgress?: (info: UploadProgressInfo) => void
+): Promise<T> {
+  const jobId = (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function')
+    ? crypto.randomUUID()
+    : 'job_' + Math.random().toString(36).substring(2, 15) + Date.now().toString(36);
+
+  formData.append('job_id', jobId);
+
+  let pollInterval: any = null;
+  let isDone = false;
+
+  const stopPolling = () => {
+    if (pollInterval) {
+      clearInterval(pollInterval);
+      pollInterval = null;
+    }
+  };
+
+  const startPolling = () => {
+    if (pollInterval || isDone) return;
+    pollInterval = setInterval(async () => {
+      if (isDone) {
+        stopPolling();
+        return;
+      }
+      try {
+        const pollRes = await fetch(`${API_BASE}/files/import-progress/${jobId}`);
+        if (pollRes.ok) {
+          const pollData = await pollRes.json();
+          if (onProgress && !isDone) {
+            onProgress({
+              percent: Math.max(45, Math.min(100, pollData.percent ?? 45)),
+              stage_ar: pollData.stage_ar || 'جاري المعالجة في محرك DuckDB...',
+              stage_en: pollData.stage_en || 'Processing in DuckDB engine...',
+              rows_processed: pollData.rows_processed,
+              total_rows: pollData.total_rows,
+              status: pollData.status || 'running',
+              error: pollData.error,
+            });
+          }
+          if (pollData.status === 'done' || pollData.status === 'error') {
+            stopPolling();
+          }
+        }
+      } catch (_) {
+        // Silently tolerate transient polling network hiccups
+      }
+    }, 250);
+  };
+
+  return new Promise<T>((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open('POST', url, true);
+
+    // Track real byte upload progress (0% -> 45%)
+    xhr.upload.onprogress = (event) => {
+      if (event.lengthComputable && event.total > 0) {
+        const uploadPercent = Math.min(45, Math.round((event.loaded / event.total) * 45));
+        if (onProgress && !isDone) {
+          onProgress({
+            percent: uploadPercent,
+            stage_ar: uploadPercent < 45 ? 'جاري رفع الملف إلى الخادم...' : 'استلام الملف وتجهيز القراءة...',
+            stage_en: uploadPercent < 45 ? 'Uploading file to server...' : 'Receiving file stream...',
+            bytesUploaded: event.loaded,
+            bytesTotal: event.total,
+            status: 'uploading',
+          });
+        }
+        if (uploadPercent >= 45) {
+          startPolling();
+        }
+      } else {
+        if (onProgress && !isDone) {
+          onProgress({
+            percent: 25,
+            stage_ar: 'جاري نقل البيانات...',
+            stage_en: 'Transferring data...',
+            status: 'uploading',
+          });
+        }
+      }
+    };
+
+    // When upload finishes, transition to backend stage polling
+    xhr.upload.onload = () => {
+      if (onProgress && !isDone) {
+        onProgress({
+          percent: 45,
+          stage_ar: 'تم رفع الملف، جاري بدء المعالجة في DuckDB...',
+          stage_en: 'Upload complete, initializing DuckDB processing...',
+          status: 'running',
+        });
+      }
+      startPolling();
+    };
+
+    xhr.onload = () => {
+      isDone = true;
+      stopPolling();
+      if (xhr.status >= 200 && xhr.status < 300) {
+        try {
+          const response = JSON.parse(xhr.responseText);
+          if (onProgress) {
+            onProgress({
+              percent: 100,
+              stage_ar: 'اكتملت المعالجة بنجاح!',
+              stage_en: 'Processing completed successfully!',
+              rows_processed: response.rows_processed ?? response.imported_skus ?? response.row_count ?? 0,
+              total_rows: response.rows_processed ?? response.imported_skus ?? response.row_count ?? 0,
+              status: 'done',
+            });
+          }
+          resolve(response);
+        } catch (e) {
+          reject(new Error('Failed to parse server response'));
+        }
+      } else {
+        let errorMsg = `Server error ${xhr.status}`;
+        try {
+          const errRes = JSON.parse(xhr.responseText);
+          if (errRes.detail) errorMsg = errRes.detail;
+        } catch (_) {}
+        if (onProgress) {
+          onProgress({
+            percent: 100,
+            stage_ar: `خطأ أثناء المعالجة: ${errorMsg}`,
+            stage_en: `Processing error: ${errorMsg}`,
+            status: 'error',
+            error: errorMsg,
+          });
+        }
+        reject(new Error(errorMsg));
+      }
+    };
+
+    xhr.onerror = () => {
+      isDone = true;
+      stopPolling();
+      const errorMsg = 'Network connection failed during file upload';
+      if (onProgress) {
+        onProgress({
+          percent: 100,
+          stage_ar: errorMsg,
+          stage_en: errorMsg,
+          status: 'error',
+          error: errorMsg,
+        });
+      }
+      reject(new Error(errorMsg));
+    };
+
+    xhr.onabort = () => {
+      isDone = true;
+      stopPolling();
+      reject(new Error('Upload aborted'));
+    };
+
+    xhr.send(formData);
+  });
+}
+
 export interface UpdateInfo {
   update_available: boolean;
   local_sha: string;
@@ -357,21 +537,17 @@ export const api = {
   /**
    * File Inspection, Import & Export
    */
-  async inspectFile(file: File): Promise<FileInspectResult> {
+  async inspectFile(file: File, onProgress?: (info: UploadProgressInfo) => void): Promise<FileInspectResult> {
     const formData = new FormData();
     formData.append('file', file);
-    const res = await fetch(`${API_BASE}/files/inspect`, {
-      method: 'POST',
-      body: formData,
-    });
-    if (!res.ok) throw new Error('Failed to inspect spreadsheet headers');
-    return res.json();
+    return uploadFileWithProgress<FileInspectResult>(`${API_BASE}/files/inspect`, formData, onProgress);
   },
 
   async uploadFile(
     file: File,
     projectName?: string,
-    columnMapping?: Record<string, string>
+    columnMapping?: Record<string, string>,
+    onProgress?: (info: UploadProgressInfo) => void
   ): Promise<{ success: boolean; project_id: string; project_name: string; imported_skus: number }> {
     const formData = new FormData();
     formData.append('file', file);
@@ -381,15 +557,11 @@ export const api = {
     if (columnMapping) {
       formData.append('column_mapping', JSON.stringify(columnMapping));
     }
-    const res = await fetch(`${API_BASE}/files/import`, {
-      method: 'POST',
-      body: formData,
-    });
-    if (!res.ok) {
-      const err = await res.json().catch(() => ({ detail: res.statusText }));
-      throw new Error(err.detail || 'File import failed');
-    }
-    return res.json();
+    return uploadFileWithProgress<{ success: boolean; project_id: string; project_name: string; imported_skus: number }>(
+      `${API_BASE}/files/import`,
+      formData,
+      onProgress
+    );
   },
 
   getExportUrl(projectId: string, exportType: string = 'all'): string {
@@ -499,7 +671,8 @@ export const api = {
     projectId?: string,
     newProjectName?: string,
     mergeMode: 'merge' | 'replace' = 'merge',
-    columnMapping?: Record<string, string>
+    columnMapping?: Record<string, string>,
+    onProgress?: (info: UploadProgressInfo) => void
   ): Promise<{ success: boolean; project_id: string; rows_processed: number; items_upserted: number; periods_upserted: number; elapsed_seconds?: number; message: string }> {
     const formData = new FormData();
     formData.append('file', file);
@@ -509,15 +682,11 @@ export const api = {
     if (newProjectName) formData.append('new_project_name', newProjectName);
     if (columnMapping) formData.append('column_mapping', JSON.stringify(columnMapping));
 
-    const res = await fetch(`${API_BASE}/files/import-typed`, {
-      method: 'POST',
-      body: formData,
-    });
-    if (!res.ok) {
-      const err = await res.json().catch(() => ({ detail: res.statusText }));
-      throw new Error(err.detail || 'Typed file import failed');
-    }
-    return res.json();
+    return uploadFileWithProgress<{ success: boolean; project_id: string; rows_processed: number; items_upserted: number; periods_upserted: number; elapsed_seconds?: number; message: string }>(
+      `${API_BASE}/files/import-typed`,
+      formData,
+      onProgress
+    );
   },
 
   async inspectLocalDb(fileOrPath: File | string): Promise<{
@@ -709,5 +878,7 @@ export const api = {
     });
     if (!res.ok) throw new Error('Failed to restart application');
     return res.json();
-  }
+  },
+
+  uploadFileWithProgress,
 };

@@ -22,7 +22,7 @@ import {
   FileCheck
 } from 'lucide-react';
 import { translations, Language } from '../i18n/translations';
-import { api, IngestionLog, ErpConnection, SqlServerTestResult } from '../api/client';
+import { api, IngestionLog, ErpConnection, SqlServerTestResult, UploadProgressInfo } from '../api/client';
 
 interface DataHubViewProps {
   projectId: string;
@@ -79,6 +79,15 @@ export const DataHubView: React.FC<DataHubViewProps> = ({
   } | null>(null);
   const [columnMapping, setColumnMapping] = useState<Record<string, string>>({});
   const [isProcessingFile, setIsProcessingFile] = useState(false);
+  const [uploadProgress, setUploadProgress] = useState<UploadProgressInfo | null>(null);
+  const [elapsedSeconds, setElapsedSeconds] = useState(0);
+  const timerRef = useRef<any>(null);
+
+  useEffect(() => {
+    return () => {
+      if (timerRef.current) clearInterval(timerRef.current);
+    };
+  }, []);
 
   // 2. SQL Server Connector State
   const [sqlHost, setSqlHost] = useState('localhost\\SQLEXPRESS');
@@ -200,8 +209,23 @@ export const DataHubView: React.FC<DataHubViewProps> = ({
     if (!file) return;
     setSelectedFile(file);
     setIsProcessingFile(true);
+    setUploadProgress({
+      percent: 5,
+      stage_ar: 'جاري فحص وتجهيز الملف...',
+      stage_en: 'Inspecting file structure...',
+      status: 'uploading'
+    });
+    const startTime = Date.now();
+    setElapsedSeconds(0);
+    if (timerRef.current) clearInterval(timerRef.current);
+    timerRef.current = setInterval(() => {
+      setElapsedSeconds((Date.now() - startTime) / 1000);
+    }, 100);
+
     try {
-      const insp = await api.inspectFile(file);
+      const insp = await api.inspectFile(file, (info) => {
+        setUploadProgress(info);
+      });
       const cols = insp.columns || [];
       const mergedMapping: Record<string, string> = { ...(insp.suggested_mappings || {}) };
 
@@ -238,12 +262,32 @@ export const DataHubView: React.FC<DataHubViewProps> = ({
       showNotification('error', err.message || 'Failed to inspect file structure');
     } finally {
       setIsProcessingFile(false);
+      if (timerRef.current) {
+        clearInterval(timerRef.current);
+        timerRef.current = null;
+      }
+      setTimeout(() => {
+        setUploadProgress(null);
+      }, 1200);
     }
   };
 
   const handleCommitTypedImport = async () => {
-    if (!selectedFile) return;
+    if (!selectedFile || isProcessingFile) return;
     setIsProcessingFile(true);
+    setUploadProgress({
+      percent: 5,
+      stage_ar: 'بدء نقل البيانات إلى محرك DuckDB...',
+      stage_en: 'Starting data transfer to DuckDB engine...',
+      status: 'uploading'
+    });
+    const startTime = Date.now();
+    setElapsedSeconds(0);
+    if (timerRef.current) clearInterval(timerRef.current);
+    timerRef.current = setInterval(() => {
+      setElapsedSeconds((Date.now() - startTime) / 1000);
+    }, 100);
+
     try {
       const res = await api.importTypedFile(
         selectedFile,
@@ -251,7 +295,10 @@ export const DataHubView: React.FC<DataHubViewProps> = ({
         projectId,
         undefined,
         mergeMode,
-        columnMapping
+        columnMapping,
+        (info) => {
+          setUploadProgress(info);
+        }
       );
       const formattedRows = (res.rows_processed || 0).toLocaleString();
       const elapsedStr = res.elapsed_seconds != null ? ` في ${res.elapsed_seconds.toFixed(2)} ثانية` : '';
@@ -268,6 +315,13 @@ export const DataHubView: React.FC<DataHubViewProps> = ({
       showNotification('error', err.message || 'Import failed');
     } finally {
       setIsProcessingFile(false);
+      if (timerRef.current) {
+        clearInterval(timerRef.current);
+        timerRef.current = null;
+      }
+      setTimeout(() => {
+        setUploadProgress(null);
+      }, 1500);
     }
   };
 
@@ -788,13 +842,112 @@ export const DataHubView: React.FC<DataHubViewProps> = ({
 
             {/* Drag & Drop File Zone */}
             <div className="bg-white rounded-lg border border-[#D1D5DB] p-5 shadow-xs space-y-4">
-              <h3 className="text-xs font-bold text-slate-700 uppercase tracking-wider">
-                {isAr ? '2. اختيار أو سحب الملف' : '2. File Upload Dropzone'}
-              </h3>
+              <div className="flex items-center justify-between">
+                <h3 className="text-xs font-bold text-slate-700 uppercase tracking-wider">
+                  {isAr ? '2. اختيار أو سحب الملف' : '2. File Upload Dropzone'}
+                </h3>
+                {uploadProgress && (
+                  <span className="text-xs font-bold font-mono text-cyan-600 flex items-center gap-1.5">
+                    <span className="relative flex h-2 w-2">
+                      <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-cyan-400 opacity-75"></span>
+                      <span className="relative inline-flex rounded-full h-2 w-2 bg-cyan-500"></span>
+                    </span>
+                    {uploadProgress.percent}%
+                  </span>
+                )}
+              </div>
+
+              {/* Live Upload & DuckDB Ingestion Progress Card */}
+              {uploadProgress && (
+                <div className="bg-gradient-to-br from-slate-900 via-slate-800 to-slate-900 border border-slate-700/80 rounded-xl p-4.5 shadow-xl text-white space-y-3.5 transition-all duration-300">
+                  {/* Top Bar: Live Engine Status & Tabular Percentage */}
+                  <div className="flex items-center justify-between">
+                    <div className="flex items-center gap-2.5">
+                      <span className="relative flex h-3 w-3">
+                        {uploadProgress.status !== 'done' && uploadProgress.status !== 'error' && (
+                          <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-cyan-400 opacity-75"></span>
+                        )}
+                        <span className={`relative inline-flex rounded-full h-3 w-3 ${
+                          uploadProgress.status === 'done'
+                            ? 'bg-emerald-400'
+                            : uploadProgress.status === 'error'
+                              ? 'bg-rose-500'
+                              : 'bg-cyan-400'
+                        }`}></span>
+                      </span>
+
+                      <div>
+                        <div className="text-xs font-bold uppercase tracking-wider text-cyan-300 flex items-center gap-1.5">
+                          <span>{isAr ? 'محرك المعالجة المباشر DuckDB' : 'Live DuckDB Ingestion Engine'}</span>
+                          <span className="px-1.5 py-0.2 bg-cyan-950/80 border border-cyan-700/60 rounded text-[10px] text-cyan-200 font-mono">
+                            {uploadProgress.status === 'uploading' ? (isAr ? 'رفع بايتات' : 'Byte Stream') : (isAr ? 'معالجة SQL' : 'DuckDB Kernel')}
+                          </span>
+                        </div>
+                        <div className="text-[11px] text-slate-300">
+                          {isAr ? 'معالجة مباشرة في الذاكرة دون تجميد الواجهة' : 'Streaming set-based ingestion without UI lock'}
+                        </div>
+                      </div>
+                    </div>
+
+                    <div className="flex items-baseline gap-1">
+                      <span className="text-3xl font-black font-mono tracking-tight text-white tabular-nums drop-shadow-sm">
+                        {uploadProgress.percent}
+                      </span>
+                      <span className="text-lg font-bold text-cyan-400 font-mono">%</span>
+                    </div>
+                  </div>
+
+                  {/* Progress Bar with glowing active shimmer */}
+                  <div className="relative w-full bg-slate-950/70 rounded-full h-3 overflow-hidden p-0.5 border border-slate-700/80">
+                    <div
+                      className={`h-full rounded-full transition-all duration-200 ease-out relative ${
+                        uploadProgress.status === 'done'
+                          ? 'bg-gradient-to-r from-emerald-500 to-teal-400'
+                          : uploadProgress.status === 'error'
+                            ? 'bg-gradient-to-r from-rose-600 to-amber-600'
+                            : 'bg-gradient-to-r from-blue-500 via-cyan-400 to-emerald-400'
+                      }`}
+                      style={{ width: `${Math.max(2, uploadProgress.percent)}%` }}
+                    >
+                      {uploadProgress.status !== 'done' && uploadProgress.status !== 'error' && (
+                        <div className="absolute inset-0 bg-white/25 animate-pulse rounded-full" />
+                      )}
+                    </div>
+                  </div>
+
+                  {/* Stage Description & Real-Time Elapsed Timer */}
+                  <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-1.5 text-xs text-slate-200">
+                    <div className="flex items-center gap-1.5 truncate">
+                      <span className="font-semibold text-cyan-200">
+                        {isAr ? uploadProgress.stage_ar : uploadProgress.stage_en}
+                      </span>
+                    </div>
+
+                    <div className="flex items-center gap-2.5 shrink-0 text-slate-400 font-mono text-[11px]">
+                      {uploadProgress.bytesUploaded && uploadProgress.bytesTotal ? (
+                        <span className="bg-slate-800/80 px-2 py-0.5 rounded border border-slate-700 text-slate-300">
+                          {(uploadProgress.bytesUploaded / (1024 * 1024)).toFixed(2)} MB / {(uploadProgress.bytesTotal / (1024 * 1024)).toFixed(2)} MB
+                        </span>
+                      ) : uploadProgress.rows_processed ? (
+                        <span className="bg-slate-800/80 px-2 py-0.5 rounded border border-slate-700 text-emerald-300 font-bold">
+                          {uploadProgress.rows_processed.toLocaleString()} {isAr ? 'سجل' : 'rows'}
+                        </span>
+                      ) : null}
+
+                      <span className="flex items-center gap-1 bg-slate-800/80 px-2 py-0.5 rounded border border-slate-700 text-cyan-300">
+                        <Clock className="w-3 h-3 text-cyan-400" />
+                        <span className="tabular-nums font-bold">{elapsedSeconds.toFixed(1)}s</span>
+                      </span>
+                    </div>
+                  </div>
+                </div>
+              )}
 
               <div
-                onClick={() => fileInputRef.current?.click()}
-                className={`border-2 border-dashed rounded-lg p-8 text-center cursor-pointer transition flex flex-col items-center justify-center gap-2 ${
+                onClick={() => !isProcessingFile && fileInputRef.current?.click()}
+                className={`border-2 border-dashed rounded-lg p-8 text-center transition flex flex-col items-center justify-center gap-2 ${
+                  isProcessingFile ? 'cursor-not-allowed opacity-80' : 'cursor-pointer'
+                } ${
                   selectedFile
                     ? 'border-emerald-400 bg-emerald-50/30'
                     : 'border-slate-300 hover:border-[#2196F3] bg-slate-50/50 hover:bg-blue-50/20'
@@ -806,6 +959,7 @@ export const DataHubView: React.FC<DataHubViewProps> = ({
                   accept=".xlsx,.xls,.csv"
                   className="hidden"
                   onChange={handleFileChange}
+                  disabled={isProcessingFile}
                 />
                 <div className="p-3 bg-white rounded-full shadow-xs border border-slate-200">
                   <UploadCloud className="w-6 h-6 text-[#2196F3]" />
@@ -839,7 +993,11 @@ export const DataHubView: React.FC<DataHubViewProps> = ({
                     className="flex items-center gap-2 px-4 py-2 bg-emerald-600 hover:bg-emerald-700 text-white rounded text-xs font-bold transition shadow-xs cursor-pointer disabled:opacity-50"
                   >
                     <Check className="w-4 h-4" />
-                    <span>{isProcessingFile ? (hubT.saving || 'Saving...') : (hubT.commitImport || (isAr ? 'اعتماد وحفظ في قاعدة بيانات DuckDB' : 'Commit & Save to DuckDB Workspace'))}</span>
+                    <span>
+                      {isProcessingFile 
+                        ? (isAr ? `جاري المعالجة (${uploadProgress?.percent ?? 0}%)...` : `Processing (${uploadProgress?.percent ?? 0}%)...`) 
+                        : (hubT.commitImport || (isAr ? 'اعتماد وحفظ في قاعدة بيانات DuckDB' : 'Commit & Save to DuckDB Workspace'))}
+                    </span>
                   </button>
                 </div>
 
