@@ -43,6 +43,18 @@ export const DataHubView: React.FC<DataHubViewProps> = ({
   const isAr = language === 'ar';
   const hubT = (t as any).dataHub || {};
 
+  const templateColumns = {
+    sales: isAr
+      ? ['كود الصنف', 'الفرع / المخزن', 'الفترة / الشهر', 'الكمية المباعة', 'قيمة المبيعات']
+      : ['CODE', 'LOCA', 'PERIOD', 'QTY_SOLD', 'REVENUE'],
+    inventory: isAr
+      ? ['كود الصنف', 'اسم الصنف', 'القسم / المجموعة', 'الفرع / المخزن', 'الرصيد المتوفر', 'قيد التوريد', 'مهلة التوريد (يوم)', 'تذبذب التوريد', 'مستوى الخدمة %', 'الحد الأدنى للطلب', 'مضاعفات العبوة', 'سعر التكلفة', 'سعر البيع', 'المورد']
+      : ['CODE', 'DESC', 'CATI', 'LOCA', 'ONHA', 'ONOW', 'LTIM', 'LTIV', 'SLEV', 'MINB', 'BROU', 'COST', 'PRIC', 'SUPP'],
+    inTransit: isAr
+      ? ['كود الصنف', 'الفرع / المخزن', 'رقم أمر الشراء / الشحنة', 'الكمية في الطريق', 'تاريخ الوصول المتوقع', 'المورد', 'حالة الشحنة']
+      : ['CODE', 'LOCA', 'PO_NUMBER', 'QTY_IN_TRANSIT', 'EXPECTED_DATE', 'SUPP', 'STATUS']
+  };
+
   const [activeConnector, setActiveConnector] = useState<ActiveConnector>('excel');
   const [logs, setLogs] = useState<IngestionLog[]>([]);
   const [connections, setConnections] = useState<ErpConnection[]>([]);
@@ -139,7 +151,7 @@ export const DataHubView: React.FC<DataHubViewProps> = ({
   const handleDownloadTemplate = async (templateType: 'sales' | 'inventory' | 'in-transit') => {
     setDownloadingTemplate(templateType);
     try {
-      const ok = await api.downloadTemplate(templateType);
+      const ok = await api.downloadTemplate(templateType, undefined, language);
       if (ok) {
         showNotification('success', isAr ? 'تم حفظ النموذج القياسي بنجاح على جهازك!' : 'Standard template downloaded successfully!');
       }
@@ -150,6 +162,33 @@ export const DataHubView: React.FC<DataHubViewProps> = ({
     }
   };
 
+  // Bilingual column map for client-side auto-mapping fallback
+  const BILINGUAL_COL_MAP: Record<string, string[]> = {
+    code: ['code', 'sku', 'item_code', 'itemcode', 'item', 'كود الصنف', 'كود', 'رمز الصنف', 'رقم الصنف'],
+    description: ['desc', 'description', 'item_description', 'name', 'item_name', 'اسم الصنف', 'الوصف', 'بيان الصنف'],
+    category: ['category', 'cat', 'cati', 'family', 'group', 'product_line', 'القسم / المجموعة', 'التصنيف', 'الفئة', 'المجموعة', 'القسم'],
+    location: ['loc', 'location', 'loca', 'warehouse', 'wh', 'branch', 'site', 'الفرع / المخزن', 'المستودع', 'المخزن', 'الفرع', 'الموقع'],
+    on_hand: ['on_hand', 'onhand', 'onha', 'stock', 'balance', 'qty_on_hand', 'inventory', 'الرصيد المتوفر', 'الرصيد', 'الرصيد الحالي', 'المخزون الحالي', 'المتوفر'],
+    on_order: ['on_order', 'onorder', 'onow', 'onor', 'in_transit', 'po_qty', 'قيد التوريد', 'تحت الطلب', 'في الطريق', 'أوامر مفتوحة'],
+    lead_time_days: ['lead_time', 'leadtime', 'lt', 'ltim', 'lead_time_days', 'مهلة التوريد (يوم)', 'مهلة التوريد', 'فترة التوريد (يوم)', 'فترة التوريد'],
+    lead_time_variance_days: ['lt_var', 'ltiv', 'lead_time_variance', 'تذبذب التوريد', 'تباين التوريد', 'انحراف التوريد'],
+    service_level: ['service_level', 'servicelevel', 'sl', 'slev', 'مستوى الخدمة %', 'مستوى الخدمة', 'نسبة الخدمة'],
+    min_batch: ['min_batch', 'moq', 'minb', 'min_order', 'الحد الأدنى للطلب', 'أدنى كمية', 'أقل كمية للطلب'],
+    batch_rounding: ['batch_rounding', 'rounding', 'brou', 'box_qty', 'مضاعفات العبوة', 'مضاعفات الطلب', 'الكرتونة', 'حجم الصندوق'],
+    purchase_price: ['cost', 'purchase_price', 'unit_cost', 'purchase_cost', 'سعر التكلفة', 'التكلفة', 'سعر الشراء'],
+    sales_price: ['price', 'sales_price', 'retail', 'selling_price', 'pric', 'سعر البيع', 'السعر'],
+    supplier: ['supplier', 'supp', 'vendor', 'المورد', 'اسم المورد'],
+    period: ['period', 'date', 'month', 'period_date', 'الفترة / الشهر', 'الفترة', 'التاريخ', 'الشهر'],
+    qty_sold: ['qty_sold', 'actual', 'sales_qty', 'quantity_sold', 'units_sold', 'الكمية المباعة', 'المبيعات', 'الكمية'],
+    revenue: ['revenue', 'sales_value', 'amount', 'total_sales', 'قيمة المبيعات', 'الإيراد', 'المبلغ'],
+    order_no: ['order_no', 'order', 'po_number', 'po', 'order_id', 'order_num', 'رقم أمر الشراء / الشحنة', 'رقم أمر الشراء', 'رقم الطلب', 'رقم الشحنة', 'رقم الأمر'],
+    destination: ['destination', 'dest', 'target_wh', 'to_location', 'الفرع / المخزن', 'المستودع المستلم', 'الوجهة', 'الموقع', 'إلى'],
+    eta_date: ['eta_date', 'eta', 'arrival_date', 'delivery_date', 'expected_date', 'تاريخ الوصول المتوقع', 'تاريخ الوصول', 'تاريخ الاستلام'],
+    carrier: ['carrier', 'shipping_line', 'forwarder', 'transport', 'الناقل', 'شركة الشحن', 'الخط الملاحي'],
+    status: ['status', 'shipment_status', 'حالة الشحنة', 'الحالة'],
+    quantity: ['quantity', 'qty', 'units', 'shipped_qty', 'qty_in_transit', 'الكمية في الطريق', 'الكمية', 'العدد', 'عدد الوحدات']
+  };
+
   // 1. File Upload & Inspection
   const handleFileChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
@@ -158,13 +197,38 @@ export const DataHubView: React.FC<DataHubViewProps> = ({
     setIsProcessingFile(true);
     try {
       const insp = await api.inspectFile(file);
+      const cols = insp.columns || [];
+      const mergedMapping: Record<string, string> = { ...(insp.suggested_mappings || {}) };
+
+      // Ensure 100% round-trip recognition client-side
+      for (const [field, candidates] of Object.entries(BILINGUAL_COL_MAP)) {
+        if (!mergedMapping[field]) {
+          const match = cols.find(c => {
+            const cl = c.trim().toLowerCase();
+            return candidates.some(cand => cl === cand.toLowerCase() || cl.includes(cand.toLowerCase()) || cand.toLowerCase().includes(cl));
+          });
+          if (match) {
+            mergedMapping[field] = match;
+          }
+        }
+      }
+
+      // Auto-detect importType if matching specialized template columns
+      if (cols.some(c => ['حالة الشحنة', 'STATUS', 'EXPECTED_DATE', 'تاريخ الوصول المتوقع'].includes(c.trim()))) {
+        setImportType('in_transit');
+      } else if (cols.some(c => ['الفترة / الشهر', 'PERIOD', 'QTY_SOLD', 'الكمية المباعة'].includes(c.trim()))) {
+        setImportType('sales');
+      } else if (cols.some(c => ['الرصيد المتوفر', 'ONHA', 'مهلة التوريد (يوم)', 'LTIM'].includes(c.trim()))) {
+        setImportType('inventory');
+      }
+
       setInspectData({
         columns: insp.columns,
         previewRows: insp.preview_rows,
         rowCount: insp.row_count,
-        suggestedMappings: insp.suggested_mappings
+        suggestedMappings: mergedMapping
       });
-      setColumnMapping(insp.suggested_mappings || {});
+      setColumnMapping(mergedMapping);
     } catch (err: any) {
       showNotification('error', err.message || 'Failed to inspect file structure');
     } finally {
@@ -486,51 +550,126 @@ export const DataHubView: React.FC<DataHubViewProps> = ({
         {activeConnector === 'excel' && (
           <div className="space-y-6">
             {/* Template Download Hero Banner */}
-            <div className="bg-white rounded-lg border border-[#D1D5DB] p-5 shadow-xs flex flex-col md:flex-row items-center justify-between gap-4">
-              <div className="space-y-1">
-                <div className="flex items-center gap-2">
-                  <span className="px-2 py-0.5 rounded text-[10px] font-bold bg-emerald-100 text-emerald-800 uppercase tracking-wide">
-                    {isAr ? 'نماذج جاهزة' : 'Official Templates'}
-                  </span>
-                  <h3 className="text-sm font-bold text-slate-800">
-                    {isAr ? 'تصدير نماذج إكسل القياسية الفارغة مع أمثلة عملية' : 'Standard Blank Excel Templates with Realistic Examples'}
-                  </h3>
+            <div className="bg-white rounded-lg border border-[#D1D5DB] p-5 shadow-xs space-y-4">
+              <div className="flex flex-col md:flex-row md:items-center justify-between gap-2 border-b border-slate-100 pb-3">
+                <div className="space-y-1">
+                  <div className="flex items-center gap-2">
+                    <span className="px-2 py-0.5 rounded text-[10px] font-bold bg-emerald-100 text-emerald-800 uppercase tracking-wide">
+                      {isAr ? 'نماذج جاهزة' : 'Official Templates'}
+                    </span>
+                    <h3 className="text-sm font-bold text-slate-800">
+                      {isAr ? 'تصدير نماذج إكسل القياسية الفارغة مع أمثلة عملية' : 'Standard Blank Excel Templates with Realistic Examples'}
+                    </h3>
+                  </div>
+                  <p className="text-xs text-slate-500 max-w-2xl">
+                    {hubT.templateBannerDesc || (isAr ? 'قم بتحميل النماذج القياسية الجاهزة المنسقة مع أمثلة عملية لاستيراد بياناتك فوراً وبشكل آلي 100% عبر الحوار الأصلي للويندوز.' : 'Download pre-formatted Excel templates with styled headers and realistic sample rows for instant automated import using native Windows Save As dialog.')}
+                  </p>
                 </div>
-                <p className="text-xs text-slate-500 max-w-2xl">
-                  {hubT.templateBannerDesc || (isAr ? 'قم بتحميل النماذج القياسية الجاهزة المنسقة مع أمثلة عملية لاستيراد بياناتك فوراً وبشكل آلي 100% عبر الحوار الأصلي للويندوز.' : 'Download pre-formatted Excel templates with styled headers and realistic sample rows for instant automated import using native Windows Save As dialog.')}
-                </p>
+                <div className="text-[11px] font-medium text-slate-400 bg-slate-50 px-2.5 py-1 rounded border border-slate-200 self-start md:self-auto">
+                  {isAr ? 'تخطيط Excel متوافق مع اللغة الحالية (RTL)' : 'Language-aware Excel layout (LTR)'}
+                </div>
               </div>
 
-              <div className="flex flex-wrap items-center gap-2.5 shrink-0">
-                {/* Sales Template Button */}
-                <button
-                  onClick={() => handleDownloadTemplate('sales')}
-                  disabled={downloadingTemplate === 'sales'}
-                  className="flex items-center gap-2 px-3 py-2 bg-emerald-50 border border-emerald-300 hover:bg-emerald-100 text-emerald-800 rounded text-xs font-semibold transition cursor-pointer shadow-xs disabled:opacity-50"
-                >
-                  <Download className={`w-3.5 h-3.5 text-emerald-600 ${downloadingTemplate === 'sales' ? 'animate-bounce' : ''}`} />
-                  <span>{hubT.downloadSalesTemplate || (isAr ? 'نموذج المبيعات (.xlsx)' : 'Sales Template (.xlsx)')}</span>
-                </button>
+              {/* 3 Template Cards with Localized Column Preview Pills */}
+              <div className="grid grid-cols-1 md:grid-cols-3 gap-3.5">
+                {/* Sales Template Card */}
+                <div className="border border-emerald-200/80 bg-emerald-50/30 rounded-lg p-3.5 flex flex-col justify-between gap-3 hover:border-emerald-300 transition shadow-2xs">
+                  <div>
+                    <div className="flex items-center justify-between gap-2 mb-1.5">
+                      <span className="text-xs font-bold text-emerald-900 flex items-center gap-1.5">
+                        <span className="w-2 h-2 rounded-full bg-emerald-500"></span>
+                        {isAr ? 'نموذج المبيعات' : 'Sales Template'}
+                      </span>
+                      <span className="text-[10px] font-semibold text-emerald-700 bg-emerald-100/80 px-1.5 py-0.5 rounded">
+                        {templateColumns.sales.length} {isAr ? 'أعمدة' : 'cols'}
+                      </span>
+                    </div>
+                    <p className="text-[11px] text-slate-500 mb-2.5">
+                      {isAr ? 'حركات المبيعات الشهرية أو الدورية لحساب التنبؤ بالطلب' : 'Periodic sales transactions and revenue history'}
+                    </p>
+                    <div className="flex flex-wrap gap-1">
+                      {templateColumns.sales.map((col, idx) => (
+                        <span key={idx} className="px-1.5 py-0.5 bg-white border border-emerald-200 text-emerald-800 text-[10px] font-medium rounded">
+                          {col}
+                        </span>
+                      ))}
+                    </div>
+                  </div>
+                  <button
+                    onClick={() => handleDownloadTemplate('sales')}
+                    disabled={downloadingTemplate === 'sales'}
+                    className="flex items-center justify-center gap-2 px-3 py-1.5 bg-emerald-600 hover:bg-emerald-700 text-white rounded text-xs font-semibold transition cursor-pointer shadow-xs disabled:opacity-50 mt-1"
+                  >
+                    <Download className={`w-3.5 h-3.5 ${downloadingTemplate === 'sales' ? 'animate-bounce' : ''}`} />
+                    <span>{hubT.downloadSalesTemplate || (isAr ? 'تحميل نموذج المبيعات (.xlsx)' : 'Download Sales Template (.xlsx)')}</span>
+                  </button>
+                </div>
 
-                {/* Inventory Template Button */}
-                <button
-                  onClick={() => handleDownloadTemplate('inventory')}
-                  disabled={downloadingTemplate === 'inventory'}
-                  className="flex items-center gap-2 px-3 py-2 bg-[#2196F3]/10 border border-[#2196F3]/30 hover:bg-[#2196F3]/20 text-blue-900 rounded text-xs font-semibold transition cursor-pointer shadow-xs disabled:opacity-50"
-                >
-                  <Download className={`w-3.5 h-3.5 text-[#2196F3] ${downloadingTemplate === 'inventory' ? 'animate-bounce' : ''}`} />
-                  <span>{hubT.downloadInventoryTemplate || (isAr ? 'نموذج المخزون (.xlsx)' : 'Inventory Template (.xlsx)')}</span>
-                </button>
+                {/* Inventory Template Card */}
+                <div className="border border-blue-200/80 bg-blue-50/30 rounded-lg p-3.5 flex flex-col justify-between gap-3 hover:border-blue-300 transition shadow-2xs">
+                  <div>
+                    <div className="flex items-center justify-between gap-2 mb-1.5">
+                      <span className="text-xs font-bold text-blue-900 flex items-center gap-1.5">
+                        <span className="w-2 h-2 rounded-full bg-[#2196F3]"></span>
+                        {isAr ? 'نموذج المخزون' : 'Inventory Master'}
+                      </span>
+                      <span className="text-[10px] font-semibold text-blue-700 bg-blue-100/80 px-1.5 py-0.5 rounded">
+                        {templateColumns.inventory.length} {isAr ? 'عموداً' : 'cols'}
+                      </span>
+                    </div>
+                    <p className="text-[11px] text-slate-500 mb-2.5">
+                      {isAr ? 'سجل الأصناف، الأرصدة، مهل التوريد ومستويات الخدمة المستهدفة' : 'SKU parameters, balances, lead times & service levels'}
+                    </p>
+                    <div className="flex flex-wrap gap-1 max-h-24 overflow-y-auto">
+                      {templateColumns.inventory.map((col, idx) => (
+                        <span key={idx} className="px-1.5 py-0.5 bg-white border border-blue-200 text-blue-800 text-[10px] font-medium rounded">
+                          {col}
+                        </span>
+                      ))}
+                    </div>
+                  </div>
+                  <button
+                    onClick={() => handleDownloadTemplate('inventory')}
+                    disabled={downloadingTemplate === 'inventory'}
+                    className="flex items-center justify-center gap-2 px-3 py-1.5 bg-[#2196F3] hover:bg-blue-600 text-white rounded text-xs font-semibold transition cursor-pointer shadow-xs disabled:opacity-50 mt-1"
+                  >
+                    <Download className={`w-3.5 h-3.5 ${downloadingTemplate === 'inventory' ? 'animate-bounce' : ''}`} />
+                    <span>{hubT.downloadInventoryTemplate || (isAr ? 'تحميل نموذج المخزون (.xlsx)' : 'Download Inventory Template (.xlsx)')}</span>
+                  </button>
+                </div>
 
-                {/* In-Transit Template Button */}
-                <button
-                  onClick={() => handleDownloadTemplate('in-transit')}
-                  disabled={downloadingTemplate === 'in-transit'}
-                  className="flex items-center gap-2 px-3 py-2 bg-amber-50 border border-amber-300 hover:bg-amber-100 text-amber-900 rounded text-xs font-semibold transition cursor-pointer shadow-xs disabled:opacity-50"
-                >
-                  <Download className={`w-3.5 h-3.5 text-amber-600 ${downloadingTemplate === 'in-transit' ? 'animate-bounce' : ''}`} />
-                  <span>{isAr ? 'نموذج الشحنات بالطريق (.xlsx)' : 'In-Transit Template (.xlsx)'}</span>
-                </button>
+                {/* In-Transit Template Card */}
+                <div className="border border-amber-200/80 bg-amber-50/30 rounded-lg p-3.5 flex flex-col justify-between gap-3 hover:border-amber-300 transition shadow-2xs">
+                  <div>
+                    <div className="flex items-center justify-between gap-2 mb-1.5">
+                      <span className="text-xs font-bold text-amber-900 flex items-center gap-1.5">
+                        <span className="w-2 h-2 rounded-full bg-amber-500"></span>
+                        {isAr ? 'نموذج الشحنات بالطريق' : 'In-Transit Shipments'}
+                      </span>
+                      <span className="text-[10px] font-semibold text-amber-700 bg-amber-100/80 px-1.5 py-0.5 rounded">
+                        {templateColumns.inTransit.length} {isAr ? 'أعمدة' : 'cols'}
+                      </span>
+                    </div>
+                    <p className="text-[11px] text-slate-500 mb-2.5">
+                      {isAr ? 'أوامر الشراء المفتوحة ومواعيد الوصول وحالات التخليص' : 'Open purchase orders, delivery ETAs & transit status'}
+                    </p>
+                    <div className="flex flex-wrap gap-1">
+                      {templateColumns.inTransit.map((col, idx) => (
+                        <span key={idx} className="px-1.5 py-0.5 bg-white border border-amber-200 text-amber-800 text-[10px] font-medium rounded">
+                          {col}
+                        </span>
+                      ))}
+                    </div>
+                  </div>
+                  <button
+                    onClick={() => handleDownloadTemplate('in-transit')}
+                    disabled={downloadingTemplate === 'in-transit'}
+                    className="flex items-center justify-center gap-2 px-3 py-1.5 bg-amber-600 hover:bg-amber-700 text-white rounded text-xs font-semibold transition cursor-pointer shadow-xs disabled:opacity-50 mt-1"
+                  >
+                    <Download className={`w-3.5 h-3.5 ${downloadingTemplate === 'in-transit' ? 'animate-bounce' : ''}`} />
+                    <span>{isAr ? 'تحميل نموذج الشحن (.xlsx)' : 'Download In-Transit Template (.xlsx)'}</span>
+                  </button>
+                </div>
               </div>
             </div>
 

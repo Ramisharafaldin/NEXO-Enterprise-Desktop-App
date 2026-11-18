@@ -709,28 +709,28 @@ def sync_saved_source(project_id: str):
 BILINGUAL_MAP: Dict[str, List[str]] = {
     "code": ["code", "sku", "item_code", "itemcode", "item", "كود الصنف", "كود", "رمز الصنف", "رقم الصنف"],
     "description": ["desc", "description", "item_description", "name", "item_name", "اسم الصنف", "الوصف", "بيان الصنف"],
-    "category": ["category", "cat", "cati", "family", "group", "product_line", "التصنيف", "الفئة", "المجموعة"],
-    "location": ["loc", "location", "loca", "warehouse", "wh", "branch", "site", "المستودع", "المخزن", "الفرع", "الموقع"],
-    "on_hand": ["on_hand", "onhand", "onha", "stock", "balance", "qty_on_hand", "inventory", "الرصيد", "الرصيد الحالي", "المخزون الحالي", "المتوفر"],
-    "on_order": ["on_order", "onorder", "onow", "onor", "in_transit", "po_qty", "تحت الطلب", "في الطريق", "أوامر مفتوحة"],
-    "lead_time_days": ["lead_time", "leadtime", "lt", "ltim", "lead_time_days", "فترة التوريد", "فترة التوريد (يوم)", "مهلة التوريد"],
-    "lead_time_variance_days": ["lt_var", "ltiv", "lead_time_variance", "تباين التوريد", "انحراف التوريد"],
-    "service_level": ["service_level", "servicelevel", "sl", "slev", "مستوى الخدمة", "نسبة الخدمة"],
-    "min_batch": ["min_batch", "moq", "minb", "min_order", "أدنى كمية", "أقل كمية للطلب", "الحد الأدنى للطلب"],
-    "batch_rounding": ["batch_rounding", "rounding", "brou", "box_qty", "مضاعفات الطلب", "الكرتونة", "حجم الصندوق"],
+    "category": ["category", "cat", "cati", "family", "group", "product_line", "القسم / المجموعة", "التصنيف", "الفئة", "المجموعة", "القسم"],
+    "location": ["loc", "location", "loca", "warehouse", "wh", "branch", "site", "الفرع / المخزن", "المستودع", "المخزن", "الفرع", "الموقع"],
+    "on_hand": ["on_hand", "onhand", "onha", "stock", "balance", "qty_on_hand", "inventory", "الرصيد المتوفر", "الرصيد", "الرصيد الحالي", "المخزون الحالي", "المتوفر"],
+    "on_order": ["on_order", "onorder", "onow", "onor", "in_transit", "po_qty", "قيد التوريد", "تحت الطلب", "في الطريق", "أوامر مفتوحة"],
+    "lead_time_days": ["lead_time", "leadtime", "lt", "ltim", "lead_time_days", "مهلة التوريد (يوم)", "مهلة التوريد", "فترة التوريد (يوم)", "فترة التوريد"],
+    "lead_time_variance_days": ["lt_var", "ltiv", "lead_time_variance", "تذبذب التوريد", "تباين التوريد", "انحراف التوريد"],
+    "service_level": ["service_level", "servicelevel", "sl", "slev", "مستوى الخدمة %", "مستوى الخدمة", "نسبة الخدمة"],
+    "min_batch": ["min_batch", "moq", "minb", "min_order", "الحد الأدنى للطلب", "أدنى كمية", "أقل كمية للطلب"],
+    "batch_rounding": ["batch_rounding", "rounding", "brou", "box_qty", "مضاعفات العبوة", "مضاعفات الطلب", "الكرتونة", "حجم الصندوق"],
     "purchase_price": ["cost", "purchase_price", "unit_cost", "purchase_cost", "سعر التكلفة", "التكلفة", "سعر الشراء"],
     "sales_price": ["price", "sales_price", "retail", "selling_price", "pric", "سعر البيع", "السعر"],
     "supplier": ["supplier", "supp", "vendor", "المورد", "اسم المورد"],
-    "period": ["period", "date", "month", "period_date", "الفترة", "التاريخ", "الشهر"],
+    "period": ["period", "date", "month", "period_date", "الفترة / الشهر", "الفترة", "التاريخ", "الشهر"],
     "qty_sold": ["qty_sold", "actual", "sales_qty", "quantity_sold", "units_sold", "الكمية المباعة", "المبيعات", "الكمية"],
     "revenue": ["revenue", "sales_value", "amount", "total_sales", "قيمة المبيعات", "الإيراد", "المبلغ"],
-    "order_no": ["order_no", "order", "po_number", "po", "order_id", "order_num", "رقم الطلب", "رقم أمر الشراء", "رقم الشحنة", "رقم الأمر"],
-    "origin": ["origin", "source", "port_of_origin", "from_location", "من", "المصدر", "مكان الشحن", "ميناء الشحن"],
-    "destination": ["destination", "dest", "target_wh", "to_location", "إلى", "المستودع المستلم", "الوجهة", "الموقع"],
-    "eta_date": ["eta_date", "eta", "arrival_date", "delivery_date", "تاريخ الوصول", "تاريخ الوصول المتوقع", "تاريخ الاستلام"],
+    "order_no": ["order_no", "order", "po_number", "po", "order_id", "order_num", "رقم أمر الشراء / الشحنة", "رقم أمر الشراء", "رقم الطلب", "رقم الشحنة", "رقم الأمر"],
+    "origin": ["origin", "source", "port_of_origin", "from_location", "مكان الشحن", "ميناء الشحن", "المصدر", "من"],
+    "destination": ["destination", "dest", "target_wh", "to_location", "الفرع / المخزن", "المستودع المستلم", "الوجهة", "الموقع", "إلى"],
+    "eta_date": ["eta_date", "eta", "arrival_date", "delivery_date", "expected_date", "تاريخ الوصول المتوقع", "تاريخ الوصول", "تاريخ الاستلام"],
     "carrier": ["carrier", "shipping_line", "forwarder", "transport", "الناقل", "شركة الشحن", "الخط الملاحي"],
-    "status": ["status", "shipment_status", "الحالة", "حالة الشحنة"],
-    "quantity": ["quantity", "qty", "units", "shipped_qty", "الكمية", "العدد", "عدد الوحدات"]
+    "status": ["status", "shipment_status", "حالة الشحنة", "الحالة"],
+    "quantity": ["quantity", "qty", "units", "shipped_qty", "qty_in_transit", "الكمية في الطريق", "الكمية", "العدد", "عدد الوحدات"]
 }
 
 def _match_column(cols: List[str], mapping: Dict[str, str], field: str) -> Optional[str]:
@@ -738,31 +738,68 @@ def _match_column(cols: List[str], mapping: Dict[str, str], field: str) -> Optio
     if field in mapping and mapping[field] in cols:
         return mapping[field]
     candidates = BILINGUAL_MAP.get(field, [])
+    # 1. Exact match (case-insensitive)
     for c in cols:
         cl = str(c).strip().lower()
         for cand in candidates:
-            if cand.lower() == cl or cand.lower() in cl:
+            if cand.lower() == cl:
+                return c
+    # 2. Substring match
+    for c in cols:
+        cl = str(c).strip().lower()
+        for cand in candidates:
+            if cand.lower() in cl or cl in cand.lower():
                 return c
     return None
 
+def _resolve_lang(lang: Optional[str]) -> str:
+    if lang and lang.strip().lower() in ["ar", "en"]:
+        return lang.strip().lower()
+    try:
+        settings = get_app_settings()
+        return str(settings.get("language", "en")).lower()
+    except Exception:
+        return "en"
+
 @app.get("/api/templates/sales")
-def download_sales_template():
-    """Generates standard NEXO Sales Excel Template (.xlsx) with styled header and sample rows."""
+def download_sales_template(lang: Optional[str] = None):
+    """
+    Generates standard NEXO Sales Excel Template (.xlsx) with styled header and sample rows.
+    Supports Arabic RTL (lang=ar) and English LTR (lang=en) formats.
+    """
     import openpyxl
     from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
     from openpyxl.utils import get_column_letter
 
+    resolved_lang = _resolve_lang(lang)
+    is_ar = (resolved_lang == "ar")
+
     wb = openpyxl.Workbook()
     ws_data = wb.active
-    ws_data.title = "Sales_Data"
+    ws_data.title = "نموذج_المبيعات" if is_ar else "Sales_Data"
+    if is_ar:
+        ws_data.sheet_view.rightToLeft = True
 
-    headers = [
-        "CODE",
-        "LOCA",
-        "PERIOD",
-        "QTY_SOLD",
-        "REVENUE"
-    ]
+    if is_ar:
+        headers = ["كود الصنف", "الفرع / المخزن", "الفترة / الشهر", "الكمية المباعة", "قيمة المبيعات"]
+        sample_rows = [
+            ("SKU-1001", "المستودع الرئيسي", "2025-10", 145, 7250.0),
+            ("SKU-1001", "المستودع الرئيسي", "2025-11", 160, 8000.0),
+            ("SKU-1001", "المستودع الرئيسي", "2025-12", 210, 10500.0),
+            ("SKU-1002", "فرع الرياض", "2025-10", 80, 12000.0),
+            ("SKU-1002", "فرع الرياض", "2025-11", 85, 12750.0),
+            ("SKU-1002", "فرع الرياض", "2025-12", 110, 16500.0),
+        ]
+    else:
+        headers = ["CODE", "LOCA", "PERIOD", "QTY_SOLD", "REVENUE"]
+        sample_rows = [
+            ("SKU-1001", "WH-MAIN", "2025-10", 145, 7250.0),
+            ("SKU-1001", "WH-MAIN", "2025-11", 160, 8000.0),
+            ("SKU-1001", "WH-MAIN", "2025-12", 210, 10500.0),
+            ("SKU-1002", "WH-EAST", "2025-10", 80, 12000.0),
+            ("SKU-1002", "WH-EAST", "2025-11", 85, 12750.0),
+            ("SKU-1002", "WH-EAST", "2025-12", 110, 16500.0),
+        ]
 
     header_fill = PatternFill(start_color="343D46", end_color="343D46", fill_type="solid")
     header_font = Font(name="Segoe UI", size=11, bold=True, color="FFFFFF")
@@ -780,15 +817,6 @@ def download_sales_template():
         cell.font = header_font
         cell.alignment = align_center
 
-    sample_rows = [
-        ("SKU-1001", "WH-MAIN", "2025-10", 145, 7250.0),
-        ("SKU-1001", "WH-MAIN", "2025-11", 160, 8000.0),
-        ("SKU-1001", "WH-MAIN", "2025-12", 210, 10500.0),
-        ("SKU-1002", "WH-EAST", "2025-10", 80, 12000.0),
-        ("SKU-1002", "WH-EAST", "2025-11", 85, 12750.0),
-        ("SKU-1002", "WH-EAST", "2025-12", 110, 16500.0),
-    ]
-
     data_font = Font(name="Segoe UI", size=10)
     for row_idx, r_data in enumerate(sample_rows, start=2):
         for col_idx, val in enumerate(r_data, start=1):
@@ -803,64 +831,121 @@ def download_sales_template():
     for col in ws_data.columns:
         max_len = max(len(str(cell.value or '')) for cell in col)
         col_letter = get_column_letter(col[0].column)
-        ws_data.column_dimensions[col_letter].width = max(max_len + 4, 15)
+        ws_data.column_dimensions[col_letter].width = max(max_len + 6, 18 if is_ar else 15)
 
     # Instructions sheet
-    ws_info = wb.create_sheet(title="Instructions_AR_EN")
-    info_rows = [
-        ["NEXO Sales Data Template Instructions | إرشادات تعبئة نموذج مبيعات نيكسو"],
-        [""],
-        ["Field (الحقل)", "Format (الصيغة)", "Description (الوصف EN)", "الوصف والتعليمات (AR)"],
-        ["CODE", "Text (نص)", "Item SKU identifier matching inventory master", "كود الصنف الفريد المطابق لسجل المخزون"],
-        ["LOCA", "Text (نص)", "Warehouse or branch location code (e.g. WH-MAIN)", "كود المستودع أو الفرع أو موقع البيع"],
-        ["PERIOD", "YYYY-MM (تاريخ)", "Period month in YYYY-MM format (e.g. 2025-11)", "تاريخ الفترة الشهرية بصيغة YYYY-MM (مثال: 2025-11)"],
-        ["QTY_SOLD", "Number >= 0 (رقم)", "Actual units sold during the period", "الكمية الفعلية المباعة خلال الفترة (أكبر من أو يساوي صفر)"],
-        ["REVENUE", "Number >= 0 (رقم)", "Total sales revenue during the period", "إجمالي قيمة المبيعات أو الإيراد خلال الفترة"],
-        [""],
-        ["Important Notes | ملاحظات هامة:"],
-        ["1. Keep the English header codes (CODE, LOCA, PERIOD, QTY_SOLD, REVENUE) in Row 1 for 100% automated ingestion."],
-        ["2. If you use Arabic column headers (كود الصنف, الفرع, الفترة, الكمية المباعة, قيمة المبيعات), the NEXO Smart Mapper will recognize them automatically."],
-        ["3. Blank lines or sample rows can be deleted or overwritten before importing into NEXO."]
-    ]
-    for row_idx, r in enumerate(info_rows, start=1):
-        for col_idx, val in enumerate(r, start=1):
-            cell = ws_info.cell(row=row_idx, column=col_idx, value=val)
-            if row_idx == 1:
-                cell.font = Font(name="Segoe UI", size=13, bold=True, color="2196F3")
-            elif row_idx == 3 or row_idx == 10:
-                cell.font = Font(name="Segoe UI", size=10, bold=True)
-            else:
-                cell.font = Font(name="Segoe UI", size=9)
+    if is_ar:
+        ws_info = wb.create_sheet(title="تعليمات_الاستخدام")
+        ws_info.sheet_view.rightToLeft = True
+        info_rows = [
+            ["إرشادات تعبئة نموذج مبيعات نيكسو (NEXO Sales Template)"],
+            [""],
+            ["الحقل (العمود)", "نوع البيانات", "الوصف والتعليمات التفصيلية"],
+            ["كود الصنف", "نص (Text)", "كود الصنف الفريد المطابق لسجل المخزون الأساسي (مثال: SKU-1001)"],
+            ["الفرع / المخزن", "نص (Text)", "كود أو اسم المستودع أو الفرع أو موقع البيع (مثال: المستودع الرئيسي)"],
+            ["الفترة / الشهر", "تاريخ YYYY-MM", "الفترة الشهرية للطلب التاريخي بصيغة YYYY-MM (مثال: 2025-11)"],
+            ["الكمية المباعة", "رقم (>= 0)", "إجمالي الكمية الفعلية المباعة خلال الفترة"],
+            ["قيمة المبيعات", "رقم (>= 0)", "إجمالي الإيرادات أو القيمة النقدية للمبيعات خلال الفترة"],
+            [""],
+            ["ملاحظات هامة للربط الآلي المباشر:"],
+            ["1. يتعرف نظام NEXO تلقائياً وبنسبة 100% على ترويسات الأعمدة باللغة العربية دون الحاجة لأي تعديل."],
+            ["2. يمكنك تعديل أو حذف الأسطر التجريبية وإضافة بيانات أصنافك ومبيعاتك الفعلية."],
+            ["3. احفظ الملف بصيغة Excel (.xlsx) ثم ارفعه مباشرة في شاشة تغذية البيانات (Data Hub)."]
+        ]
+        for row_idx, r in enumerate(info_rows, start=1):
+            for col_idx, val in enumerate(r, start=1):
+                cell = ws_info.cell(row=row_idx, column=col_idx, value=val)
+                if row_idx == 1:
+                    cell.font = Font(name="Segoe UI", size=13, bold=True, color="2196F3")
+                elif row_idx in [3, 10]:
+                    cell.font = Font(name="Segoe UI", size=10, bold=True)
+                else:
+                    cell.font = Font(name="Segoe UI", size=9)
+        ws_info.column_dimensions['A'].width = 22
+        ws_info.column_dimensions['B'].width = 20
+        ws_info.column_dimensions['C'].width = 65
+    else:
+        ws_info = wb.create_sheet(title="Instructions_AR_EN")
+        info_rows = [
+            ["NEXO Sales Data Template Instructions | إرشادات تعبئة نموذج مبيعات نيكسو"],
+            [""],
+            ["Field (الحقل)", "Format (الصيغة)", "Description (الوصف EN)", "الوصف والتعليمات (AR)"],
+            ["CODE", "Text (نص)", "Item SKU identifier matching inventory master", "كود الصنف الفريد المطابق لسجل المخزون"],
+            ["LOCA", "Text (نص)", "Warehouse or branch location code (e.g. WH-MAIN)", "كود المستودع أو الفرع أو موقع البيع"],
+            ["PERIOD", "YYYY-MM (تاريخ)", "Period month in YYYY-MM format (e.g. 2025-11)", "تاريخ الفترة الشهرية بصيغة YYYY-MM (مثال: 2025-11)"],
+            ["QTY_SOLD", "Number >= 0 (رقم)", "Actual units sold during the period", "الكمية الفعلية المباعة خلال الفترة"],
+            ["REVENUE", "Number >= 0 (رقم)", "Total sales revenue during the period", "إجمالي قيمة المبيعات أو الإيراد خلال الفترة"],
+            [""],
+            ["Important Notes | ملاحظات هامة:"],
+            ["1. Keep the English header codes (CODE, LOCA, PERIOD, QTY_SOLD, REVENUE) in Row 1 for 100% automated ingestion."],
+            ["2. If you use Arabic column headers, the NEXO Smart Mapper will recognize them automatically."],
+            ["3. Blank lines or sample rows can be deleted or overwritten before importing into NEXO."]
+        ]
+        for row_idx, r in enumerate(info_rows, start=1):
+            for col_idx, val in enumerate(r, start=1):
+                cell = ws_info.cell(row=row_idx, column=col_idx, value=val)
+                if row_idx == 1:
+                    cell.font = Font(name="Segoe UI", size=13, bold=True, color="2196F3")
+                elif row_idx in [3, 10]:
+                    cell.font = Font(name="Segoe UI", size=10, bold=True)
+                else:
+                    cell.font = Font(name="Segoe UI", size=9)
+        ws_info.column_dimensions['A'].width = 18
+        ws_info.column_dimensions['B'].width = 22
+        ws_info.column_dimensions['C'].width = 45
+        ws_info.column_dimensions['D'].width = 50
 
-    ws_info.column_dimensions['A'].width = 18
-    ws_info.column_dimensions['B'].width = 22
-    ws_info.column_dimensions['C'].width = 45
-    ws_info.column_dimensions['D'].width = 50
-
+    filename = "NEXO_Sales_Template_AR.xlsx" if is_ar else "NEXO_Sales_Template_EN.xlsx"
     buf = io.BytesIO()
     wb.save(buf)
     buf.seek(0)
     return Response(
         content=buf.getvalue(),
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        headers={"Content-Disposition": "attachment; filename=NEXO_Sales_Template.xlsx"}
+        headers={"Content-Disposition": f"attachment; filename={filename}"}
     )
 
 @app.get("/api/templates/inventory")
-def download_inventory_template():
-    """Generates standard NEXO Inventory Master Excel Template (.xlsx) with styled header and sample rows."""
+def download_inventory_template(lang: Optional[str] = None):
+    """
+    Generates standard NEXO Inventory Master Excel Template (.xlsx) with styled header and sample rows.
+    Supports Arabic RTL (lang=ar) and English LTR (lang=en) formats.
+    """
     import openpyxl
     from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
     from openpyxl.utils import get_column_letter
 
+    resolved_lang = _resolve_lang(lang)
+    is_ar = (resolved_lang == "ar")
+
     wb = openpyxl.Workbook()
     ws_data = wb.active
-    ws_data.title = "Inventory_Master"
+    ws_data.title = "نموذج_المخزون" if is_ar else "Inventory_Master"
+    if is_ar:
+        ws_data.sheet_view.rightToLeft = True
 
-    headers = [
-        "CODE", "DESC", "CATI", "LOCA", "ONHA", "ONOW",
-        "LTIM", "LTIV", "SLEV", "MINB", "BROU", "COST", "PRIC", "SUPP"
-    ]
+    if is_ar:
+        headers = [
+            "كود الصنف", "اسم الصنف", "القسم / المجموعة", "الفرع / المخزن",
+            "الرصيد المتوفر", "قيد التوريد", "مهلة التوريد (يوم)", "تذبذب التوريد",
+            "مستوى الخدمة %", "الحد الأدنى للطلب", "مضاعفات العبوة", "سعر التكلفة",
+            "سعر البيع", "المورد"
+        ]
+        sample_rows = [
+            ("SKU-1001", "بن قهوة فاخر أرابيكا 250 جم", "مشروبات ساخنة", "المستودع الرئيسي", 240, 100, 21, 3, 0.95, 20, 10, 28.5, 45.0, "شركة التحميص العالمية"),
+            ("SKU-1002", "شاي أخضر عضوي عبوة 100 كيس", "مشروبات ساخنة", "فرع الرياض", 150, 0, 14, 2, 0.98, 50, 25, 12.0, 22.0, "مؤسسة الأعشاب الطبيعية"),
+            ("SKU-1003", "مكبس قهوة فرنسي ستانلس ستيل", "أدوات ومعدات", "المستودع الرئيسي", 45, 30, 45, 7, 0.90, 12, 6, 85.0, 140.0, "تجهيزات المطاعم الدولية"),
+        ]
+    else:
+        headers = [
+            "CODE", "DESC", "CATI", "LOCA", "ONHA", "ONOW",
+            "LTIM", "LTIV", "SLEV", "MINB", "BROU", "COST", "PRIC", "SUPP"
+        ]
+        sample_rows = [
+            ("SKU-1001", "Premium Coffee Blend 250g", "Beverages", "WH-MAIN", 240, 100, 21, 3, 0.95, 20, 10, 28.5, 45.0, "Global Roast Ltd"),
+            ("SKU-1002", "Organic Green Tea Box 100s", "Beverages", "WH-EAST", 150, 0, 14, 2, 0.98, 50, 25, 12.0, 22.0, "Ceylon Herbs Co"),
+            ("SKU-1003", "Stainless Steel French Press", "Equipment", "WH-MAIN", 45, 30, 45, 7, 0.90, 12, 6, 85.0, 140.0, "KitchenTech Int"),
+        ]
 
     header_fill = PatternFill(start_color="343D46", end_color="343D46", fill_type="solid")
     header_font = Font(name="Segoe UI", size=10, bold=True, color="FFFFFF")
@@ -877,12 +962,6 @@ def download_inventory_template():
         cell.fill = header_fill
         cell.font = header_font
         cell.alignment = align_center
-
-    sample_rows = [
-        ("SKU-1001", "Premium Coffee Blend 250g", "Beverages", "WH-MAIN", 240, 100, 21, 3, 0.95, 20, 10, 28.5, 45.0, "Global Roast Ltd"),
-        ("SKU-1002", "Organic Green Tea Box 100s", "Beverages", "WH-EAST", 150, 0, 14, 2, 0.98, 50, 25, 12.0, 22.0, "Ceylon Herbs Co"),
-        ("SKU-1003", "Stainless Steel French Press", "Equipment", "WH-MAIN", 45, 30, 45, 7, 0.90, 12, 6, 85.0, 140.0, "KitchenTech Int"),
-    ]
 
     data_font = Font(name="Segoe UI", size=9)
     for row_idx, r_data in enumerate(sample_rows, start=2):
@@ -891,79 +970,142 @@ def download_inventory_template():
             cell.font = data_font
             cell.border = thin_border
             if col_idx in [1, 3, 4, 14]:
-                cell.alignment = Alignment(horizontal="left", vertical="center")
+                cell.alignment = Alignment(horizontal="left" if not is_ar else "right", vertical="center")
             elif col_idx == 2:
-                cell.alignment = Alignment(horizontal="left", vertical="center")
+                cell.alignment = Alignment(horizontal="left" if not is_ar else "right", vertical="center")
             else:
                 cell.alignment = Alignment(horizontal="right", vertical="center")
 
     for col in ws_data.columns:
         max_len = max(len(str(cell.value or '')) for cell in col)
         col_letter = get_column_letter(col[0].column)
-        ws_data.column_dimensions[col_letter].width = max(max_len + 3, 11)
+        ws_data.column_dimensions[col_letter].width = max(max_len + 4, 15 if is_ar else 11)
 
     # Instructions sheet
-    ws_info = wb.create_sheet(title="Instructions_AR_EN")
-    info_rows = [
-        ["NEXO Inventory Master Template Instructions | إرشادات تعبئة سجل المخزون"],
-        [""],
-        ["Field (الحقل)", "Required", "Description (الوصف EN)", "الوصف والتفاصيل (AR)"],
-        ["CODE", "Yes", "Unique Item SKU Code", "كود الصنف الفريد (إلزامي)"],
-        ["DESC", "No", "Item Description or Product Name", "اسم الصنف أو الوصف التجاري"],
-        ["CATI", "No", "Category or Product Family", "التصنيف الرئيسي أو العائلة السلعية"],
-        ["LOCA", "No", "Warehouse or Branch Location Code", "كود المستودع أو الفرع (افتراضي: Main Warehouse)"],
-        ["ONHA", "Yes", "Current On-Hand Stock (>= 0)", "الرصيد الفعلي الحالي في المستودع"],
-        ["ONOW", "No", "Open Purchase Orders in transit (>= 0)", "البضاعة تحت الطلب وفي الطريق"],
-        ["LTIM", "No", "Replenishment Lead Time in Days (e.g. 30)", "فترة التوريد بالأيام (افتراضي: 30 يوماً)"],
-        ["LTIV", "No", "Lead Time Variance in Days (e.g. 5)", "تباين أو عدم استقرار التوريد بالأيام"],
-        ["SLEV", "No", "Target Service Level percentage (e.g. 0.95)", "مستوى الخدمة المستهدف كنسبة (0.90 إلى 0.99)"],
-        ["MINB", "No", "Minimum Order Quantity (MOQ)", "أدنى كمية للطلب من المورد"],
-        ["BROU", "No", "Batch / Carton Rounding Multiple", "مضاعفات كرتونة أو علبة الشحن"],
-        ["COST", "Yes", "Unit Purchase Cost", "تكلفة شراء الوحدة"],
-        ["PRIC", "No", "Unit Sales Price", "سعر البيع للوحدة"],
-        ["SUPP", "No", "Primary Supplier or Vendor Name", "اسم المورد أو المصنع الرئيسي"],
-        [""],
-        ["Bilingual Support | دعم اللغات:"],
-        ["NEXO automatically maps both English standard codes (CODE, ONHA, LTIM...) and Arabic headers (كود الصنف, الرصيد الحالي, فترة التوريد)."]
-    ]
-    for row_idx, r in enumerate(info_rows, start=1):
-        for col_idx, val in enumerate(r, start=1):
-            cell = ws_info.cell(row=row_idx, column=col_idx, value=val)
-            if row_idx == 1:
-                cell.font = Font(name="Segoe UI", size=13, bold=True, color="2196F3")
-            elif row_idx == 3 or row_idx == 19:
-                cell.font = Font(name="Segoe UI", size=10, bold=True)
-            else:
-                cell.font = Font(name="Segoe UI", size=9)
+    if is_ar:
+        ws_info = wb.create_sheet(title="تعليمات_الاستخدام")
+        ws_info.sheet_view.rightToLeft = True
+        info_rows = [
+            ["إرشادات تعبئة سجل المخزون الرئيسي (NEXO Inventory Master Template)"],
+            [""],
+            ["الحقل (العمود)", "إلزامي؟", "الوصف والتعليمات التفصيلية"],
+            ["كود الصنف", "نعم", "كود الصنف الفريد (رمز SKU) الذي يربط المخزون بالمبيعات"],
+            ["اسم الصنف", "لا", "اسم المنتج أو الوصف التجاري الكامل"],
+            ["القسم / المجموعة", "لا", "التصنيف السلعي أو العائلة الرئيسية (مثل: مشروبات، معدات)"],
+            ["الفرع / المخزن", "لا", "اسم أو كود الفرع أو المستودع (افتراضي: المستودع الرئيسي)"],
+            ["الرصيد المتوفر", "نعم", "الرصيد المخزني الفعلي المتوفر حالياً على الرف بالمستودع"],
+            ["قيد التوريد", "لا", "الكميات الجاري توريدها أو الشحنات المفتوحة في الطريق"],
+            ["مهلة التوريد (يوم)", "لا", "فترة الانتظار اللازمة من إصدار أمر الشراء حتى الاستلام (افتراضي: 30 يوماً)"],
+            ["تذبذب التوريد", "لا", "الانحراف المعياري لمهلة التوريد بالأيام لحساب مخزون الأمان بدقة"],
+            ["مستوى الخدمة %", "لا", "نسبة تلبية الطلب المستهدفة (مثال: 0.95 لنسبة 95%، 0.98 لنسبة 98%)"],
+            ["الحد الأدنى للطلب", "لا", "أقل كمية مقبولة للطلب من المورد (MOQ)"],
+            ["مضاعفات العبوة", "لا", "حجم الصندوق أو مضاعفات الكرتونة لتقريب أوامر الشراء"],
+            ["سعر التكلفة", "نعم", "تكلفة شراء الوحدة الواحدة لحساب رأس المال والميزانيات"],
+            ["سعر البيع", "لا", "سعر البيع للجمهور أو العميل لحساب تصنيف ABC ومعدل الدوران"],
+            ["المورد", "لا", "اسم المصنع أو المورد الرئيسي المعتمد"],
+            [""],
+            ["ملاحظات الاستيراد الآلي:"],
+            ["1. يدعم NEXO التعرف التلقائي الذكي على الحقول باللغة العربية والإنجليزية."],
+            ["2. يتم حفظ البيانات مباشرة داخل قاعدة بيانات DuckDB المحلية بأمان وسرعة فائقة."]
+        ]
+        for row_idx, r in enumerate(info_rows, start=1):
+            for col_idx, val in enumerate(r, start=1):
+                cell = ws_info.cell(row=row_idx, column=col_idx, value=val)
+                if row_idx == 1:
+                    cell.font = Font(name="Segoe UI", size=13, bold=True, color="2196F3")
+                elif row_idx in [3, 19]:
+                    cell.font = Font(name="Segoe UI", size=10, bold=True)
+                else:
+                    cell.font = Font(name="Segoe UI", size=9)
+        ws_info.column_dimensions['A'].width = 24
+        ws_info.column_dimensions['B'].width = 12
+        ws_info.column_dimensions['C'].width = 70
+    else:
+        ws_info = wb.create_sheet(title="Instructions_AR_EN")
+        info_rows = [
+            ["NEXO Inventory Master Template Instructions | إرشادات تعبئة سجل المخزون"],
+            [""],
+            ["Field (الحقل)", "Required", "Description (الوصف EN)", "الوصف والتفاصيل (AR)"],
+            ["CODE", "Yes", "Unique Item SKU Code", "كود الصنف الفريد (إلزامي)"],
+            ["DESC", "No", "Item Description or Product Name", "اسم الصنف أو الوصف التجاري"],
+            ["CATI", "No", "Category or Product Family", "التصنيف الرئيسي أو العائلة السلعية"],
+            ["LOCA", "No", "Warehouse or Branch Location Code", "كود المستودع أو الفرع (افتراضي: Main Warehouse)"],
+            ["ONHA", "Yes", "Current On-Hand Stock (>= 0)", "الرصيد الفعلي الحالي في المستودع"],
+            ["ONOW", "No", "Open Purchase Orders in transit (>= 0)", "البضاعة تحت الطلب وفي الطريق"],
+            ["LTIM", "No", "Replenishment Lead Time in Days (e.g. 30)", "فترة التوريد بالأيام (افتراضي: 30 يوماً)"],
+            ["LTIV", "No", "Lead Time Variance in Days (e.g. 5)", "تباين أو عدم استقرار التوريد بالأيام"],
+            ["SLEV", "No", "Target Service Level percentage (e.g. 0.95)", "مستوى الخدمة المستهدف كنسبة (0.90 إلى 0.99)"],
+            ["MINB", "No", "Minimum Order Quantity (MOQ)", "أدنى كمية للطلب من المورد"],
+            ["BROU", "No", "Batch / Carton Rounding Multiple", "مضاعفات كرتونة أو علبة الشحن"],
+            ["COST", "Yes", "Unit Purchase Cost", "تكلفة شراء الوحدة"],
+            ["PRIC", "No", "Unit Sales Price", "سعر البيع للوحدة"],
+            ["SUPP", "No", "Primary Supplier or Vendor Name", "اسم المورد أو المصنع الرئيسي"],
+            [""],
+            ["Bilingual Support | دعم اللغات:"],
+            ["NEXO automatically maps both English standard codes (CODE, ONHA, LTIM...) and Arabic headers (كود الصنف, الرصيد المتوفر, مهلة التوريد)."]
+        ]
+        for row_idx, r in enumerate(info_rows, start=1):
+            for col_idx, val in enumerate(r, start=1):
+                cell = ws_info.cell(row=row_idx, column=col_idx, value=val)
+                if row_idx == 1:
+                    cell.font = Font(name="Segoe UI", size=13, bold=True, color="2196F3")
+                elif row_idx in [3, 19]:
+                    cell.font = Font(name="Segoe UI", size=10, bold=True)
+                else:
+                    cell.font = Font(name="Segoe UI", size=9)
+        ws_info.column_dimensions['A'].width = 16
+        ws_info.column_dimensions['B'].width = 12
+        ws_info.column_dimensions['C'].width = 42
+        ws_info.column_dimensions['D'].width = 50
 
-    ws_info.column_dimensions['A'].width = 16
-    ws_info.column_dimensions['B'].width = 12
-    ws_info.column_dimensions['C'].width = 42
-    ws_info.column_dimensions['D'].width = 50
-
+    filename = "NEXO_Inventory_Template_AR.xlsx" if is_ar else "NEXO_Inventory_Template_EN.xlsx"
     buf = io.BytesIO()
     wb.save(buf)
     buf.seek(0)
     return Response(
         content=buf.getvalue(),
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        headers={"Content-Disposition": "attachment; filename=NEXO_Inventory_Template.xlsx"}
+        headers={"Content-Disposition": f"attachment; filename={filename}"}
     )
 
 @app.get("/api/templates/in-transit")
-def download_in_transit_template():
-    """Generates standard NEXO In-Transit Shipments Excel Template (.xlsx) with styled header and sample rows."""
+def download_in_transit_template(lang: Optional[str] = None):
+    """
+    Generates standard NEXO In-Transit Shipments Excel Template (.xlsx) with styled header and sample rows.
+    Supports Arabic RTL (lang=ar) and English LTR (lang=en) formats.
+    """
     import openpyxl
     from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
     from openpyxl.utils import get_column_letter
 
+    resolved_lang = _resolve_lang(lang)
+    is_ar = (resolved_lang == "ar")
+
     wb = openpyxl.Workbook()
     ws_data = wb.active
-    ws_data.title = "In_Transit_Shipments"
+    ws_data.title = "نموذج_الشحن" if is_ar else "In_Transit_Shipments"
+    if is_ar:
+        ws_data.sheet_view.rightToLeft = True
 
-    headers = [
-        "ITEM_CODE", "ORDER_NO", "ORIGIN", "DESTINATION", "QUANTITY", "ETA_DATE", "CARRIER", "STATUS"
-    ]
+    if is_ar:
+        headers = [
+            "كود الصنف", "الفرع / المخزن", "رقم أمر الشراء / الشحنة",
+            "الكمية في الطريق", "تاريخ الوصول المتوقع", "المورد", "حالة الشحنة"
+        ]
+        sample_rows = [
+            ("SKU-1001", "المستودع الرئيسي", "PO-98421", 350, "2026-03-25", "شركة التحميص العالمية", "في البحر"),
+            ("SKU-1002", "فرع الرياض", "PO-98444", 100, "2026-03-18", "مؤسسة الأعشاب الطبيعية", "تخليص جمركي"),
+            ("SKU-1003", "المستودع الرئيسي", "PO-98480", 500, "2026-03-10", "تجهيزات المطاعم الدولية", "في الطريق"),
+        ]
+    else:
+        headers = [
+            "CODE", "LOCA", "PO_NUMBER", "QTY_IN_TRANSIT", "EXPECTED_DATE", "SUPP", "STATUS"
+        ]
+        sample_rows = [
+            ("SKU-1001", "WH-MAIN", "PO-98421", 350, "2026-03-25", "Global Roast Ltd", "on_water"),
+            ("SKU-1002", "WH-EAST", "PO-98444", 100, "2026-03-18", "Ceylon Herbs Co", "customs_clearance"),
+            ("SKU-1003", "WH-MAIN", "PO-98480", 500, "2026-03-10", "KitchenTech Int", "in_transit"),
+        ]
 
     header_fill = PatternFill(start_color="343D46", end_color="343D46", fill_type="solid")
     header_font = Font(name="Segoe UI", size=10, bold=True, color="FFFFFF")
@@ -981,67 +1123,92 @@ def download_in_transit_template():
         cell.font = header_font
         cell.alignment = align_center
 
-    sample_rows = [
-        ("004652-BLU", "PO-98421", "Supplier (Port of Lisbon)", "WH-East (New Jersey)", 350, "2026-03-25", "Maersk Line", "on_water"),
-        ("1866-MB", "PO-98444", "Supplier (Hamburg)", "WH-West (San Francisco)", 100, "2026-03-18", "Hapag-Lloyd", "customs_clearance"),
-        ("VB2166-150", "PO-98480", "Pharma Lab (Geneva)", "WH-East (New Jersey)", 500, "2026-03-10", "DHL Global Forwarding", "in_transit"),
-    ]
-
     data_font = Font(name="Segoe UI", size=9)
     for row_idx, r_data in enumerate(sample_rows, start=2):
         for col_idx, val in enumerate(r_data, start=1):
             cell = ws_data.cell(row=row_idx, column=col_idx, value=val)
             cell.font = data_font
             cell.border = thin_border
-            if col_idx in [1, 2, 6, 8]:
+            if col_idx in [1, 2, 3, 5, 7]:
                 cell.alignment = align_center
-            elif col_idx in [3, 4, 7]:
-                cell.alignment = Alignment(horizontal="left", vertical="center")
+            elif col_idx in [4, 6]:
+                cell.alignment = Alignment(horizontal="right" if is_ar else "left", vertical="center")
             else:
                 cell.alignment = Alignment(horizontal="right", vertical="center")
 
     for col in ws_data.columns:
         max_len = max(len(str(cell.value or '')) for cell in col)
         col_letter = get_column_letter(col[0].column)
-        ws_data.column_dimensions[col_letter].width = max(max_len + 3, 14)
+        ws_data.column_dimensions[col_letter].width = max(max_len + 4, 16 if is_ar else 14)
 
     # Instructions sheet
-    ws_info = wb.create_sheet(title="Instructions_AR_EN")
-    info_rows = [
-        ["NEXO In-Transit Shipments Template Instructions | إرشادات شحنات وبضائع الطريق"],
-        [""],
-        ["Field (الحقل)", "Required", "Description (الوصف EN)", "الوصف والتفاصيل (AR)"],
-        ["ITEM_CODE", "Yes", "Item SKU matching inventory master", "كود الصنف المطابق لسجل المخزون"],
-        ["ORDER_NO", "Yes", "Purchase Order or Shipment Tracking No", "رقم أمر الشراء أو بوليصة الشحن"],
-        ["ORIGIN", "No", "Origin Port / Supplier Facility", "مكان أو ميناء الشحن"],
-        ["DESTINATION", "No", "Receiving Warehouse / Branch Location", "المستودع أو الفرع المستلم"],
-        ["QUANTITY", "Yes", "Shipped Units / Quantity in transit", "كمية الوحدات المشحونة في الطريق"],
-        ["ETA_DATE", "No", "Estimated Arrival Date (YYYY-MM-DD)", "تاريخ الوصول المتوقع (مثال: 2026-03-25)"],
-        ["CARRIER", "No", "Shipping line / freight forwarder name", "اسم الناقل أو الخط الملاحي"],
-        ["STATUS", "No", "Status: on_water, in_transit, customs_clearance", "حالة الشحنة: في البحر، في الطريق، جمارك"]
-    ]
-    for row_idx, r in enumerate(info_rows, start=1):
-        for col_idx, val in enumerate(r, start=1):
-            cell = ws_info.cell(row=row_idx, column=col_idx, value=val)
-            if row_idx == 1:
-                cell.font = Font(name="Segoe UI", size=13, bold=True, color="2196F3")
-            elif row_idx == 3:
-                cell.font = Font(name="Segoe UI", size=10, bold=True)
-            else:
-                cell.font = Font(name="Segoe UI", size=9)
+    if is_ar:
+        ws_info = wb.create_sheet(title="تعليمات_الاستخدام")
+        ws_info.sheet_view.rightToLeft = True
+        info_rows = [
+            ["إرشادات نموذج بضائع وشحنات الطريق (NEXO In-Transit Shipments)"],
+            [""],
+            ["الحقل (العمود)", "إلزامي؟", "الوصف والتعليمات التفصيلية"],
+            ["كود الصنف", "نعم", "كود الصنف الفريد المطابق لسجل الأصناف والمخزون"],
+            ["الفرع / المخزن", "لا", "المستودع أو الفرع المستلم للبضاعة عند وصولها"],
+            ["رقم أمر الشراء / الشحنة", "نعم", "رقم أمر الشراء (PO) أو بوليصة الشحن لتتبع الشحنة"],
+            ["الكمية في الطريق", "نعم", "كمية الوحدات المشحونة الفعالة قيد النقل"],
+            ["تاريخ الوصول المتوقع", "لا", "تاريخ الاستلام والوصول المقدر بصيغة YYYY-MM-DD (مثال: 2026-03-25)"],
+            ["المورد", "لا", "اسم المصنع أو المورد أو الناقل المشحون منه"],
+            ["حالة الشحنة", "لا", "حالة الشحنة: في البحر (on_water)، في الطريق (in_transit)، تخليص جمركي (customs_clearance)"],
+            [""],
+            ["ملاحظات الاستيراد:"],
+            ["1. يتم مطابقة الأعمدة تلقائياً سواءً استخدمت الترويسات العربية أو الإنجليزية."],
+            ["2. الشحنات المستوردة تنعكس فورياً في حسابات التوريد وخطة الإمداد."]
+        ]
+        for row_idx, r in enumerate(info_rows, start=1):
+            for col_idx, val in enumerate(r, start=1):
+                cell = ws_info.cell(row=row_idx, column=col_idx, value=val)
+                if row_idx == 1:
+                    cell.font = Font(name="Segoe UI", size=13, bold=True, color="2196F3")
+                elif row_idx in [3, 12]:
+                    cell.font = Font(name="Segoe UI", size=10, bold=True)
+                else:
+                    cell.font = Font(name="Segoe UI", size=9)
+        ws_info.column_dimensions['A'].width = 24
+        ws_info.column_dimensions['B'].width = 12
+        ws_info.column_dimensions['C'].width = 65
+    else:
+        ws_info = wb.create_sheet(title="Instructions_AR_EN")
+        info_rows = [
+            ["NEXO In-Transit Shipments Template Instructions | إرشادات شحنات وبضائع الطريق"],
+            [""],
+            ["Field (الحقل)", "Required", "Description (الوصف EN)", "الوصف والتفاصيل (AR)"],
+            ["CODE", "Yes", "Item SKU matching inventory master", "كود الصنف المطابق لسجل المخزون"],
+            ["LOCA", "No", "Receiving Warehouse / Branch Location", "المستودع أو الفرع المستلم"],
+            ["PO_NUMBER", "Yes", "Purchase Order or Shipment Tracking No", "رقم أمر الشراء أو بوليصة الشحن"],
+            ["QTY_IN_TRANSIT", "Yes", "Shipped Units / Quantity in transit", "كمية الوحدات المشحونة في الطريق"],
+            ["EXPECTED_DATE", "No", "Estimated Arrival Date (YYYY-MM-DD)", "تاريخ الوصول المتوقع (مثال: 2026-03-25)"],
+            ["SUPP", "No", "Supplier or Carrier name", "اسم المورد أو الناقل"],
+            ["STATUS", "No", "Status: on_water, in_transit, customs_clearance", "حالة الشحنة: في البحر، في الطريق، جمارك"]
+        ]
+        for row_idx, r in enumerate(info_rows, start=1):
+            for col_idx, val in enumerate(r, start=1):
+                cell = ws_info.cell(row=row_idx, column=col_idx, value=val)
+                if row_idx == 1:
+                    cell.font = Font(name="Segoe UI", size=13, bold=True, color="2196F3")
+                elif row_idx == 3:
+                    cell.font = Font(name="Segoe UI", size=10, bold=True)
+                else:
+                    cell.font = Font(name="Segoe UI", size=9)
+        ws_info.column_dimensions['A'].width = 16
+        ws_info.column_dimensions['B'].width = 12
+        ws_info.column_dimensions['C'].width = 42
+        ws_info.column_dimensions['D'].width = 50
 
-    ws_info.column_dimensions['A'].width = 16
-    ws_info.column_dimensions['B'].width = 12
-    ws_info.column_dimensions['C'].width = 42
-    ws_info.column_dimensions['D'].width = 50
-
+    filename = "NEXO_InTransit_Template_AR.xlsx" if is_ar else "NEXO_InTransit_Template_EN.xlsx"
     buf = io.BytesIO()
     wb.save(buf)
     buf.seek(0)
     return Response(
         content=buf.getvalue(),
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        headers={"Content-Disposition": "attachment; filename=NEXO_InTransit_Template.xlsx"}
+        headers={"Content-Disposition": f"attachment; filename={filename}"}
     )
 
 @app.post("/api/files/import-typed")
@@ -1152,12 +1319,30 @@ async def import_typed_file(
     elif import_type == "in_transit":
         # Process as in-transit shipments table
         c_ord_no = _match_column(cols, mapping, "order_no")
-        c_origin = _match_column(cols, mapping, "origin")
-        c_dest = _match_column(cols, mapping, "destination")
+        c_dest = _match_column(cols, mapping, "destination") or _match_column(cols, mapping, "location")
         c_eta = _match_column(cols, mapping, "eta_date")
-        c_carrier = _match_column(cols, mapping, "carrier")
+        c_supp_col = _match_column(cols, mapping, "supplier")
+        c_carrier = _match_column(cols, mapping, "carrier") or c_supp_col
+        c_origin = _match_column(cols, mapping, "origin") or c_supp_col
         c_status = _match_column(cols, mapping, "status")
         c_qty = _match_column(cols, mapping, "quantity") or _match_column(cols, mapping, "qty_sold")
+
+        status_map = {
+            "في البحر": "on_water",
+            "on water": "on_water",
+            "on_water": "on_water",
+            "في الطريق": "in_transit",
+            "in transit": "in_transit",
+            "in_transit": "in_transit",
+            "تخليص جمركي": "customs_clearance",
+            "customs clearance": "customs_clearance",
+            "customs": "customs_clearance",
+            "customs_clearance": "customs_clearance",
+            "تم الاستلام": "received",
+            "received": "received",
+            "تم التسليم": "delivered",
+            "delivered": "delivered"
+        }
 
         transit_records = []
         for _, row in df.iterrows():
@@ -1165,15 +1350,22 @@ async def import_typed_file(
             if not code or code.lower() in ["nan", "none"]:
                 continue
             ord_no = str(row.get(c_ord_no, "")).strip() if c_ord_no and pd.notna(row.get(c_ord_no)) else f"PO-{uuid.uuid4().hex[:6].upper()}"
+            supp_val = str(row.get(c_supp_col, "Supplier")).strip() if c_supp_col and pd.notna(row.get(c_supp_col)) else "Supplier"
+            origin_val = str(row.get(c_origin, supp_val)).strip() if c_origin and pd.notna(row.get(c_origin)) else supp_val
+            dest_val = str(row.get(c_dest, "Main Warehouse")).strip() if c_dest and pd.notna(row.get(c_dest)) else "Main Warehouse"
+            carrier_val = str(row.get(c_carrier, supp_val)).strip() if c_carrier and pd.notna(row.get(c_carrier)) else supp_val
+            raw_status = str(row.get(c_status, "in_transit")).strip() if c_status and pd.notna(row.get(c_status)) else "in_transit"
+            norm_status = status_map.get(raw_status.lower(), status_map.get(raw_status, raw_status.lower()))
+
             transit_records.append({
                 "item_code": code,
                 "order_no": ord_no,
-                "origin": str(row.get(c_origin, "Supplier")).strip() if c_origin and pd.notna(row.get(c_origin)) else "Supplier",
-                "destination": str(row.get(c_dest, "Main Warehouse")).strip() if c_dest and pd.notna(row.get(c_dest)) else "Main Warehouse",
+                "origin": origin_val,
+                "destination": dest_val,
                 "quantity": float(row.get(c_qty, 0.0)) if c_qty and pd.notna(row.get(c_qty)) else 0.0,
                 "eta_date": str(row.get(c_eta, "2026-03-30")).strip() if c_eta and pd.notna(row.get(c_eta)) else "2026-03-30",
-                "carrier": str(row.get(c_carrier, "Ocean Freight")).strip() if c_carrier and pd.notna(row.get(c_carrier)) else "Ocean Freight",
-                "status": str(row.get(c_status, "in_transit")).strip() if c_status and pd.notna(row.get(c_status)) else "in_transit"
+                "carrier": carrier_val,
+                "status": norm_status
             })
 
         count = bulk_upsert_in_transit(proj_id, transit_records, merge_mode=merge_mode)
@@ -1648,32 +1840,19 @@ async def inspect_file_endpoint(file: UploadFile = File(...)):
     cols = [str(c).strip() for c in df.columns]
     preview_rows = df.head(3).fillna("").to_dict(orient="records")
 
-    # Suggest mappings for standard NEXO schema
+    # Suggest mappings for standard NEXO schema using bilingual heuristics
+    fields_to_suggest = [
+        "code", "description", "category", "location", "on_hand", "on_order",
+        "lead_time_days", "lead_time_variance_days", "service_level", "min_batch",
+        "batch_rounding", "sales_price", "purchase_price", "supplier",
+        "period", "qty_sold", "revenue", "order_no", "destination", "eta_date",
+        "carrier", "status", "quantity"
+    ]
     suggestions = {}
-    for c in cols:
-        cl = c.lower()
-        if any(x in cl for x in ["code", "sku", "item_code", "itemcode"]):
-            suggestions["code"] = c
-        elif any(x in cl for x in ["desc", "name", "description"]):
-            suggestions["description"] = c
-        elif any(x in cl for x in ["cat", "family", "group"]):
-            suggestions["category"] = c
-        elif any(x in cl for x in ["loc", "wh", "warehouse", "branch", "site"]):
-            suggestions["location"] = c
-        elif any(x in cl for x in ["on_hand", "onhand", "stock", "balance", "qty"]):
-            suggestions["on_hand"] = c
-        elif any(x in cl for x in ["on_order", "onorder", "transit", "po"]):
-            suggestions["on_order"] = c
-        elif any(x in cl for x in ["lt", "lead_time", "leadtime"]):
-            suggestions["lead_time_days"] = c
-        elif any(x in cl for x in ["sl", "service_level", "servicelevel"]):
-            suggestions["service_level"] = c
-        elif any(x in cl for x in ["moq", "min_batch", "batch"]):
-            suggestions["min_batch"] = c
-        elif any(x in cl for x in ["price", "sales_price", "retail"]):
-            suggestions["sales_price"] = c
-        elif any(x in cl for x in ["cost", "purchase_price", "purchase_cost"]):
-            suggestions["purchase_price"] = c
+    for fld in fields_to_suggest:
+        m = _match_column(cols, {}, fld)
+        if m and fld not in suggestions:
+            suggestions[fld] = m
 
     return {
         "filename": filename,

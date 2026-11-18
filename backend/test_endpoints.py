@@ -126,7 +126,36 @@ async def run_tests():
         assert r_transit_ingest.status_code == 200 and r_transit_ingest.json()['success'] is True
         print(f'14. In-Transit Template & Ingestion PASSED ({len(r_transit_tmpl.content)} bytes template, {r_transit_ingest.json()["rows_processed"]} rows ingested)')
 
-        print('\n=== ALL 14 BACKEND & DATA HUB ENDPOINTS TESTED AND VERIFIED 100% OPERATIONAL! ===')
+        # 15. Bilingual Templates & Round-Trip Auto-Mapping
+        r_ar_sales = await client.get('/api/templates/sales?lang=ar')
+        r_en_sales = await client.get('/api/templates/sales?lang=en')
+        r_ar_inv = await client.get('/api/templates/inventory?lang=ar')
+        r_en_inv = await client.get('/api/templates/inventory?lang=en')
+        r_ar_transit = await client.get('/api/templates/in-transit?lang=ar')
+        r_en_transit = await client.get('/api/templates/in-transit?lang=en')
+        assert all(r.status_code == 200 for r in [r_ar_sales, r_en_sales, r_ar_inv, r_en_inv, r_ar_transit, r_en_transit])
+
+        # Test round-trip inspection of Arabic Inventory Template
+        r_inspect = await client.post(
+            '/api/files/inspect',
+            files={'file': ('NEXO_Inventory_Template_AR.xlsx', r_ar_inv.content, 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')}
+        )
+        assert r_inspect.status_code == 200
+        insp_data = r_inspect.json()
+        assert 'code' in insp_data['suggested_mappings']
+        assert insp_data['suggested_mappings']['code'] == 'كود الصنف'
+        assert insp_data['suggested_mappings']['on_hand'] == 'الرصيد المتوفر'
+
+        # Ingest Arabic Sales Template round-trip
+        r_ingest_ar_sales = await client.post(
+            '/api/files/import-typed',
+            files={'file': ('NEXO_Sales_Template_AR.xlsx', r_ar_sales.content, 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')},
+            data={'import_type': 'sales', 'project_id': pid, 'merge_mode': 'merge'}
+        )
+        assert r_ingest_ar_sales.status_code == 200 and r_ingest_ar_sales.json()['success'] is True
+        print(f'15. Bilingual Templates & Arabic Round-Trip PASSED ({r_ingest_ar_sales.json()["rows_processed"]} sales rows ingested)')
+
+        print('\n=== ALL 15 BACKEND & DATA HUB ENDPOINTS TESTED AND VERIFIED 100% OPERATIONAL! ===')
 
 if __name__ == '__main__':
     asyncio.run(run_tests())

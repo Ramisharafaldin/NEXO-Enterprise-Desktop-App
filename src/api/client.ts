@@ -417,14 +417,16 @@ export const api = {
    */
   async downloadTemplate(
     templateType: 'sales' | 'inventory' | 'in-transit',
-    defaultFilename?: string
+    defaultFilename?: string,
+    language: 'ar' | 'en' = 'en'
   ): Promise<boolean> {
+    const isAr = language === 'ar';
     const filename = defaultFilename || (
-      templateType === 'sales' ? 'NEXO_Sales_Template.xlsx' :
-        templateType === 'inventory' ? 'NEXO_Inventory_Template.xlsx' :
-          'NEXO_InTransit_Template.xlsx'
+      templateType === 'sales' ? `NEXO_Sales_Template_${isAr ? 'AR' : 'EN'}.xlsx` :
+        templateType === 'inventory' ? `NEXO_Inventory_Template_${isAr ? 'AR' : 'EN'}.xlsx` :
+          `NEXO_InTransit_Template_${isAr ? 'AR' : 'EN'}.xlsx`
     );
-    const templateUrl = `${API_BASE}/templates/${templateType}`;
+    const templateUrl = `${API_BASE}/templates/${templateType}?lang=${language}`;
 
     const pyApi = (window as any).pywebview?.api;
     if (pyApi && typeof pyApi.save_file_dialog === 'function') {
