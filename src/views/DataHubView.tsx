@@ -48,8 +48,8 @@ export const DataHubView: React.FC<DataHubViewProps> = ({
       ? ['كود الصنف', 'الفرع / المخزن', 'الفترة / الشهر', 'الكمية المباعة', 'قيمة المبيعات']
       : ['CODE', 'LOCA', 'PERIOD', 'QTY_SOLD', 'REVENUE'],
     inventory: isAr
-      ? ['كود الصنف', 'اسم الصنف', 'القسم / المجموعة', 'الفرع / المخزن', 'الرصيد المتوفر', 'قيد التوريد', 'مهلة التوريد (يوم)', 'تذبذب التوريد', 'مستوى الخدمة %', 'الحد الأدنى للطلب', 'مضاعفات العبوة', 'سعر التكلفة', 'سعر البيع', 'المورد']
-      : ['CODE', 'DESC', 'CATI', 'LOCA', 'ONHA', 'ONOW', 'LTIM', 'LTIV', 'SLEV', 'MINB', 'BROU', 'COST', 'PRIC', 'SUPP'],
+      ? ['كود الصنف', 'اسم الصنف', 'القسم / المجموعة', 'الفرع / المخزن', 'الرصيد المتوفر', 'سعر التكلفة', 'المورد']
+      : ['CODE', 'DESC', 'CATI', 'LOCA', 'ONHA', 'COST', 'SUPP'],
     inTransit: isAr
       ? ['كود الصنف', 'الفرع / المخزن', 'رقم أمر الشراء / الشحنة', 'الكمية في الطريق', 'تاريخ الوصول المتوقع', 'المورد', 'حالة الشحنة']
       : ['CODE', 'LOCA', 'PO_NUMBER', 'QTY_IN_TRANSIT', 'EXPECTED_DATE', 'SUPP', 'STATUS']
@@ -611,21 +611,27 @@ export const DataHubView: React.FC<DataHubViewProps> = ({
                     <div className="flex items-center justify-between gap-2 mb-1.5">
                       <span className="text-xs font-bold text-blue-900 flex items-center gap-1.5">
                         <span className="w-2 h-2 rounded-full bg-[#2196F3]"></span>
-                        {isAr ? 'نموذج المخزون' : 'Inventory Master'}
+                        {isAr ? 'نموذج المخزون الميسر' : 'Lean Inventory Master'}
                       </span>
                       <span className="text-[10px] font-semibold text-blue-700 bg-blue-100/80 px-1.5 py-0.5 rounded">
-                        {templateColumns.inventory.length} {isAr ? 'عموداً' : 'cols'}
+                        {templateColumns.inventory.length} {isAr ? 'أعمدة أساسية' : 'essential cols'}
                       </span>
                     </div>
-                    <p className="text-[11px] text-slate-500 mb-2.5">
-                      {isAr ? 'سجل الأصناف، الأرصدة، مهل التوريد ومستويات الخدمة المستهدفة' : 'SKU parameters, balances, lead times & service levels'}
+                    <p className="text-[11px] text-slate-500 mb-2">
+                      {isAr ? 'الأعمدة الـ 7 التشغيلية الأساسية فقط المستخرجة عادة من ERP أو نظام المستودعات' : 'The 7 core operational columns typically exported from warehouse or ERP systems'}
                     </p>
-                    <div className="flex flex-wrap gap-1 max-h-24 overflow-y-auto">
+                    <div className="flex flex-wrap gap-1 mb-2.5">
                       {templateColumns.inventory.map((col, idx) => (
                         <span key={idx} className="px-1.5 py-0.5 bg-white border border-blue-200 text-blue-800 text-[10px] font-medium rounded">
                           {col}
                         </span>
                       ))}
+                    </div>
+                    <div className="p-2 bg-blue-50/90 rounded border border-blue-200/70 text-[10px] text-blue-900 leading-tight">
+                      <span className="font-bold">{isAr ? '⚡ اشتقاق آلي ذكي:' : '⚡ Auto-Derived:'}</span>{' '}
+                      {isAr 
+                        ? 'مهل التوريد ومستوى الخدمة تُسحب من الإعدادات، والبضاعة بالطريق من الشحنات، وسعر البيع من المبيعات.'
+                        : 'Lead times & Service Level pull from Settings, On-Order from In-Transit, and Price from Sales.'}
                     </div>
                   </div>
                   <button
@@ -634,7 +640,7 @@ export const DataHubView: React.FC<DataHubViewProps> = ({
                     className="flex items-center justify-center gap-2 px-3 py-1.5 bg-[#2196F3] hover:bg-blue-600 text-white rounded text-xs font-semibold transition cursor-pointer shadow-xs disabled:opacity-50 mt-1"
                   >
                     <Download className={`w-3.5 h-3.5 ${downloadingTemplate === 'inventory' ? 'animate-bounce' : ''}`} />
-                    <span>{hubT.downloadInventoryTemplate || (isAr ? 'تحميل نموذج المخزون (.xlsx)' : 'Download Inventory Template (.xlsx)')}</span>
+                    <span>{hubT.downloadInventoryTemplate || (isAr ? 'تحميل نموذج المخزون (7 أعمدة)' : 'Download Inventory Template (7 cols)')}</span>
                   </button>
                 </div>
 

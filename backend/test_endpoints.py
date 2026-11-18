@@ -155,7 +155,32 @@ async def run_tests():
         assert r_ingest_ar_sales.status_code == 200 and r_ingest_ar_sales.json()['success'] is True
         print(f'15. Bilingual Templates & Arabic Round-Trip PASSED ({r_ingest_ar_sales.json()["rows_processed"]} sales rows ingested)')
 
-        print('\n=== ALL 15 BACKEND & DATA HUB ENDPOINTS TESTED AND VERIFIED 100% OPERATIONAL! ===')
+        # 16. Streamlined 7-Column Inventory & Auto-Populated Parameters
+        r_lean_inv_ar = await client.get('/api/templates/inventory?lang=ar')
+        r_lean_inv_en = await client.get('/api/templates/inventory?lang=en')
+        assert r_lean_inv_ar.status_code == 200 and r_lean_inv_en.status_code == 200
+        import io, pandas as pd
+        df_inv_ar = pd.read_excel(io.BytesIO(r_lean_inv_ar.content))
+        df_inv_en = pd.read_excel(io.BytesIO(r_lean_inv_en.content))
+        assert list(df_inv_ar.columns) == ['كود الصنف', 'اسم الصنف', 'القسم / المجموعة', 'الفرع / المخزن', 'الرصيد المتوفر', 'سعر التكلفة', 'المورد']
+        assert list(df_inv_en.columns) == ['CODE', 'DESC', 'CATI', 'LOCA', 'ONHA', 'COST', 'SUPP']
+
+        # Ingest 7-column inventory template
+        r_lean_ingest = await client.post(
+            '/api/files/import-typed',
+            files={'file': ('NEXO_Inventory_Template_AR.xlsx', r_lean_inv_ar.content, 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')},
+            data={'import_type': 'inventory', 'project_id': pid, 'merge_mode': 'merge'}
+        )
+        assert r_lean_ingest.status_code == 200 and r_lean_ingest.json()['success'] is True
+
+        from backend.database import get_connection
+        con = get_connection()
+        item_check = con.execute("SELECT code, lead_time_days, service_level, min_batch, sales_price FROM items WHERE project_id = ? AND code = 'SKU-1001'", (pid,)).fetchone()
+        con.close()
+        assert item_check is not None and item_check[1] > 0 and item_check[2] >= 0.90
+        print(f'16. Lean 7-Column Inventory & Auto-Parameters PASSED (SKU-1001 LeadTime={item_check[1]}, SL={item_check[2]}, Price={item_check[4]})')
+
+        print('\n=== ALL 16 BACKEND & DATA HUB ENDPOINTS TESTED AND VERIFIED 100% OPERATIONAL! ===')
 
 if __name__ == '__main__':
     asyncio.run(run_tests())

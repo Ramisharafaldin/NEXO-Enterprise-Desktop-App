@@ -805,6 +805,25 @@ def bulk_upsert_in_transit(project_id: str, records: List[Dict[str, Any]], merge
                     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """, (tid, project_id, code, ord_no, origin, dest, qty, eta, carrier, status))
                 count += 1
+
+            # Synchronize items.on_order from in_transition shipments for this project
+            try:
+                con.execute("""
+                    UPDATE items SET
+                        on_order = COALESCE(sub.tot_qty, 0.0),
+                        order_now = GREATEST(0.0, items.reorder_point - items.on_hand - COALESCE(sub.tot_qty, 0.0) + items.backorders),
+                        order_now_value = GREATEST(0.0, items.reorder_point - items.on_hand - COALESCE(sub.tot_qty, 0.0) + items.backorders) * items.purchase_price
+                    FROM (
+                        SELECT item_code, SUM(quantity) AS tot_qty
+                        FROM in_transition
+                        WHERE project_id = ? AND status NOT IN ('delivered', 'received', 'تم الاستلام', 'تم التسليم')
+                        GROUP BY item_code
+                    ) sub
+                    WHERE items.code = sub.item_code AND items.project_id = ?
+                """, (project_id, project_id))
+            except Exception:
+                pass
+
             return count
         finally:
             con.close()
@@ -1285,34 +1304,173 @@ def upsert_items_and_periods(
                 elif periods_data:
                     con.execute("DELETE FROM periods WHERE project_id = ?", (project_id,))
 
-            # Build map of existing items {code: id}
-            existing_rows = con.execute("SELECT id, code FROM items WHERE project_id = ?", (project_id,)).fetchall()
-            existing_items_map = {row[1]: row[0] for row in existing_rows}
+            # Query global settings for active system defaults
+            settings_row = con.execute("""
+                SELECT default_service_level, default_lead_time_days, default_order_cycle_days
+                FROM app_settings WHERE id = 'global_settings'
+            """).fetchone()
+            if settings_row:
+                def_sl = clean_float(settings_row[0], 0.95)
+                def_lt = clean_float(settings_row[1], 30.0)
+                def_cycle = clean_float(settings_row[2], 30.0)
+            else:
+                def_sl = 0.95
+                def_lt = 30.0
+                def_cycle = 30.0
+            def_lt_var = 5.0
+            def_moq = 1.0
+            def_brou = 1.0
+
+            # Build map of existing items with their saved parameters
+            existing_items_rows = con.execute("""
+                SELECT id, code, description, category, location, channel, supplier,
+                       sales_price, purchase_price, margin, on_hand, on_order, backorders,
+                       lead_time_days, lead_time_variance_days, order_cycle_days,
+                       service_level, min_batch, batch_rounding, model_type, replenishment_strategy
+                FROM items WHERE project_id = ?
+            """, (project_id,)).fetchall()
+            existing_items_dict = {
+                row[1]: {
+                    "id": row[0],
+                    "code": row[1],
+                    "description": row[2],
+                    "category": row[3],
+                    "location": row[4],
+                    "channel": row[5],
+                    "supplier": row[6],
+                    "sales_price": clean_float(row[7], 0.0),
+                    "purchase_price": clean_float(row[8], 0.0),
+                    "margin": clean_float(row[9], 0.0),
+                    "on_hand": clean_float(row[10], 0.0),
+                    "on_order": clean_float(row[11], 0.0),
+                    "backorders": clean_float(row[12], 0.0),
+                    "lead_time_days": clean_float(row[13], def_lt),
+                    "lead_time_variance_days": clean_float(row[14], def_lt_var),
+                    "order_cycle_days": clean_float(row[15], def_cycle),
+                    "service_level": clean_float(row[16], def_sl),
+                    "min_batch": clean_float(row[17], def_moq),
+                    "batch_rounding": clean_float(row[18], def_brou),
+                    "model_type": row[19] or "auto",
+                    "replenishment_strategy": row[20] or "periodic"
+                }
+                for row in existing_items_rows
+            }
+            existing_items_map = {k: v["id"] for k, v in existing_items_dict.items()}
 
             for itm in items_data:
                 code = str(itm.get("code", "")).strip()
                 if not code:
                     continue
 
-                desc = str(itm.get("description", "")).strip() or f"Item {code}"
-                cat = str(itm.get("category", "")).strip() or "General"
-                loc = str(itm.get("location", "")).strip() or "Main Warehouse"
-                channel = str(itm.get("channel", "")).strip() or "Standard Channel"
-                supplier = str(itm.get("supplier", "")).strip() or "Primary Supplier"
-                price = clean_float(itm.get("sales_price", itm.get("price", 0.0)))
-                cost = clean_float(itm.get("purchase_price", itm.get("cost", 0.0)))
+                existing = existing_items_dict.get(code) if merge_mode == "merge" else None
+
+                desc = str(itm.get("description", "")).strip() or (existing["description"] if existing else f"Item {code}")
+                cat = str(itm.get("category", "")).strip() or (existing["category"] if existing else "General")
+                loc = str(itm.get("location", "")).strip() or (existing["location"] if existing else "Main Warehouse")
+                channel = str(itm.get("channel", "")).strip() or (existing["channel"] if existing else "Standard Channel")
+                supplier = str(itm.get("supplier", "")).strip() or (existing["supplier"] if existing else "Primary Supplier")
+                cost = clean_float(itm.get("purchase_price", itm.get("cost")), (existing["purchase_price"] if existing else 50.0))
+                on_hand = clean_float(itm.get("on_hand", itm.get("stock")), (existing["on_hand"] if existing else 0.0))
+                backorders = clean_float(itm.get("backorders"), (existing["backorders"] if existing else 0.0))
+
+                # Auto-populate or preserve Lead Time
+                raw_lt = itm.get("lead_time_days", itm.get("lt"))
+                if raw_lt is not None and str(raw_lt).strip() != "":
+                    lt = clean_float(raw_lt, def_lt)
+                elif existing:
+                    lt = existing["lead_time_days"]
+                else:
+                    lt = def_lt
+
+                # Auto-populate or preserve Lead Time Variance
+                raw_lt_var = itm.get("lead_time_variance_days", itm.get("lt_var"))
+                if raw_lt_var is not None and str(raw_lt_var).strip() != "":
+                    lt_var = clean_float(raw_lt_var, def_lt_var)
+                elif existing:
+                    lt_var = existing["lead_time_variance_days"]
+                else:
+                    lt_var = def_lt_var
+
+                # Auto-populate or preserve Order Cycle
+                raw_cycle = itm.get("order_cycle_days", itm.get("cycle"))
+                if raw_cycle is not None and str(raw_cycle).strip() != "":
+                    cycle = clean_float(raw_cycle, def_cycle)
+                elif existing:
+                    cycle = existing["order_cycle_days"]
+                else:
+                    cycle = def_cycle
+
+                # Auto-populate or preserve Service Level %
+                raw_sl = itm.get("service_level", itm.get("sl"))
+                if raw_sl is not None and str(raw_sl).strip() != "":
+                    sl = clean_float(raw_sl, def_sl)
+                    if sl > 1.0:
+                        sl = sl / 100.0
+                elif existing:
+                    sl = existing["service_level"]
+                else:
+                    sl = def_sl
+
+                # Auto-populate or preserve MOQ
+                raw_moq = itm.get("min_batch", itm.get("moq"))
+                if raw_moq is not None and str(raw_moq).strip() != "":
+                    moq = clean_float(raw_moq, def_moq)
+                elif existing:
+                    moq = existing["min_batch"]
+                else:
+                    moq = def_moq
+
+                # Auto-populate or preserve Batch Rounding
+                raw_brou = itm.get("batch_rounding", itm.get("round"))
+                if raw_brou is not None and str(raw_brou).strip() != "":
+                    brou = clean_float(raw_brou, def_brou)
+                elif existing:
+                    brou = existing["batch_rounding"]
+                else:
+                    brou = def_brou
+
+                # Auto-derive On-Order from In-Transit Shipments if not provided
+                raw_on_order = itm.get("on_order")
+                if raw_on_order is not None and str(raw_on_order).strip() != "":
+                    on_order = clean_float(raw_on_order, 0.0)
+                else:
+                    in_trans_row = con.execute("""
+                        SELECT COALESCE(SUM(quantity), 0.0)
+                        FROM in_transition
+                        WHERE project_id = ? AND item_code = ? AND status NOT IN ('delivered', 'received', 'تم الاستلام', 'تم التسليم')
+                    """, (project_id, code)).fetchone()
+                    in_trans_qty = clean_float(in_trans_row[0], 0.0) if in_trans_row else 0.0
+                    if in_trans_qty > 0:
+                        on_order = in_trans_qty
+                    elif existing:
+                        on_order = existing["on_order"]
+                    else:
+                        on_order = 0.0
+
+                # Auto-derive Selling Price from Sales history if not provided
+                raw_price = itm.get("sales_price", itm.get("price"))
+                if raw_price is not None and str(raw_price).strip() != "" and clean_float(raw_price, 0.0) > 0:
+                    price = clean_float(raw_price)
+                elif existing and existing["sales_price"] > 0:
+                    price = existing["sales_price"]
+                else:
+                    p_id_for_query = existing["id"] if existing else None
+                    period_sales = None
+                    if p_id_for_query:
+                        period_sales = con.execute("""
+                            SELECT COALESCE(SUM(revenue), 0.0), COALESCE(SUM(actual), 0.0)
+                            FROM periods WHERE project_id = ? AND item_id = ?
+                        """, (project_id, p_id_for_query)).fetchone()
+                    if period_sales and period_sales[1] > 0 and period_sales[0] > 0:
+                        price = round(period_sales[0] / period_sales[1], 2)
+                    elif cost > 0:
+                        price = round(cost * 1.5, 2)
+                    else:
+                        price = 100.0
+
                 margin = round((price - cost) / price * 100 if price > 0 else 0.0, 1)
-                on_hand = clean_float(itm.get("on_hand", itm.get("stock", 0.0)))
-                on_order = clean_float(itm.get("on_order", 0.0))
-                backorders = clean_float(itm.get("backorders", 0.0))
-                lt = clean_float(itm.get("lead_time_days", itm.get("lt", 30.0)))
-                lt_var = clean_float(itm.get("lead_time_variance_days", itm.get("lt_var", 5.0)))
-                cycle = clean_float(itm.get("order_cycle_days", itm.get("cycle", 30.0)))
-                sl = clean_float(itm.get("service_level", itm.get("sl", 0.95)))
-                moq = clean_float(itm.get("min_batch", itm.get("moq", 1.0)))
-                brou = clean_float(itm.get("batch_rounding", itm.get("round", 1.0)))
-                model = str(itm.get("model_type", "auto"))
-                strat = str(itm.get("replenishment_strategy", "periodic"))
+                model = str(itm.get("model_type", existing["model_type"] if existing else "auto"))
+                strat = str(itm.get("replenishment_strategy", existing["replenishment_strategy"] if existing else "periodic"))
 
                 # Math calculations
                 mean_daily = clean_float(itm.get("mean_daily_demand", 5.0))
@@ -1429,6 +1587,25 @@ def upsert_items_and_periods(
                             override, promotion
                         ))
                     periods_upserted += 1
+
+            # Auto-derive and update items.sales_price from sales history whenever periods are ingested
+            if periods_data:
+                try:
+                    con.execute("""
+                        UPDATE items SET
+                            sales_price = sub.derived_price,
+                            margin = ROUND((sub.derived_price - items.purchase_price) / sub.derived_price * 100, 1),
+                            order_now_value = items.order_now * items.purchase_price
+                        FROM (
+                            SELECT item_id, ROUND(SUM(revenue) / NULLIF(SUM(actual), 0), 2) AS derived_price
+                            FROM periods
+                            WHERE project_id = ? AND actual > 0 AND revenue > 0
+                            GROUP BY item_id
+                        ) sub
+                        WHERE items.id = sub.item_id AND items.project_id = ? AND sub.derived_price > 0
+                    """, (project_id, project_id))
+                except Exception:
+                    pass
 
             # Update project SKU count & timestamp
             con.execute("""

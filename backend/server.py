@@ -927,24 +927,21 @@ def download_inventory_template(lang: Optional[str] = None):
     if is_ar:
         headers = [
             "كود الصنف", "اسم الصنف", "القسم / المجموعة", "الفرع / المخزن",
-            "الرصيد المتوفر", "قيد التوريد", "مهلة التوريد (يوم)", "تذبذب التوريد",
-            "مستوى الخدمة %", "الحد الأدنى للطلب", "مضاعفات العبوة", "سعر التكلفة",
-            "سعر البيع", "المورد"
+            "الرصيد المتوفر", "سعر التكلفة", "المورد"
         ]
         sample_rows = [
-            ("SKU-1001", "بن قهوة فاخر أرابيكا 250 جم", "مشروبات ساخنة", "المستودع الرئيسي", 240, 100, 21, 3, 0.95, 20, 10, 28.5, 45.0, "شركة التحميص العالمية"),
-            ("SKU-1002", "شاي أخضر عضوي عبوة 100 كيس", "مشروبات ساخنة", "فرع الرياض", 150, 0, 14, 2, 0.98, 50, 25, 12.0, 22.0, "مؤسسة الأعشاب الطبيعية"),
-            ("SKU-1003", "مكبس قهوة فرنسي ستانلس ستيل", "أدوات ومعدات", "المستودع الرئيسي", 45, 30, 45, 7, 0.90, 12, 6, 85.0, 140.0, "تجهيزات المطاعم الدولية"),
+            ("SKU-1001", "بن قهوة فاخر أرابيكا 250 جم", "مشروبات ساخنة", "المستودع الرئيسي", 240, 28.5, "شركة التحميص العالمية"),
+            ("SKU-1002", "شاي أخضر عضوي عبوة 100 كيس", "مشروبات ساخنة", "فرع الرياض", 150, 12.0, "مؤسسة الأعشاب الطبيعية"),
+            ("SKU-1003", "مكبس قهوة فرنسي ستانلس ستيل", "أدوات ومعدات", "المستودع الرئيسي", 45, 85.0, "تجهيزات المطاعم الدولية"),
         ]
     else:
         headers = [
-            "CODE", "DESC", "CATI", "LOCA", "ONHA", "ONOW",
-            "LTIM", "LTIV", "SLEV", "MINB", "BROU", "COST", "PRIC", "SUPP"
+            "CODE", "DESC", "CATI", "LOCA", "ONHA", "COST", "SUPP"
         ]
         sample_rows = [
-            ("SKU-1001", "Premium Coffee Blend 250g", "Beverages", "WH-MAIN", 240, 100, 21, 3, 0.95, 20, 10, 28.5, 45.0, "Global Roast Ltd"),
-            ("SKU-1002", "Organic Green Tea Box 100s", "Beverages", "WH-EAST", 150, 0, 14, 2, 0.98, 50, 25, 12.0, 22.0, "Ceylon Herbs Co"),
-            ("SKU-1003", "Stainless Steel French Press", "Equipment", "WH-MAIN", 45, 30, 45, 7, 0.90, 12, 6, 85.0, 140.0, "KitchenTech Int"),
+            ("SKU-1001", "Premium Coffee Blend 250g", "Beverages", "WH-MAIN", 240, 28.5, "Global Roast Ltd"),
+            ("SKU-1002", "Organic Green Tea Box 100s", "Beverages", "WH-EAST", 150, 12.0, "Ceylon Herbs Co"),
+            ("SKU-1003", "Stainless Steel French Press", "Equipment", "WH-MAIN", 45, 85.0, "KitchenTech Int"),
         ]
 
     header_fill = PatternFill(start_color="343D46", end_color="343D46", fill_type="solid")
@@ -969,93 +966,93 @@ def download_inventory_template(lang: Optional[str] = None):
             cell = ws_data.cell(row=row_idx, column=col_idx, value=val)
             cell.font = data_font
             cell.border = thin_border
-            if col_idx in [1, 3, 4, 14]:
-                cell.alignment = Alignment(horizontal="left" if not is_ar else "right", vertical="center")
-            elif col_idx == 2:
-                cell.alignment = Alignment(horizontal="left" if not is_ar else "right", vertical="center")
-            else:
+            if col_idx in [5, 6]:
+                # On-hand and Cost are numbers
                 cell.alignment = Alignment(horizontal="right", vertical="center")
+            elif col_idx == 1:
+                # Code
+                cell.alignment = Alignment(horizontal="center", vertical="center")
+            else:
+                # Text fields (Desc, Cat, Loc, Supp)
+                cell.alignment = Alignment(horizontal="right" if is_ar else "left", vertical="center")
 
     for col in ws_data.columns:
         max_len = max(len(str(cell.value or '')) for cell in col)
         col_letter = get_column_letter(col[0].column)
-        ws_data.column_dimensions[col_letter].width = max(max_len + 4, 15 if is_ar else 11)
+        ws_data.column_dimensions[col_letter].width = max(max_len + 4, 16 if is_ar else 12)
 
     # Instructions sheet
     if is_ar:
         ws_info = wb.create_sheet(title="تعليمات_الاستخدام")
         ws_info.sheet_view.rightToLeft = True
         info_rows = [
-            ["إرشادات تعبئة سجل المخزون الرئيسي (NEXO Inventory Master Template)"],
+            ["إرشادات تعبئة سجل المخزون الميسر (NEXO Lean Inventory Master Template)"],
             [""],
             ["الحقل (العمود)", "إلزامي؟", "الوصف والتعليمات التفصيلية"],
-            ["كود الصنف", "نعم", "كود الصنف الفريد (رمز SKU) الذي يربط المخزون بالمبيعات"],
+            ["كود الصنف", "نعم", "كود الصنف الفريد (رمز SKU) الذي يربط المخزون بالمبيعات وأوامر الشراء"],
             ["اسم الصنف", "لا", "اسم المنتج أو الوصف التجاري الكامل"],
-            ["القسم / المجموعة", "لا", "التصنيف السلعي أو العائلة الرئيسية (مثل: مشروبات، معدات)"],
+            ["القسم / المجموعة", "لا", "التصنيف السلعي أو العائلة الرئيسية (مثل: مشروبات، معدات - افتراضي: General)"],
             ["الفرع / المخزن", "لا", "اسم أو كود الفرع أو المستودع (افتراضي: المستودع الرئيسي)"],
             ["الرصيد المتوفر", "نعم", "الرصيد المخزني الفعلي المتوفر حالياً على الرف بالمستودع"],
-            ["قيد التوريد", "لا", "الكميات الجاري توريدها أو الشحنات المفتوحة في الطريق"],
-            ["مهلة التوريد (يوم)", "لا", "فترة الانتظار اللازمة من إصدار أمر الشراء حتى الاستلام (افتراضي: 30 يوماً)"],
-            ["تذبذب التوريد", "لا", "الانحراف المعياري لمهلة التوريد بالأيام لحساب مخزون الأمان بدقة"],
-            ["مستوى الخدمة %", "لا", "نسبة تلبية الطلب المستهدفة (مثال: 0.95 لنسبة 95%، 0.98 لنسبة 98%)"],
-            ["الحد الأدنى للطلب", "لا", "أقل كمية مقبولة للطلب من المورد (MOQ)"],
-            ["مضاعفات العبوة", "لا", "حجم الصندوق أو مضاعفات الكرتونة لتقريب أوامر الشراء"],
             ["سعر التكلفة", "نعم", "تكلفة شراء الوحدة الواحدة لحساب رأس المال والميزانيات"],
-            ["سعر البيع", "لا", "سعر البيع للجمهور أو العميل لحساب تصنيف ABC ومعدل الدوران"],
             ["المورد", "لا", "اسم المصنع أو المورد الرئيسي المعتمد"],
             [""],
-            ["ملاحظات الاستيراد الآلي:"],
-            ["1. يدعم NEXO التعرف التلقائي الذكي على الحقول باللغة العربية والإنجليزية."],
-            ["2. يتم حفظ البيانات مباشرة داخل قاعدة بيانات DuckDB المحلية بأمان وسرعة فائقة."]
+            ["المحددات والمعاملات المشتقة تلقائياً في NEXO (Auto-Populated Parameters):"],
+            ["1. مهلة التوريد وتذبذبها:", "تُسحب تلقائياً من إعدادات النظام النشطة (Settings) لكل صنف جديد."],
+            ["2. مستوى الخدمة المستهدف %:", "يُطبق تلقائياً من إعدادات النظام الافتراضية (افتراضي: 95% أو 98%)."],
+            ["3. الحد الأدنى للطلب ومضاعفات العبوة:", "تُحدد تلقائياً (1) أو يُحافظ على القيم المخصصة السابقة في DuckDB."],
+            ["4. الرصيد قيد التوريد (On-Order):", "يُحسب ويُحدث تلقائياً ومباشرة من شحنات البضاعة بالطريق في نموذج الشحن (In-Transit)."],
+            ["5. سعر البيع (Selling Price):", "يُستنتج تلقائياً من حركات المبيعات الفعلية (إجمالي الإيراد ÷ إجمالي الكمية المباعة)."],
+            [""],
+            ["ملاحظات هامة:"],
+            ["- يدعم نظام NEXO التعرف التلقائي الذكي على الحقول باللغة العربية والإنجليزية."],
+            ["- لا حاجة لتعديل أي معادلات، النظام يتولى حساب نقاط الطلب ومخزون الأمان وتصنيفات ABC/XYZ فوراً."]
         ]
         for row_idx, r in enumerate(info_rows, start=1):
             for col_idx, val in enumerate(r, start=1):
                 cell = ws_info.cell(row=row_idx, column=col_idx, value=val)
                 if row_idx == 1:
                     cell.font = Font(name="Segoe UI", size=13, bold=True, color="2196F3")
-                elif row_idx in [3, 19]:
+                elif row_idx in [3, 11, 18]:
+                    cell.font = Font(name="Segoe UI", size=10, bold=True)
+                else:
+                    cell.font = Font(name="Segoe UI", size=9)
+        ws_info.column_dimensions['A'].width = 28
+        ws_info.column_dimensions['B'].width = 12
+        ws_info.column_dimensions['C'].width = 75
+    else:
+        ws_info = wb.create_sheet(title="Instructions_AR_EN")
+        info_rows = [
+            ["NEXO Lean Inventory Master Template Instructions | إرشادات سجل المخزون الميسر"],
+            [""],
+            ["Field (الحقل)", "Required", "Description (الوصف EN)", "الوصف والتفاصيل (AR)"],
+            ["CODE", "Yes", "Unique Item SKU identifier", "كود الصنف الفريد (إلزامي)"],
+            ["DESC", "No", "Item description or product commercial name", "اسم الصنف أو الوصف التجاري"],
+            ["CATI", "No", "Category or product family (Default: General)", "التصنيف الرئيسي أو العائلة السلعية"],
+            ["LOCA", "No", "Warehouse or branch location (Default: Main Warehouse)", "كود المستودع أو الفرع"],
+            ["ONHA", "Yes", "Current on-hand physical stock balance (>= 0)", "الرصيد الفعلي الحالي في المستودع"],
+            ["COST", "Yes", "Unit purchase cost price", "تكلفة شراء الوحدة الواحدة"],
+            ["SUPP", "No", "Primary approved supplier or vendor name", "اسم المورد أو المصنع الرئيسي"],
+            [""],
+            ["Auto-Populated & Derived Parameters | محددات يتم اشتقاقها آلياً بالكامل:"],
+            ["Lead Time & LT Variability", "Auto", "Populated automatically from active System Settings in DuckDB.", "تُسحب تلقائياً من إعدادات النظام."],
+            ["Service Level %", "Auto", "Applied from default Service Level setting (e.g. 95% or 98%).", "يُطبق تلقائياً من إعدادات النظام."],
+            ["MOQ & Batch Rounding", "Auto", "Defaults to 1 or preserves user overrides from DuckDB.", "افتراضي 1 مع الحفاظ على التخصيصات."],
+            ["On-Order Stock", "Auto", "Computed dynamically from In-Transit active shipments.", "يُحسب آلياً من شحنات البضاعة بالطريق."],
+            ["Selling Price", "Auto", "Derived automatically from historical sales transactions (Revenue / Qty).", "يُستنتج آلياً من حركات المبيعات المسجلة."]
+        ]
+        for row_idx, r in enumerate(info_rows, start=1):
+            for col_idx, val in enumerate(r, start=1):
+                cell = ws_info.cell(row=row_idx, column=col_idx, value=val)
+                if row_idx == 1:
+                    cell.font = Font(name="Segoe UI", size=13, bold=True, color="2196F3")
+                elif row_idx in [3, 11]:
                     cell.font = Font(name="Segoe UI", size=10, bold=True)
                 else:
                     cell.font = Font(name="Segoe UI", size=9)
         ws_info.column_dimensions['A'].width = 24
         ws_info.column_dimensions['B'].width = 12
-        ws_info.column_dimensions['C'].width = 70
-    else:
-        ws_info = wb.create_sheet(title="Instructions_AR_EN")
-        info_rows = [
-            ["NEXO Inventory Master Template Instructions | إرشادات تعبئة سجل المخزون"],
-            [""],
-            ["Field (الحقل)", "Required", "Description (الوصف EN)", "الوصف والتفاصيل (AR)"],
-            ["CODE", "Yes", "Unique Item SKU Code", "كود الصنف الفريد (إلزامي)"],
-            ["DESC", "No", "Item Description or Product Name", "اسم الصنف أو الوصف التجاري"],
-            ["CATI", "No", "Category or Product Family", "التصنيف الرئيسي أو العائلة السلعية"],
-            ["LOCA", "No", "Warehouse or Branch Location Code", "كود المستودع أو الفرع (افتراضي: Main Warehouse)"],
-            ["ONHA", "Yes", "Current On-Hand Stock (>= 0)", "الرصيد الفعلي الحالي في المستودع"],
-            ["ONOW", "No", "Open Purchase Orders in transit (>= 0)", "البضاعة تحت الطلب وفي الطريق"],
-            ["LTIM", "No", "Replenishment Lead Time in Days (e.g. 30)", "فترة التوريد بالأيام (افتراضي: 30 يوماً)"],
-            ["LTIV", "No", "Lead Time Variance in Days (e.g. 5)", "تباين أو عدم استقرار التوريد بالأيام"],
-            ["SLEV", "No", "Target Service Level percentage (e.g. 0.95)", "مستوى الخدمة المستهدف كنسبة (0.90 إلى 0.99)"],
-            ["MINB", "No", "Minimum Order Quantity (MOQ)", "أدنى كمية للطلب من المورد"],
-            ["BROU", "No", "Batch / Carton Rounding Multiple", "مضاعفات كرتونة أو علبة الشحن"],
-            ["COST", "Yes", "Unit Purchase Cost", "تكلفة شراء الوحدة"],
-            ["PRIC", "No", "Unit Sales Price", "سعر البيع للوحدة"],
-            ["SUPP", "No", "Primary Supplier or Vendor Name", "اسم المورد أو المصنع الرئيسي"],
-            [""],
-            ["Bilingual Support | دعم اللغات:"],
-            ["NEXO automatically maps both English standard codes (CODE, ONHA, LTIM...) and Arabic headers (كود الصنف, الرصيد المتوفر, مهلة التوريد)."]
-        ]
-        for row_idx, r in enumerate(info_rows, start=1):
-            for col_idx, val in enumerate(r, start=1):
-                cell = ws_info.cell(row=row_idx, column=col_idx, value=val)
-                if row_idx == 1:
-                    cell.font = Font(name="Segoe UI", size=13, bold=True, color="2196F3")
-                elif row_idx in [3, 19]:
-                    cell.font = Font(name="Segoe UI", size=10, bold=True)
-                else:
-                    cell.font = Font(name="Segoe UI", size=9)
-        ws_info.column_dimensions['A'].width = 16
-        ws_info.column_dimensions['B'].width = 12
-        ws_info.column_dimensions['C'].width = 42
+        ws_info.column_dimensions['C'].width = 46
         ws_info.column_dimensions['D'].width = 50
 
     filename = "NEXO_Inventory_Template_AR.xlsx" if is_ar else "NEXO_Inventory_Template_EN.xlsx"
@@ -1306,14 +1303,14 @@ async def import_typed_file(
                 "category": str(row.get(c_cat, "General")).strip() if c_cat and pd.notna(row.get(c_cat)) else "General",
                 "location": str(row.get(c_loc, "Main Warehouse")).strip() if c_loc and pd.notna(row.get(c_loc)) else "Main Warehouse",
                 "on_hand": float(row.get(c_onhand, 0.0)) if c_onhand and pd.notna(row.get(c_onhand)) else 0.0,
-                "on_order": float(row.get(c_onorder, 0.0)) if c_onorder and pd.notna(row.get(c_onorder)) else 0.0,
-                "lead_time_days": float(row.get(c_lt, 30.0)) if c_lt and pd.notna(row.get(c_lt)) else 30.0,
-                "lead_time_variance_days": float(row.get(c_lt_var, 5.0)) if c_lt_var and pd.notna(row.get(c_lt_var)) else 5.0,
-                "service_level": float(row.get(c_sl, 0.95)) if c_sl and pd.notna(row.get(c_sl)) else 0.95,
-                "min_batch": float(row.get(c_moq, 1.0)) if c_moq and pd.notna(row.get(c_moq)) else 1.0,
-                "batch_rounding": float(row.get(c_brou, 1.0)) if c_brou and pd.notna(row.get(c_brou)) else 1.0,
+                "on_order": float(row.get(c_onorder)) if c_onorder and pd.notna(row.get(c_onorder)) else None,
+                "lead_time_days": float(row.get(c_lt)) if c_lt and pd.notna(row.get(c_lt)) else None,
+                "lead_time_variance_days": float(row.get(c_lt_var)) if c_lt_var and pd.notna(row.get(c_lt_var)) else None,
+                "service_level": float(row.get(c_sl)) if c_sl and pd.notna(row.get(c_sl)) else None,
+                "min_batch": float(row.get(c_moq)) if c_moq and pd.notna(row.get(c_moq)) else None,
+                "batch_rounding": float(row.get(c_brou)) if c_brou and pd.notna(row.get(c_brou)) else None,
                 "purchase_price": float(row.get(c_cost, 50.0)) if c_cost and pd.notna(row.get(c_cost)) else 50.0,
-                "sales_price": float(row.get(c_price, 100.0)) if c_price and pd.notna(row.get(c_price)) else 100.0,
+                "sales_price": float(row.get(c_price)) if c_price and pd.notna(row.get(c_price)) else None,
                 "supplier": str(row.get(c_supp, "Primary Supplier")).strip() if c_supp and pd.notna(row.get(c_supp)) else "Primary Supplier"
             })
     elif import_type == "in_transit":
