@@ -676,7 +676,7 @@ export const DataHubView: React.FC<DataHubViewProps> = ({
 
                 {/* Preview Grid */}
                 <div className="border border-slate-200 rounded overflow-x-auto max-h-72">
-                  <table className="w-full text-[11px] border-collapse">
+                  <table className="w-full text-[12px] border-collapse">
                     <thead className="bg-[#343D46] text-white sticky top-0">
                       <tr>
                         {inspectData.columns.map((c, i) => (
@@ -1219,7 +1219,7 @@ export const DataHubView: React.FC<DataHubViewProps> = ({
               </div>
             ) : (
               <div className="border border-slate-200 rounded overflow-x-auto">
-                <table className="w-full text-xs text-left border-collapse">
+                <table className="w-full text-[12px] text-left border-collapse">
                   <thead className="bg-[#343D46] text-white">
                     <tr>
                       <th className="px-3 py-2 font-semibold border-r border-[#2A3138]">{hubT.logTime || 'Timestamp'}</th>
@@ -1237,7 +1237,7 @@ export const DataHubView: React.FC<DataHubViewProps> = ({
                           {new Date(log.created_at).toLocaleString(language === 'ar' ? 'ar-EG' : 'en-US')}
                         </td>
                         <td className="px-3 py-2 whitespace-nowrap">
-                          <span className={`px-2 py-0.5 rounded text-[10px] font-bold uppercase ${
+                          <span className={`px-2 py-0.5 rounded text-[11.5px] font-bold uppercase ${
                             log.source_type === 'sql_server' ? 'bg-blue-100 text-blue-800' :
                             log.source_type === 'excel' ? 'bg-emerald-100 text-emerald-800' :
                             log.source_type === 'duckdb_sqlite' ? 'bg-amber-100 text-amber-800' : 'bg-indigo-100 text-indigo-800'
@@ -1252,12 +1252,12 @@ export const DataHubView: React.FC<DataHubViewProps> = ({
                           {log.rows_processed.toLocaleString()}
                         </td>
                         <td className="px-3 py-2">
-                          <span className="flex items-center gap-1 text-emerald-700 font-semibold text-[11px]">
+                          <span className="flex items-center gap-1 text-emerald-700 font-semibold text-[12px]">
                             <CheckCircle2 className="w-3.5 h-3.5 text-emerald-600" />
                             <span>{log.status}</span>
                           </span>
                         </td>
-                        <td className="px-3 py-2 text-slate-500 text-[11px] truncate max-w-xs">
+                        <td className="px-3 py-2 text-slate-500 text-[12px] truncate max-w-xs">
                           {log.source_name}
                         </td>
                       </tr>

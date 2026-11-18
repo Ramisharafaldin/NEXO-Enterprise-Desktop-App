@@ -383,7 +383,7 @@ export const DemandView: React.FC<DemandViewProps> = ({
         <div className="h-[210px] flex-none overflow-auto border-b border-[#CBD5E1] bg-white">
           <table className="nexo-grid w-full text-right">
             <thead>
-              <tr className="bg-[#ECEFF1] text-slate-700 font-semibold sticky top-0 z-10 text-[11px]">
+              <tr className="bg-[#ECEFF1] text-slate-700 font-semibold sticky top-0 z-10 text-[12px]">
                 <th className={`w-44 ${stickyColClass} z-20 bg-[#ECEFF1]`}>
                   {isAr ? 'نوع البيانات / الفترة' : 'Series / Period'}
                 </th>
@@ -398,7 +398,7 @@ export const DemandView: React.FC<DemandViewProps> = ({
                     >
                       <div>{p.date}</div>
                       {isFuture && (
-                        <div className="text-[9px] text-[#2196F3] font-bold">
+                        <div className="text-[10.5px] text-[#2196F3] font-bold">
                           +{idx - historicalPeriods.length + 1}
                         </div>
                       )}
@@ -502,7 +502,7 @@ export const DemandView: React.FC<DemandViewProps> = ({
 
               {/* Row 5: Lower 95% */}
               {visibleRows.lowerConf && (
-                <tr className="text-slate-500 hover:bg-slate-50 text-[11px]">
+                <tr className="text-slate-500 hover:bg-slate-50 text-[12px]">
                   <td className={`${stickyColClass} bg-white`}>
                     {t.demand.gridRows.lowerConf}
                   </td>
@@ -516,7 +516,7 @@ export const DemandView: React.FC<DemandViewProps> = ({
 
               {/* Row 6: Upper 95% */}
               {visibleRows.upperConf && (
-                <tr className="text-slate-500 hover:bg-slate-50 text-[11px]">
+                <tr className="text-slate-500 hover:bg-slate-50 text-[12px]">
                   <td className={`${stickyColClass} bg-white`}>
                     {t.demand.gridRows.upperConf}
                   </td>

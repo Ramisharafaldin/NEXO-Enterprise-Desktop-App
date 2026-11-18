@@ -556,7 +556,7 @@ export const InventoryView: React.FC<InventoryViewProps> = ({
       <div className="flex-1 overflow-auto bg-white">
         <table className="nexo-grid w-full text-right">
           <thead>
-            <tr className="bg-[#ECEFF1] text-slate-700 font-semibold sticky top-0 z-10 text-[11px]">
+            <tr className="bg-[#ECEFF1] text-slate-700 font-semibold sticky top-0 z-10 text-[12px]">
               {visibleCols.code && (
                 <th className="text-left w-24 sticky left-0 bg-[#ECEFF1] z-20 border-r border-[#CBD5E1]">
                   {t.inventory.table.code}
@@ -574,7 +574,11 @@ export const InventoryView: React.FC<InventoryViewProps> = ({
               {visibleCols.rop && <th className="min-w-[75px] bg-sky-50 text-sky-900">{t.inventory.table.rop}</th>}
               {visibleCols.coverage && <th className="min-w-[75px]">{t.inventory.table.coverage}</th>}
               {visibleCols.orderNow && <th className="min-w-[80px] bg-amber-50 text-amber-900 font-bold">{t.inventory.table.orderNow}</th>}
-              {visibleCols.orderValue && <th className="min-w-[90px] bg-amber-50 text-amber-900">{t.inventory.table.orderValue}</th>}
+              {visibleCols.orderValue && (
+                <th className="min-w-[125px] bg-amber-50 text-amber-900 whitespace-nowrap">
+                  {t.inventory.table.orderValue} ({getCurrencySymbol(settings?.currency_code || 'EGP', language)})
+                </th>
+              )}
               {visibleCols.transfer && <th className="text-left min-w-[140px]">{t.inventory.table.transfer}</th>}
               {visibleCols.status && <th className="text-center min-w-[75px]">{t.inventory.table.status}</th>}
               <th className="text-center min-w-[60px]">{t.inventory.table.action}</th>
@@ -612,7 +616,7 @@ export const InventoryView: React.FC<InventoryViewProps> = ({
                   )}
                   {visibleCols.abc && (
                     <td className="text-center font-bold font-mono">
-                      <span className={`px-1.5 py-0.5 rounded text-[10px] ${
+                      <span className={`px-1.5 py-0.5 rounded text-[11px] font-semibold ${
                         item.abcClass === 'A' ? 'bg-emerald-100 text-emerald-800' :
                         item.abcClass === 'B' ? 'bg-blue-100 text-blue-800' : 'bg-slate-100 text-slate-600'
                       }`}>
@@ -670,14 +674,14 @@ export const InventoryView: React.FC<InventoryViewProps> = ({
                     </td>
                   )}
                   {visibleCols.orderValue && (
-                    <td className="font-mono bg-amber-50/70 text-amber-900">
+                    <td className="font-mono bg-amber-50/70 text-amber-900 whitespace-nowrap">
                       {isToOrder ? formatCurrency(item.orderNowValue || 0, settings, language) : '-'}
                     </td>
                   )}
                   {visibleCols.transfer && (
-                    <td className="text-left font-mono text-[11px]">
+                    <td className="text-left font-mono text-[12px]">
                       {item.transferQty ? (
-                        <span className="text-purple-700 bg-purple-50 px-1 py-0.5 rounded border border-purple-200">
+                        <span className="text-purple-700 bg-purple-50 px-1.5 py-0.5 rounded border border-purple-200">
                           {item.transferQty} ← {item.transferSource}
                         </span>
                       ) : '-'}

@@ -8,8 +8,8 @@ export default {
   theme: {
     extend: {
       fontFamily: {
-        sans: ['Inter', 'IBM Plex Sans Arabic', 'system-ui', 'sans-serif'],
-        arabic: ['IBM Plex Sans Arabic', 'Cairo', 'sans-serif'],
+        sans: ['Inter', 'IBM Plex Sans Arabic', 'system-ui', '-apple-system', 'sans-serif'],
+        arabic: ['IBM Plex Sans Arabic', 'Inter', 'system-ui', '-apple-system', 'sans-serif'],
       },
       colors: {
         brand: {

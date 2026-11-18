@@ -335,7 +335,7 @@ export const ReportsView: React.FC<ReportsViewProps> = ({
       <div className="flex-1 overflow-auto bg-white">
         <table className="nexo-grid w-full text-right">
           <thead>
-            <tr className="bg-[#ECEFF1] text-slate-700 font-semibold sticky top-0 z-10 text-[11px]">
+            <tr className="bg-[#ECEFF1] text-slate-700 font-semibold sticky top-0 z-10 text-[12px]">
               <th className="text-left w-28 sticky left-0 bg-[#ECEFF1] z-20 border-r border-[#CBD5E1]">
                 {t.inventory.table.code}
               </th>
@@ -350,7 +350,7 @@ export const ReportsView: React.FC<ReportsViewProps> = ({
                   <th className="min-w-[70px] bg-sky-50 text-sky-900">{t.inventory.table.rop}</th>
                   <th className="min-w-[80px] bg-amber-50 text-amber-900 font-bold">{t.inventory.table.orderNow}</th>
                   <th className="min-w-[80px]">Unit Cost ({currSym})</th>
-                  <th className="min-w-[90px] bg-amber-50 text-amber-900 font-bold">{t.inventory.table.orderValue}</th>
+                  <th className="min-w-[125px] bg-amber-50 text-amber-900 font-bold whitespace-nowrap">{t.inventory.table.orderValue} ({currSym})</th>
                   <th className="text-center min-w-[80px]">{t.inventory.table.approval}</th>
                 </>
               )}
@@ -443,11 +443,11 @@ export const ReportsView: React.FC<ReportsViewProps> = ({
                       <td className="font-mono font-bold text-amber-800 bg-amber-50/50">
                         {item.orderNow || 0}
                       </td>
-                      <td className="font-mono text-slate-600">{formatCurrency(item.purchasePrice, settings, language)}</td>
-                      <td className="font-mono font-bold bg-amber-50/50 text-slate-900">
+                      <td className="font-mono text-slate-600 whitespace-nowrap">{formatCurrency(item.purchasePrice, settings, language)}</td>
+                      <td className="font-mono font-bold bg-amber-50/50 text-slate-900 whitespace-nowrap">
                         {formatCurrency(item.orderNowValue || 0, settings, language)}
                       </td>
-                      <td className="text-center font-semibold text-[10px]">
+                      <td className="text-center font-semibold text-[11.5px]">
                         <span className={`px-1.5 py-0.5 rounded ${
                           item.approvalState === 'approved' 
                             ? 'bg-emerald-100 text-emerald-800' 
@@ -461,7 +461,7 @@ export const ReportsView: React.FC<ReportsViewProps> = ({
 
                   {reportType === 'accuracy' && (
                     <>
-                      <td className="text-left font-semibold text-slate-700 uppercase text-[10px]">
+                      <td className="text-left font-semibold text-slate-700 uppercase text-[11.5px]">
                         {item.fittedModelType || item.modelType}
                       </td>
                       <td className="font-mono text-slate-600">{item.wmape?.toFixed(1)}%</td>
@@ -489,10 +489,10 @@ export const ReportsView: React.FC<ReportsViewProps> = ({
                           {item.xyzClass}
                         </span>
                       </td>
-                      <td className="font-mono">{formatCurrency(item.salesPrice, settings, language)}</td>
+                      <td className="font-mono whitespace-nowrap">{formatCurrency(item.salesPrice, settings, language)}</td>
                       <td className="font-mono font-semibold">{item.turnoverRatio}x</td>
-                      <td className="font-mono font-bold">{formatCurrency(item.inventoryValue || 0, settings, language)}</td>
-                      <td className="text-left text-[11px] text-slate-600">
+                      <td className="font-mono font-bold whitespace-nowrap">{formatCurrency(item.inventoryValue || 0, settings, language)}</td>
+                      <td className="text-left text-[12px] text-slate-600">
                         {item.abcClass === 'A' ? 'JIT / Daily Monitoring' : 'Periodic Min/Max'}
                       </td>
                     </>
@@ -522,7 +522,7 @@ export const ReportsView: React.FC<ReportsViewProps> = ({
                       </td>
                       <td className="font-mono">{item.onHand.toLocaleString()}</td>
                       <td className="font-mono">{item.safetyStock.toLocaleString()}</td>
-                      <td className="text-left text-[11px] text-purple-700 font-medium">
+                      <td className="text-left text-[12px] text-purple-700 font-medium">
                         {item.transferQty ? `${item.transferQty} units transfer` : 'No transfer'}
                       </td>
                       <td className="font-mono font-bold text-amber-800">

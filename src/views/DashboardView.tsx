@@ -272,7 +272,7 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
           {visibleTiles.inventoryValue !== false && (
             <div className="p-4 bg-white border border-[#CBD5E1] rounded-lg shadow-xs flex flex-col justify-between">
               <div className="flex items-center justify-between">
-                <span className="text-[11px] font-bold text-slate-500 uppercase tracking-wider">
+                <span className="text-[12px] font-bold text-slate-500 uppercase tracking-wider">
                   {t.dashboard.cards.inventoryValue}
                 </span>
                 <div className="p-1.5 bg-blue-50 text-[#2196F3] rounded">
@@ -283,7 +283,7 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
                 <span className="text-2xl font-bold text-slate-900 font-mono">
                   {formatCurrency(totalInventoryValue, settings, language)}
                 </span>
-                <div className="text-[11px] text-slate-500 mt-1 flex items-center gap-1.5">
+                <div className="text-[12px] text-slate-500 mt-1 flex items-center gap-1.5">
                   <span className="font-semibold text-slate-700">{items.length} {isAr ? 'صنف' : 'SKUs'}</span> 
                   <span>{isAr ? `عبر ${locationCount} موقع توزيع` : `across ${locationCount} distribution locations`}</span>
                 </div>
@@ -295,7 +295,7 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
           {visibleTiles.ordersToPlace !== false && (
             <div className="p-4 bg-white border border-[#CBD5E1] rounded-lg shadow-xs flex flex-col justify-between">
               <div className="flex items-center justify-between">
-                <span className="text-[11px] font-bold text-slate-500 uppercase tracking-wider">
+                <span className="text-[12px] font-bold text-slate-500 uppercase tracking-wider">
                   {t.dashboard.cards.ordersToPlace}
                 </span>
                 <div className="p-1.5 bg-amber-50 text-amber-600 rounded">
@@ -306,7 +306,7 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
                 <span className="text-2xl font-bold text-amber-600 font-mono">
                   {formatCurrency(totalOrdersToPlaceValue, settings, language)}
                 </span>
-                <div className="text-[11px] text-slate-500 mt-1 flex items-center gap-1.5">
+                <div className="text-[12px] text-slate-500 mt-1 flex items-center gap-1.5">
                   <strong className="text-amber-800 font-mono">{totalOrdersToPlaceUnits.toLocaleString()} units</strong>
                   <span>{isAr ? 'مطلوب طلبها الآن' : 'to order now'}</span>
                 </div>
@@ -318,7 +318,7 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
           {visibleTiles.forecastAccuracy !== false && (
             <div className="p-4 bg-white border border-[#CBD5E1] rounded-lg shadow-xs flex flex-col justify-between">
               <div className="flex items-center justify-between">
-                <span className="text-[11px] font-bold text-slate-500 uppercase tracking-wider">
+                <span className="text-[12px] font-bold text-slate-500 uppercase tracking-wider">
                   {t.dashboard.cards.forecastAccuracy}
                 </span>
                 <div className="p-1.5 bg-emerald-50 text-emerald-600 rounded">
@@ -329,7 +329,7 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
                 <span className="text-2xl font-bold text-emerald-600 font-mono">
                   {avgAccuracy.toFixed(1)}%
                 </span>
-                <div className="text-[11px] text-slate-500 mt-1 flex items-center gap-1.5">
+                <div className="text-[12px] text-slate-500 mt-1 flex items-center gap-1.5">
                   <span>Average WMAPE:</span>
                   <strong className="text-slate-700 font-mono">{avgWmape.toFixed(1)}%</strong>
                 </div>
@@ -341,7 +341,7 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
           {visibleTiles.stockoutAlert !== false && (
             <div className="p-4 bg-white border border-[#CBD5E1] rounded-lg shadow-xs flex flex-col justify-between">
               <div className="flex items-center justify-between">
-                <span className="text-[11px] font-bold text-slate-500 uppercase tracking-wider">
+                <span className="text-[12px] font-bold text-slate-500 uppercase tracking-wider">
                   {t.dashboard.cards.stockoutAlert}
                 </span>
                 <div className="p-1.5 bg-rose-50 text-rose-600 rounded">
@@ -352,7 +352,7 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
                 <span className="text-2xl font-bold text-rose-600 font-mono">
                   {stockoutItems.length} {isAr ? 'صنف' : 'SKUs'}
                 </span>
-                <div className="text-[11px] text-rose-700 mt-1 font-semibold">
+                <div className="text-[12px] text-rose-700 mt-1 font-semibold">
                   {stockoutItems.length > 0 
                     ? (isAr ? 'يلزم توريد عاجل لمنع النفاذ' : 'Critical replenishment required')
                     : (isAr ? 'مستويات الأمان مكتملة' : 'Safety stock levels fully met')}
@@ -367,13 +367,13 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
           {visibleTiles.overstock !== false && (
             <div className="p-3.5 bg-white border border-[#CBD5E1] rounded-lg shadow-xs flex items-center justify-between">
               <div>
-                <span className="text-[11px] font-bold text-slate-500 uppercase">
+                <span className="text-[12px] font-bold text-slate-500 uppercase">
                   {t.dashboard.cards.overstockCapital}
                 </span>
                 <div className="text-lg font-bold text-amber-700 font-mono mt-0.5">
                   {formatCurrency(totalOverstockValue, settings, language)}
                 </div>
-                <span className="text-[10px] text-slate-400">
+                <span className="text-[11.5px] text-slate-500">
                   {overstockItems.length} {isAr ? 'أصناف تتجاوز الحد الأقصى' : 'items over max target'}
                 </span>
               </div>
@@ -384,13 +384,13 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
           {visibleTiles.expirations !== false && (
             <div className="p-3.5 bg-white border border-[#CBD5E1] rounded-lg shadow-xs flex items-center justify-between">
               <div>
-                <span className="text-[11px] font-bold text-slate-500 uppercase">
+                <span className="text-[12px] font-bold text-slate-500 uppercase">
                   {t.dashboard.cards.expirations}
                 </span>
                 <div className="text-lg font-bold text-slate-700 font-mono mt-0.5">
                   {formatCurrency(totalWriteOffValue, settings, language)}
                 </div>
-                <span className="text-[10px] text-slate-400">
+                <span className="text-[11.5px] text-slate-500">
                   {isAr ? 'حماية تواريخ الصلاحية نشطة' : 'Shelf life expiration protection active'}
                 </span>
               </div>
@@ -401,13 +401,13 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
           {visibleTiles.turnover !== false && (
             <div className="p-3.5 bg-white border border-[#CBD5E1] rounded-lg shadow-xs flex items-center justify-between">
               <div>
-                <span className="text-[11px] font-bold text-slate-500 uppercase">
+                <span className="text-[12px] font-bold text-slate-500 uppercase">
                   {t.dashboard.cards.turnoverRatio}
                 </span>
                 <div className="text-lg font-bold text-emerald-700 font-mono mt-0.5">
                   {avgTurnover.toFixed(1)}x / {isAr ? 'سنة' : 'year'}
                 </div>
-                <span className="text-[10px] text-slate-400">
+                <span className="text-[11.5px] text-slate-500">
                   {isAr ? 'معدل دوران رأس المال العامل' : 'Healthy capital velocity'}
                 </span>
               </div>
