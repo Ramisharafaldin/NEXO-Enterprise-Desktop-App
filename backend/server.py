@@ -7,6 +7,32 @@ Excel/CSV import/export, and live reactive inventory calculations.
 
 import os
 import sys
+import subprocess
+
+# 1. Safe pythonw.exe stdout/stderr stream redirection
+if sys.platform == "win32":
+    _parent_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    _log_file = os.path.join(_parent_dir, "desktop_app.log")
+    if sys.stdout is None:
+        try:
+            sys.stdout = open(_log_file, "a", encoding="utf-8", buffering=1)
+        except Exception:
+            pass
+    if sys.stderr is None:
+        try:
+            sys.stderr = open(_log_file, "a", encoding="utf-8", buffering=1)
+        except Exception:
+            pass
+
+# 2. Global Windows subprocess.Popen CREATE_NO_WINDOW monkey-patch
+if sys.platform == "win32" and not getattr(subprocess, "_nexo_silent_patched", False):
+    _orig_popen = subprocess.Popen
+    class _SilentPopen(_orig_popen):
+        def __init__(self, *args, **kwargs):
+            kwargs["creationflags"] = kwargs.get("creationflags", 0) | subprocess.CREATE_NO_WINDOW
+            super().__init__(*args, **kwargs)
+    subprocess.Popen = _SilentPopen
+    subprocess._nexo_silent_patched = True
 
 # Ensure backend directory is in sys.path so both direct execution and package imports work
 backend_dir = os.path.dirname(os.path.abspath(__file__))
