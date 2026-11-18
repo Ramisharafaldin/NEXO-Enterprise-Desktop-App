@@ -1,5 +1,5 @@
 import React, { useMemo } from 'react';
-import { InventoryItem, AppSettings } from '../engine/types';
+import { InventoryItem, AppSettings, isAnalyzableItem } from '../engine/types';
 import { translations, Language } from '../i18n/translations';
 import { formatCurrency, getCurrencySymbol } from '../utils/formatters';
 import { classifyAbcXyz } from '../engine/math';
@@ -26,10 +26,11 @@ export const AbcXyzModal: React.FC<AbcXyzModalProps> = ({
   const isAr = language === 'ar';
   const currSym = getCurrencySymbol(settings?.currency_code || 'EGP', language);
 
-  // Re-classify dynamically with configured thresholds
+  // Re-classify dynamically with configured thresholds, excluding dormant SKUs
   const classifiedItems = useMemo(() => {
+    const active = (items || []).filter(isAnalyzableItem);
     return classifyAbcXyz(
-      items,
+      active,
       settings?.abc_a_cutoff ?? 80,
       settings?.abc_b_cutoff ?? 95,
       settings?.xyz_x_cv ?? 0.5,

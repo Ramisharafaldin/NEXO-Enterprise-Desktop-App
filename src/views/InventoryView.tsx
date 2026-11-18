@@ -1,5 +1,5 @@
-import React, { useState, useRef, useEffect } from 'react';
-import { InventoryItem, ReplenishmentStrategy, AppSettings } from '../engine/types';
+import React, { useState, useRef, useEffect, useMemo } from 'react';
+import { InventoryItem, ReplenishmentStrategy, AppSettings, isAnalyzableItem } from '../engine/types';
 import { translations, Language } from '../i18n/translations';
 import { formatCurrency, getCurrencySymbol } from '../utils/formatters';
 import { 
@@ -70,6 +70,9 @@ export const InventoryView: React.FC<InventoryViewProps> = ({
 }) => {
   const t = translations[language];
   const isAr = language === 'ar';
+
+  // Strict Defensive Exclusion: Filter out any dormant SKUs (onHand <= 0 && totalSales <= 0)
+  const activeItems = useMemo(() => (items || []).filter(isAnalyzableItem), [items]);
 
   const [activeFilterTab, setActiveFilterTab] = useState<'all' | 'toOrder' | 'stockout' | 'overstock' | 'transition' | string>('all');
   const [searchTerm, setSearchTerm] = useState('');
@@ -181,7 +184,7 @@ export const InventoryView: React.FC<InventoryViewProps> = ({
 
   // Export / Import parameter files
   const handleExportParameters = () => {
-    const params = items.map(i => ({
+    const params = activeItems.map(i => ({
       code: i.code,
       description: i.description,
       modelType: i.modelType,
@@ -213,7 +216,7 @@ export const InventoryView: React.FC<InventoryViewProps> = ({
         const parsed = JSON.parse(evt.target?.result as string);
         if (Array.isArray(parsed)) {
           for (const p of parsed) {
-            const match = items.find(it => it.code === p.code);
+            const match = activeItems.find(it => it.code === p.code);
             if (match) {
               await api.updateItemParameters(projectId, match.id, {
                 modelType: p.modelType,
@@ -237,7 +240,7 @@ export const InventoryView: React.FC<InventoryViewProps> = ({
   };
 
   // Filtered items logic
-  const filteredItems = items.filter(item => {
+  const filteredItems = activeItems.filter(item => {
     const matchesSearch = !searchTerm || 
       item.code.toLowerCase().includes(searchTerm.toLowerCase()) ||
       item.description.toLowerCase().includes(searchTerm.toLowerCase()) ||
@@ -293,10 +296,10 @@ export const InventoryView: React.FC<InventoryViewProps> = ({
     XLSX.writeFile(wb, `NEXO_Inventory_Replenishment_${projectId}.xlsx`);
   };
 
-  const toOrderCount = items.filter(i => (i.orderNow || 0) > 0).length;
-  const stockoutCount = items.filter(i => i.isStockout).length;
-  const overstockCount = items.filter(i => i.isOverstock).length;
-  const transitionCount = items.filter(i => (i.onOrder || 0) > 0).length;
+  const toOrderCount = activeItems.filter(i => (i.orderNow || 0) > 0).length;
+  const stockoutCount = activeItems.filter(i => i.isStockout).length;
+  const overstockCount = activeItems.filter(i => i.isOverstock).length;
+  const transitionCount = activeItems.filter(i => (i.onOrder || 0) > 0).length;
 
   return (
     <div className="flex-1 flex flex-col overflow-hidden bg-[#F8F9FA] select-none text-[#1E293B] text-[12px]">
@@ -319,7 +322,7 @@ export const InventoryView: React.FC<InventoryViewProps> = ({
                 : 'border-transparent text-slate-600 hover:bg-[#E2E8F0]'
             }`}
           >
-            {t.inventory.filterTabs.all} ({items.length})
+            {t.inventory.filterTabs.all} ({activeItems.length})
           </button>
           <button
             onClick={() => setActiveFilterTab('toOrder')}

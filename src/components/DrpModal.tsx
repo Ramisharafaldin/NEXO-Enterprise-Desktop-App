@@ -1,5 +1,5 @@
 import React, { useMemo } from 'react';
-import { InventoryItem } from '../engine/types';
+import { InventoryItem, isAnalyzableItem } from '../engine/types';
 import { translations, Language } from '../i18n/translations';
 import { X, Network, ArrowRightLeft, Building2, Store, CheckCircle2 } from 'lucide-react';
 
@@ -21,16 +21,19 @@ export const DrpModal: React.FC<DrpModalProps> = ({
   const t = translations[language];
   const isAr = language === 'ar';
 
+  // Strict Defensive Exclusion: Filter out any dormant SKUs (onHand <= 0 && totalSales <= 0)
+  const activeItems = useMemo(() => (items || []).filter(isAnalyzableItem), [items]);
+
   // Dynamic Multi-Echelon Location Topology
   const locations = useMemo(() => {
-    const set = new Set(items.map(i => i.location || (isAr ? 'المستودع الرئيسي' : 'Central DC')));
+    const set = new Set(activeItems.map(i => i.location || (isAr ? 'المستودع الرئيسي' : 'Central DC')));
     return Array.from(set);
-  }, [items, isAr]);
+  }, [activeItems, isAr]);
 
   const primaryDc = useMemo(() => {
-    const dcItem = items.find(i => !!i.dc);
+    const dcItem = activeItems.find(i => !!i.dc);
     return dcItem ? dcItem.location : (locations[0] || 'Central DC');
-  }, [items, locations]);
+  }, [activeItems, locations]);
 
   const branches = useMemo(() => {
     return locations.filter(l => l !== primaryDc);

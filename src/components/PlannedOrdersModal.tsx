@@ -1,5 +1,5 @@
 import React from 'react';
-import { InventoryItem, AppSettings } from '../engine/types';
+import { InventoryItem, AppSettings, isAnalyzableItem } from '../engine/types';
 import { translations, Language } from '../i18n/translations';
 import { formatCurrency, getCurrencySymbol } from '../utils/formatters';
 import { X, ShoppingCart, CheckCircle, Download, FileSpreadsheet, Send } from 'lucide-react';
@@ -28,7 +28,7 @@ export const PlannedOrdersModal: React.FC<PlannedOrdersModalProps> = ({
   const isAr = language === 'ar';
   const currSym = getCurrencySymbol(settings?.currency_code || 'EGP', language);
 
-  const orderItems = items.filter(i => (i.orderNow || 0) > 0);
+  const orderItems = items.filter(isAnalyzableItem).filter(i => (i.orderNow || 0) > 0);
   const totalUnits = orderItems.reduce((sum, i) => sum + (i.orderNow || 0), 0);
   const totalValue = orderItems.reduce((sum, i) => sum + (i.orderNowValue || 0), 0);
 

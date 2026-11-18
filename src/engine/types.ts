@@ -106,7 +106,11 @@ export interface InventoryItem {
   checkState: CheckState;
   approvalState: ApprovalState;
   notes?: string;
+  totalSales?: number;
+  isDormant?: boolean;
 }
+
+export { isAnalyzableItem, filterAnalyzableItems } from './dormantFilter';
 
 export interface OrderItem {
   id: string;

@@ -1,5 +1,5 @@
-import React, { useState, useEffect } from 'react';
-import { InventoryItem, AppSettings } from '../engine/types';
+import React, { useState, useEffect, useMemo } from 'react';
+import { InventoryItem, AppSettings, isAnalyzableItem } from '../engine/types';
 import { translations, Language } from '../i18n/translations';
 import { formatCurrency, getCurrencySymbol } from '../utils/formatters';
 import { api, DashboardKpis } from '../api/client';
@@ -112,25 +112,28 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
     if (onRefresh) onRefresh();
   };
 
-  // Aggregated KPIs (DuckDB backend prioritised, fallback to local item computations)
-  const totalInventoryValue = dbKpis?.totalInventoryValue ?? items.reduce((sum, i) => sum + (i.inventoryValue || (i.onHand * i.salesPrice) || 0), 0);
-  const totalOrdersToPlaceValue = items.reduce((sum, i) => sum + (i.orderNowValue || 0), 0);
-  const totalOrdersToPlaceUnits = items.reduce((sum, i) => sum + (i.orderNow || 0), 0);
-  const stockoutItems = items.filter(i => i.isStockout || i.onHand <= 0);
-  const overstockItems = items.filter(i => i.isOverstock);
-  const totalOverstockValue = dbKpis?.totalOverstockValue ?? items.reduce((sum, i) => sum + (i.overstockValue || 0), 0);
-  const totalWriteOffValue = items.reduce((sum, i) => sum + (i.expectedWriteOffValue || 0), 0);
-  const avgWmape = items.length > 0 ? (items.reduce((sum, i) => sum + (i.wmape || 0), 0) / items.length) : 0;
-  const avgAccuracy = dbKpis?.overallForecastAccuracy ?? (100 - avgWmape);
-  const avgTurnover = dbKpis?.inventoryTurns ?? (items.length > 0 ? (items.reduce((sum, i) => sum + (i.turnoverRatio || 0), 0) / items.length) : 0);
+  // Strict Defensive Exclusion: Filter out any dormant SKUs (onHand <= 0 && totalSales <= 0)
+  const activeItems = useMemo(() => (items || []).filter(isAnalyzableItem), [items]);
 
-  const uniqueLocations = Array.from(new Set(items.map(i => i.location || (isAr ? 'المركز الرئيسي' : 'Main Hub'))));
+  // Aggregated KPIs (DuckDB backend prioritised, fallback to local item computations)
+  const totalInventoryValue = dbKpis?.totalInventoryValue ?? activeItems.reduce((sum, i) => sum + (i.inventoryValue || (i.onHand * i.salesPrice) || 0), 0);
+  const totalOrdersToPlaceValue = activeItems.reduce((sum, i) => sum + (i.orderNowValue || 0), 0);
+  const totalOrdersToPlaceUnits = activeItems.reduce((sum, i) => sum + (i.orderNow || 0), 0);
+  const stockoutItems = activeItems.filter(i => i.isStockout || i.onHand <= 0);
+  const overstockItems = activeItems.filter(i => i.isOverstock);
+  const totalOverstockValue = dbKpis?.totalOverstockValue ?? activeItems.reduce((sum, i) => sum + (i.overstockValue || 0), 0);
+  const totalWriteOffValue = activeItems.reduce((sum, i) => sum + (i.expectedWriteOffValue || 0), 0);
+  const avgWmape = activeItems.length > 0 ? (activeItems.reduce((sum, i) => sum + (i.wmape || 0), 0) / activeItems.length) : 0;
+  const avgAccuracy = dbKpis?.overallForecastAccuracy ?? (100 - avgWmape);
+  const avgTurnover = dbKpis?.inventoryTurns ?? (activeItems.length > 0 ? (activeItems.reduce((sum, i) => sum + (i.turnoverRatio || 0), 0) / activeItems.length) : 0);
+
+  const uniqueLocations = Array.from(new Set(activeItems.map(i => i.location || (isAr ? 'المركز الرئيسي' : 'Main Hub'))));
   const locationCount = uniqueLocations.length || 1;
 
   // Real ABC Revenue Breakdown from actual item inventory values
-  const classAItems = items.filter(i => (i.abcClass || 'C').toUpperCase() === 'A');
-  const classBItems = items.filter(i => (i.abcClass || 'C').toUpperCase() === 'B');
-  const classCItems = items.filter(i => (i.abcClass || 'C').toUpperCase() === 'C');
+  const classAItems = activeItems.filter(i => (i.abcClass || 'C').toUpperCase() === 'A');
+  const classBItems = activeItems.filter(i => (i.abcClass || 'C').toUpperCase() === 'B');
+  const classCItems = activeItems.filter(i => (i.abcClass || 'C').toUpperCase() === 'C');
 
   const classAVal = classAItems.reduce((sum, i) => sum + (i.inventoryValue || (i.onHand * i.salesPrice) || 0), 0);
   const classBVal = classBItems.reduce((sum, i) => sum + (i.inventoryValue || (i.onHand * i.salesPrice) || 0), 0);
@@ -157,7 +160,7 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
 
   // Chart data: Orders by Category
   const categoryOrderMap: Record<string, number> = {};
-  items.forEach(i => {
+  activeItems.forEach(i => {
     const cat = i.category || (isAr ? 'عام' : 'General');
     if ((i.orderNowValue || 0) > 0) {
       categoryOrderMap[cat] = (categoryOrderMap[cat] || 0) + (i.orderNowValue || 0);
@@ -284,7 +287,7 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
                   {formatCurrency(totalInventoryValue, settings, language)}
                 </span>
                 <div className="text-[12px] text-slate-500 mt-1 flex items-center gap-1.5">
-                  <span className="font-semibold text-slate-700">{items.length} {isAr ? 'صنف' : 'SKUs'}</span> 
+                  <span className="font-semibold text-slate-700">{activeItems.length} {isAr ? 'صنف' : 'SKUs'}</span> 
                   <span>{isAr ? `عبر ${locationCount} موقع توزيع` : `across ${locationCount} distribution locations`}</span>
                 </div>
               </div>

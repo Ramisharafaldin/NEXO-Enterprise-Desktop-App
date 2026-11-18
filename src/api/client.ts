@@ -195,6 +195,8 @@ export const api = {
     filters: SavedFilter[];
     transitions: InTransitionRecord[];
     kpis: DashboardKpis;
+    dormant_count?: number;
+    excluded_dormant_count?: number;
   }> {
     const res = await fetch(`${API_BASE}/projects/${projectId}/workspace`);
     if (!res.ok) throw new Error(`Failed to load workspace: ${res.statusText}`);
@@ -204,8 +206,8 @@ export const api = {
   /**
    * Items & time-series periods
    */
-  async getProjectItems(projectId: string): Promise<{ project_id: string; count: number; items: InventoryItem[] }> {
-    const res = await fetch(`${API_BASE}/projects/${projectId}/items`);
+  async getProjectItems(projectId: string, includeDormant: boolean = false): Promise<{ project_id: string; count: number; items: InventoryItem[]; dormant_count?: number; excluded_dormant_count?: number; }> {
+    const res = await fetch(`${API_BASE}/projects/${projectId}/items?include_dormant=${includeDormant}`);
     if (!res.ok) throw new Error(`Failed to load items: ${res.statusText}`);
     return res.json();
   },

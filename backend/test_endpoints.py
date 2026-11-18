@@ -219,7 +219,101 @@ async def run_tests():
         assert ds_count == 3, f"Expected 3 raw daily transactions in daily_sales, got {ds_count}"
         print(f'17. Daily Sales POS Auto-Aggregation & Zero-Overwrite PASSED (Aggregated Actual={p_row[0]}, Revenue={p_row[1]}, Staged Transactions={ds_count})')
 
-        print('\n=== ALL 17 BACKEND & DATA HUB ENDPOINTS TESTED AND VERIFIED 100% OPERATIONAL! ===')
+        # 18. Core Analytical Rule: Exclude Zero-Stock & Zero-Sales SKUs
+        con = get_connection()
+        test_dormant_codes = ['SKU-DORMANT-TEST', 'SKU-STOCKOUT-TEST', 'SKU-DEADSTOCK-TEST']
+        for c in test_dormant_codes:
+            con.execute("DELETE FROM periods WHERE project_id = ? AND item_id IN (SELECT id FROM items WHERE project_id = ? AND code = ?)", (pid, pid, c))
+            con.execute("DELETE FROM items WHERE project_id = ? AND code = ?", (pid, c))
+
+        # Insert 3 test SKUs:
+        # A) Dormant SKU: on_hand = 0, no sales (total_sales = 0) -> MUST BE EXCLUDED
+        dormant_id = f"{pid}_dormant_test"
+        con.execute("""
+            INSERT INTO items (id, project_id, code, description, category, location, on_hand, purchase_price, sales_price)
+            VALUES (?, ?, 'SKU-DORMANT-TEST', 'Dormant Zero Stock Zero Sales', 'General', 'Main WH', 0.0, 50.0, 100.0)
+        """, (dormant_id, pid))
+
+        # B) Stockout SKU: on_hand = 0, actual = 25.0 -> MUST BE INCLUDED
+        stockout_id = f"{pid}_stockout_test"
+        con.execute("""
+            INSERT INTO items (id, project_id, code, description, category, location, on_hand, purchase_price, sales_price)
+            VALUES (?, ?, 'SKU-STOCKOUT-TEST', 'Stockout SKU with Demand', 'General', 'Main WH', 0.0, 50.0, 100.0)
+        """, (stockout_id, pid))
+        con.execute("""
+            INSERT INTO periods (id, project_id, item_id, date, actual, forecast)
+            VALUES ('per_stockout_test', ?, ?, '2025-10', 25.0, 25.0)
+        """, (pid, stockout_id))
+
+        # C) Deadstock/New Stock SKU: on_hand = 40.0, actual = 0.0 -> MUST BE INCLUDED
+        deadstock_id = f"{pid}_deadstock_test"
+        con.execute("""
+            INSERT INTO items (id, project_id, code, description, category, location, on_hand, purchase_price, sales_price)
+            VALUES (?, ?, 'SKU-DEADSTOCK-TEST', 'Dead Stock in Warehouse', 'General', 'Main WH', 40.0, 50.0, 100.0)
+        """, (deadstock_id, pid))
+        con.close()
+
+        # Test A: GET /api/projects/{pid}/items (default: include_dormant=False)
+        r_items = await client.get(f'/api/projects/{pid}/items')
+        assert r_items.status_code == 200
+        items_payload = r_items.json()
+        item_codes = [it['code'] for it in items_payload['items']]
+        assert 'SKU-DORMANT-TEST' not in item_codes, "Dormant SKU must be excluded from /api/projects/{pid}/items"
+        assert 'SKU-STOCKOUT-TEST' in item_codes, "Stockout SKU with sales demand must be included"
+        assert 'SKU-DEADSTOCK-TEST' in item_codes, "Dead stock SKU with on-hand units must be included"
+        assert items_payload.get('dormant_count', 0) >= 1, "dormant_count must be >= 1"
+
+        # Test B: GET /api/projects/{pid}/items?include_dormant=true
+        r_items_all = await client.get(f'/api/projects/{pid}/items?include_dormant=true')
+        assert r_items_all.status_code == 200
+        all_codes = [it['code'] for it in r_items_all.json()['items']]
+        assert 'SKU-DORMANT-TEST' in all_codes, "Dormant SKU should be returned when include_dormant=true"
+
+        # Test C: GET /api/inventory
+        r_inv = await client.get(f'/api/inventory?project_id={pid}')
+        assert r_inv.status_code == 200
+        inv_codes = [it['code'] for it in r_inv.json()['items']]
+        assert 'SKU-DORMANT-TEST' not in inv_codes, "Dormant SKU must be excluded from /api/inventory"
+        assert 'SKU-STOCKOUT-TEST' in inv_codes
+
+        # Test D: GET /api/demand
+        r_dem = await client.get(f'/api/demand?project_id={pid}')
+        assert r_dem.status_code == 200
+        dem_codes = [it['code'] for it in r_dem.json()['series']]
+        assert 'SKU-DORMANT-TEST' not in dem_codes, "Dormant SKU must be excluded from /api/demand"
+
+        # Test E: GET /api/dashboard & /api/reports
+        r_dash = await client.get(f'/api/dashboard?project_id={pid}')
+        assert r_dash.status_code == 200
+        assert r_dash.json().get('dormant_count', 0) >= 1
+
+        r_rep = await client.get(f'/api/reports?project_id={pid}')
+        assert r_rep.status_code == 200
+        rep_codes = [it['code'] for it in r_rep.json()['items']]
+        assert 'SKU-DORMANT-TEST' not in rep_codes, "Dormant SKU must be excluded from /api/reports"
+
+        # Test F: Excel Export must NOT contain dormant SKU
+        r_exp = await client.get(f'/api/files/export/{pid}?export_type=all')
+        assert r_exp.status_code == 200
+        df_exp = pd.read_excel(io.BytesIO(r_exp.content), sheet_name='Inventory Replenishment')
+        assert 'SKU-DORMANT-TEST' not in df_exp['Item Code'].values, "Dormant SKU must be excluded from Excel exports"
+        assert 'SKU-STOCKOUT-TEST' in df_exp['Item Code'].values
+        assert 'SKU-DEADSTOCK-TEST' in df_exp['Item Code'].values
+
+        # Test G: DataHub Summary endpoint
+        r_dh = await client.get(f'/api/data-hub/summary?project_id={pid}')
+        assert r_dh.status_code == 200
+        assert r_dh.json().get('dormant_count', 0) >= 1
+
+        # Test H: Non-destructive storage verification in DuckDB
+        con = get_connection()
+        raw_db_row = con.execute("SELECT code, description FROM items WHERE project_id = ? AND code = 'SKU-DORMANT-TEST'", (pid,)).fetchone()
+        con.close()
+        assert raw_db_row is not None and raw_db_row[0] == 'SKU-DORMANT-TEST', "Raw dormant item master row must remain preserved in DuckDB"
+
+        print(f'18. Exclude Zero-Stock & Zero-Sales SKUs PASSED (Dormant excluded from all views/kpis/exports, non-destructively preserved in DuckDB)')
+
+        print('\n=== ALL 18 BACKEND & DATA HUB ENDPOINTS TESTED AND VERIFIED 100% OPERATIONAL! ===')
 
 if __name__ == '__main__':
     asyncio.run(run_tests())

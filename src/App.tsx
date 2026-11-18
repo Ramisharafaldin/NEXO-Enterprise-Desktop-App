@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useCallback, useMemo, useRef } from 'react';
 import { TrendingUp } from 'lucide-react';
-import { InventoryItem, ModelType, ReplenishmentStrategy, AppSettings } from './engine/types';
+import { InventoryItem, ModelType, ReplenishmentStrategy, AppSettings, isAnalyzableItem } from './engine/types';
 import { getInitialInventoryItems } from './engine/sampleData';
 import {
   autoSelectModel,
@@ -48,8 +48,9 @@ export const App: React.FC = () => {
   const [activeDataset, setActiveDataset] = useState('Retail Inventory Planning Example monthly.xlsx');
 
   // Core Items State - Initialized immediately with standard benchmark data to prevent blank/null state
-  const initialItems = useMemo(() => getInitialInventoryItems(), []);
+  const initialItems = useMemo(() => getInitialInventoryItems().filter(isAnalyzableItem), []);
   const [items, setItems] = useState<InventoryItem[]>(initialItems);
+  const [dormantCount, setDormantCount] = useState<number>(0);
   const [selectedItemId, setSelectedItemId] = useState<string>(initialItems[0]?.id || '');
   const [explainingItem, setExplainingItem] = useState<InventoryItem | null>(null);
   const [isServerConnected, setIsServerConnected] = useState(false);
@@ -83,23 +84,27 @@ export const App: React.FC = () => {
     try {
       const ws = await api.getWorkspace(projectId);
       if (ws && ws.items && ws.items.length > 0) {
-        setItems(ws.items);
-        setSelectedItemId(ws.items[0].id);
+        const analyzable = ws.items.filter(isAnalyzableItem);
+        setItems(analyzable.length > 0 ? analyzable : ws.items);
+        setSelectedItemId(analyzable[0]?.id || ws.items[0].id);
         setActiveProjectId(projectId);
+        setDormantCount(ws.dormant_count ?? ws.excluded_dormant_count ?? Math.max(0, ws.items.length - analyzable.length));
         if (ws.project) {
           setActiveDataset(ws.project.dataset_name || ws.project.name);
         }
         setIsServerConnected(true);
       } else {
         // Fallback to sample data if project has 0 items
-        const initial = getInitialInventoryItems();
+        const initial = getInitialInventoryItems().filter(isAnalyzableItem);
         setItems(initial);
+        setDormantCount(0);
         if (initial.length > 0) setSelectedItemId(initial[0].id);
       }
     } catch (err) {
       console.warn('Backend unavailable, loading local memory cache:', err);
-      const initial = getInitialInventoryItems();
+      const initial = getInitialInventoryItems().filter(isAnalyzableItem);
       setItems(initial);
+      setDormantCount(0);
       if (initial.length > 0) setSelectedItemId(initial[0].id);
       setIsServerConnected(false);
     } finally {
@@ -576,6 +581,7 @@ export const App: React.FC = () => {
             <DataHubView
               projectId={activeProjectId}
               projectName={activeDataset}
+              dormantCount={dormantCount}
               onRefreshProject={() => {
                 refreshProjects();
                 loadProject(activeProjectId);

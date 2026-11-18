@@ -27,6 +27,7 @@ import { api, IngestionLog, ErpConnection, SqlServerTestResult } from '../api/cl
 interface DataHubViewProps {
   projectId: string;
   projectName: string;
+  dormantCount?: number;
   onRefreshProject: () => void;
   language: Language;
 }
@@ -36,6 +37,7 @@ type ActiveConnector = 'excel' | 'sql' | 'local_db' | 'api' | 'logs';
 export const DataHubView: React.FC<DataHubViewProps> = ({
   projectId,
   projectName,
+  dormantCount,
   onRefreshProject,
   language,
 }) => {
@@ -463,18 +465,32 @@ export const DataHubView: React.FC<DataHubViewProps> = ({
           </div>
         </div>
 
-        {/* 1-Click Quick Re-Sync Button (if connections exist) */}
-        {connections.length > 0 && (
-          <button
-            onClick={handleQuickSync}
-            disabled={isQuickSyncing}
-            className="flex items-center gap-2 px-3.5 py-1.5 bg-[#2196F3] hover:bg-blue-600 text-white rounded text-xs font-semibold transition shadow-xs cursor-pointer disabled:opacity-50"
-            title={isAr ? 'مزامنة فورية بنقرة واحدة من المصدر المحفوظ' : '1-Click Re-sync from Saved ERP Profile'}
-          >
-            <RefreshCw className={`w-3.5 h-3.5 ${isQuickSyncing ? 'animate-spin' : ''}`} />
-            <span>{isAr ? 'مزامنة المصدر المحفوظ الآن' : 'Sync Saved Profile Now'}</span>
-          </button>
-        )}
+        <div className="flex items-center gap-3">
+          {/* Informational Audit Pill for Dormant SKUs Excluded */}
+          {dormantCount !== undefined && dormantCount > 0 && (
+            <div className="flex items-center gap-2 px-3 py-1.5 bg-amber-500/15 border border-amber-400/40 text-amber-200 rounded-md text-xs font-medium shadow-xs">
+              <span className="w-2 h-2 rounded-full bg-amber-400 animate-pulse shrink-0" />
+              <span>
+                {isAr
+                  ? `تم استبعاد ${dormantCount.toLocaleString()} صنف رصيده صفر وبدون مبيعات من التحليل`
+                  : `${dormantCount.toLocaleString()} dormant SKUs (zero stock & zero sales) excluded from analysis`}
+              </span>
+            </div>
+          )}
+
+          {/* 1-Click Quick Re-Sync Button (if connections exist) */}
+          {connections.length > 0 && (
+            <button
+              onClick={handleQuickSync}
+              disabled={isQuickSyncing}
+              className="flex items-center gap-2 px-3.5 py-1.5 bg-[#2196F3] hover:bg-blue-600 text-white rounded text-xs font-semibold transition shadow-xs cursor-pointer disabled:opacity-50"
+              title={isAr ? 'مزامنة فورية بنقرة واحدة من المصدر المحفوظ' : '1-Click Re-sync from Saved ERP Profile'}
+            >
+              <RefreshCw className={`w-3.5 h-3.5 ${isQuickSyncing ? 'animate-spin' : ''}`} />
+              <span>{isAr ? 'مزامنة المصدر المحفوظ الآن' : 'Sync Saved Profile Now'}</span>
+            </button>
+          )}
+        </div>
       </div>
 
       {/* Primary Connector Tabs Navigation */}

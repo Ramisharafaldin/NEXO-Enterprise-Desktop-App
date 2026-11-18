@@ -76,6 +76,8 @@ from database import (
     get_project_by_id,
     create_new_project,
     delete_project_by_id,
+    is_analyzable_sku,
+    get_project_dormant_count,
     get_project_items,
     get_workspace,
     save_period_override,
@@ -135,13 +137,23 @@ def on_startup():
 @app.get("/api/health")
 def health_check():
     drivers = pyodbc.drivers()
+    # Calculate global dormant SKU count across active projects
+    try:
+        projs = list_projects()
+        active_pid = next((p["id"] for p in projs if p.get("sku_count", 0) > 0), (projs[0]["id"] if projs else None))
+        dormant_cnt = get_project_dormant_count(active_pid) if active_pid else 0
+    except Exception:
+        dormant_cnt = 0
+
     return {
         "status": "online",
         "app": "NEXO Enterprise Supply Chain Planning",
         "duckdb_version": duckdb.__version__,
         "python_version": sys.version.split()[0],
         "installed_odbc_drivers": drivers,
-        "sql_server_driver_available": any("SQL Server" in d for d in drivers)
+        "sql_server_driver_available": any("SQL Server" in d for d in drivers),
+        "excluded_dormant_count": dormant_cnt,
+        "active_rule": "exclude_zero_stock_zero_sales"
     }
 
 # ==============================================================================
@@ -177,8 +189,8 @@ def delete_project_endpoint(project_id: str):
 
 # Workspace load endpoint (loads all items, overrides, settings, and filters for project)
 @app.get("/api/projects/{project_id}/workspace")
-def get_project_workspace_endpoint(project_id: str):
-    ws = get_workspace(project_id)
+def get_project_workspace_endpoint(project_id: str, include_dormant: bool = Query(False)):
+    ws = get_workspace(project_id, include_dormant=include_dormant)
     if not ws["project"]:
         raise HTTPException(status_code=404, detail="Project not found")
     return ws
@@ -224,10 +236,103 @@ def save_settings_endpoint(req: SettingsUpdateRequest):
 # Items, Periods, Overrides & Parameters Endpoints
 # ==============================================================================
 
+def _resolve_project_id(project_id: Optional[str] = None) -> str:
+    """Helper to resolve target project_id or pick active project."""
+    if project_id and project_id.strip():
+        return project_id.strip()
+    projs = list_projects()
+    if projs:
+        active = next((p["id"] for p in projs if p.get("sku_count", 0) > 0), projs[0]["id"])
+        return active
+    raise HTTPException(status_code=404, detail="No projects found")
+
 @app.get("/api/projects/{project_id}/items")
-def get_items_endpoint(project_id: str):
-    items = get_project_items(project_id)
-    return {"project_id": project_id, "count": len(items), "items": items}
+def get_items_endpoint(project_id: str, include_dormant: bool = Query(False)):
+    items = get_project_items(project_id, include_dormant=include_dormant)
+    dormant_count = get_project_dormant_count(project_id)
+    return {
+        "project_id": project_id,
+        "count": len(items),
+        "dormant_count": dormant_count,
+        "excluded_dormant_count": dormant_count,
+        "items": items
+    }
+
+# ==============================================================================
+# Supply Chain Analytical Endpoints (Strict Zero-Stock & Zero-Sales Exclusion)
+# ==============================================================================
+
+@app.get("/api/inventory")
+def get_inventory_endpoint(project_id: Optional[str] = Query(None), include_dormant: bool = Query(False)):
+    pid = _resolve_project_id(project_id)
+    items = get_project_items(pid, include_dormant=include_dormant)
+    dormant_count = get_project_dormant_count(pid)
+    kpis = compute_project_kpis(pid)
+    return {
+        "project_id": pid,
+        "count": len(items),
+        "dormant_count": dormant_count,
+        "excluded_dormant_count": dormant_count,
+        "items": items,
+        "kpis": kpis
+    }
+
+@app.get("/api/demand")
+def get_demand_endpoint(project_id: Optional[str] = Query(None), include_dormant: bool = Query(False)):
+    pid = _resolve_project_id(project_id)
+    items = get_project_items(pid, include_dormant=include_dormant)
+    dormant_count = get_project_dormant_count(pid)
+    return {
+        "project_id": pid,
+        "count": len(items),
+        "dormant_count": dormant_count,
+        "excluded_dormant_count": dormant_count,
+        "series": items,
+        "items": items
+    }
+
+@app.get("/api/dashboard")
+def get_dashboard_endpoint(project_id: Optional[str] = Query(None)):
+    pid = _resolve_project_id(project_id)
+    kpis = compute_project_kpis(pid)
+    dormant_count = get_project_dormant_count(pid)
+    items = get_project_items(pid, include_dormant=False)
+    return {
+        "project_id": pid,
+        "active_skus": len(items),
+        "dormant_count": dormant_count,
+        "excluded_dormant_count": dormant_count,
+        "kpis": kpis
+    }
+
+@app.get("/api/reports")
+def get_reports_endpoint(project_id: Optional[str] = Query(None)):
+    pid = _resolve_project_id(project_id)
+    items = get_project_items(pid, include_dormant=False)
+    kpis = compute_project_kpis(pid)
+    dormant_count = get_project_dormant_count(pid)
+    return {
+        "project_id": pid,
+        "active_skus": len(items),
+        "dormant_count": dormant_count,
+        "excluded_dormant_count": dormant_count,
+        "items": items,
+        "kpis": kpis
+    }
+
+@app.get("/api/data-hub/summary")
+def get_data_hub_summary_endpoint(project_id: Optional[str] = Query(None)):
+    pid = _resolve_project_id(project_id)
+    dormant_count = get_project_dormant_count(pid)
+    active_items = get_project_items(pid, include_dormant=False)
+    all_items = get_project_items(pid, include_dormant=True)
+    return {
+        "project_id": pid,
+        "total_skus": len(all_items),
+        "active_skus": len(active_items),
+        "dormant_count": dormant_count,
+        "excluded_dormant_count": dormant_count
+    }
 
 class UpdateItemRequest(BaseModel):
     modelType: Optional[str] = None

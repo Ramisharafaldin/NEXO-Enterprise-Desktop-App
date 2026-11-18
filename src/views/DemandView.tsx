@@ -1,5 +1,5 @@
 import React, { useState, useMemo, useRef, useEffect } from 'react';
-import { InventoryItem, ModelType, ReplenishmentStrategy, AppSettings } from '../engine/types';
+import { InventoryItem, ModelType, ReplenishmentStrategy, AppSettings, isAnalyzableItem } from '../engine/types';
 import { translations, Language } from '../i18n/translations';
 import { getCurrencySymbol } from '../utils/formatters';
 import { 
@@ -105,10 +105,13 @@ export const DemandView: React.FC<DemandViewProps> = ({
   // Pane 3 State
   const [inspectorTab, setInspectorTab] = useState<'forecasting' | 'model' | 'inventory' | 'kpis'>('forecasting');
 
+  // Strict Defensive Exclusion: Filter out any dormant SKUs (onHand <= 0 && totalSales <= 0)
+  const activeItems = useMemo(() => (items || []).filter(isAnalyzableItem), [items]);
+
   // Categories group
   const categories = useMemo(() => {
     const map: Record<string, InventoryItem[]> = {};
-    (items || []).forEach(i => {
+    activeItems.forEach(i => {
       const key = (groupBy === 'item' ? i.category : i.location) || (isAr ? 'عام' : 'General');
       if (!map[key]) map[key] = [];
       const code = (i.code || '').toLowerCase();
@@ -119,7 +122,7 @@ export const DemandView: React.FC<DemandViewProps> = ({
       }
     });
     return map;
-  }, [items, groupBy, treeSearch, isAr]);
+  }, [activeItems, groupBy, treeSearch, isAr]);
 
   const toggleCategory = (cat: string) => {
     setExpandedCategories(prev => ({ ...prev, [cat]: !prev[cat] }));

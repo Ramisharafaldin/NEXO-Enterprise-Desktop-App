@@ -1,5 +1,5 @@
 import React, { useState, useMemo } from 'react';
-import { InventoryItem, AppSettings } from '../engine/types';
+import { InventoryItem, AppSettings, isAnalyzableItem } from '../engine/types';
 import { translations, Language } from '../i18n/translations';
 import { formatCurrency, getCurrencySymbol } from '../utils/formatters';
 import { 
@@ -47,8 +47,11 @@ export const ReportsView: React.FC<ReportsViewProps> = ({
   const [filterAbc, setFilterAbc] = useState<string>('all');
   const [filterStockStatus, setFilterStockStatus] = useState<'all' | 'stockout' | 'overstock' | 'reorder'>('all');
 
-  const uniqueCategories = useMemo(() => Array.from(new Set(items.map(i => i.category || 'General'))), [items]);
-  const uniqueLocations = useMemo(() => Array.from(new Set(items.map(i => i.location || 'Central'))), [items]);
+  // Strict Defensive Exclusion: Filter out any dormant SKUs (onHand <= 0 && totalSales <= 0)
+  const activeItems = useMemo(() => (items || []).filter(isAnalyzableItem), [items]);
+
+  const uniqueCategories = useMemo(() => Array.from(new Set(activeItems.map(i => i.category || 'General'))), [activeItems]);
+  const uniqueLocations = useMemo(() => Array.from(new Set(activeItems.map(i => i.location || 'Central'))), [activeItems]);
 
   const hasActiveAdvancedFilters = filterCategory !== 'all' || filterLocation !== 'all' || filterAbc !== 'all' || filterStockStatus !== 'all';
 
@@ -62,23 +65,23 @@ export const ReportsView: React.FC<ReportsViewProps> = ({
   // Dynamic period dates extraction
   const futurePeriodDates = useMemo(() => {
     const dates = new Set<string>();
-    items.forEach(i => {
+    activeItems.forEach(i => {
       (i.periods || []).forEach(p => {
         if ((p.actual || 0) === 0) dates.add(p.date);
       });
     });
     return Array.from(dates);
-  }, [items]);
+  }, [activeItems]);
 
   const historyPeriodDates = useMemo(() => {
     const dates = new Set<string>();
-    items.forEach(i => {
+    activeItems.forEach(i => {
       (i.periods || []).forEach(p => {
         if ((p.actual || 0) > 0) dates.add(p.date);
       });
     });
     return Array.from(dates);
-  }, [items]);
+  }, [activeItems]);
 
   const activePeriodColumns = useMemo(() => {
     if (periodHorizon === 'next6') {
@@ -95,7 +98,7 @@ export const ReportsView: React.FC<ReportsViewProps> = ({
 
   // Filter items
   const filteredItems = useMemo(() => {
-    return items.filter(i => {
+    return activeItems.filter(i => {
       const matchesSearch = !searchTerm || 
         i.code.toLowerCase().includes(searchTerm.toLowerCase()) || 
         i.description.toLowerCase().includes(searchTerm.toLowerCase()) ||

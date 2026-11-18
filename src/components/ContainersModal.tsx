@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import { InventoryItem } from '../engine/types';
+import { InventoryItem, isAnalyzableItem } from '../engine/types';
 import { translations, Language } from '../i18n/translations';
 import { api } from '../api/client';
 import { X, Box, CheckCircle2, AlertTriangle, Truck } from 'lucide-react';
@@ -36,7 +36,7 @@ export const ContainersModal: React.FC<ContainersModalProps> = ({
   };
 
   const spec = containerSpecs[containerType];
-  const orderItems = items.filter(i => (i.orderNow || 0) > 0);
+  const orderItems = items.filter(isAnalyzableItem).filter(i => (i.orderNow || 0) > 0);
 
   // Dynamic volume & weight based on actual item properties
   const totalVolume = orderItems.reduce((sum, i) => sum + ((i.orderNow || 0) * (i.unitCbm ?? 0.05)), 0);

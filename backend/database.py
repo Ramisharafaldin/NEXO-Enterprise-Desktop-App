@@ -37,7 +37,7 @@ def clean_opt_float(val: Any) -> Optional[float]:
         return None
 
 DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "nexo_workspace.duckdb")
-_LOCK = threading.Lock()
+_LOCK = threading.RLock()
 
 def get_connection():
     """Returns a DuckDB connection to the local database file."""
@@ -522,8 +522,42 @@ def delete_project_by_id(project_id: str):
         finally:
             con.close()
 
-def get_project_items(project_id: str) -> List[Dict[str, Any]]:
-    """Returns all items for a project, including periods and metrics."""
+def is_analyzable_sku(on_hand: Any, total_sales: Any) -> bool:
+    """Core supply chain analytical filter: SKU is active/analyzable if on_hand > 0 OR total_sales > 0."""
+    try:
+        oh = float(on_hand) if on_hand is not None else 0.0
+    except (ValueError, TypeError):
+        oh = 0.0
+    try:
+        ts = float(total_sales) if total_sales is not None else 0.0
+    except (ValueError, TypeError):
+        ts = 0.0
+    return (oh > 0.0) or (ts > 0.0)
+
+def get_project_dormant_count(project_id: str) -> int:
+    """Returns the count of dormant SKUs (on_hand <= 0 AND total sales <= 0) in DuckDB."""
+    with _LOCK:
+        con = get_connection()
+        try:
+            row = con.execute("""
+                SELECT COUNT(*)
+                FROM items i
+                LEFT JOIN (
+                    SELECT item_id, COALESCE(SUM(actual), 0.0) as total_sales
+                    FROM periods
+                    WHERE project_id = ?
+                    GROUP BY item_id
+                ) p ON i.id = p.item_id
+                WHERE i.project_id = ?
+                  AND COALESCE(i.on_hand, 0) <= 0
+                  AND COALESCE(p.total_sales, 0) <= 0
+            """, (project_id, project_id)).fetchone()
+            return int(row[0]) if row and row[0] is not None else 0
+        finally:
+            con.close()
+
+def get_project_items(project_id: str, include_dormant: bool = False) -> List[Dict[str, Any]]:
+    """Returns all analyzable items for a project, excluding dormant SKUs (0 stock & 0 sales) unless include_dormant=True."""
     with _LOCK:
         con = get_connection()
         try:
@@ -554,6 +588,15 @@ def get_project_items(project_id: str) -> List[Dict[str, Any]]:
             res = []
             for item in items_df.to_dict(orient="records"):
                 iid = str(item["id"])
+                item_periods = periods_by_item.get(iid, [])
+                total_sales = sum(clean_float(p.get("actual"), 0.0) for p in item_periods)
+                on_hand = clean_float(item.get("on_hand"), 0.0)
+                is_active = is_analyzable_sku(on_hand, total_sales)
+
+                # Strict Analytical Exclusion Filter
+                if not include_dormant and not is_active:
+                    continue
+
                 item_dict = {
                     "id": str(item["id"]),
                     "code": str(item["code"]),
@@ -567,7 +610,7 @@ def get_project_items(project_id: str) -> List[Dict[str, Any]]:
                     "salesPrice": clean_float(item.get("sales_price"), 0.0),
                     "purchasePrice": clean_float(item.get("purchase_price"), 0.0),
                     "margin": clean_float(item.get("margin"), 0.0),
-                    "onHand": clean_float(item.get("on_hand"), 0.0),
+                    "onHand": on_hand,
                     "onOrder": clean_float(item.get("on_order"), 0.0),
                     "backorders": clean_float(item.get("backorders"), 0.0),
                     "leadTimeDays": clean_float(item.get("lead_time_days"), 30.0),
@@ -594,26 +637,31 @@ def get_project_items(project_id: str) -> List[Dict[str, Any]]:
                     "transferQty": clean_float(item.get("transfer_qty"), 0.0),
                     "transferSource": str(item["transfer_source"]) if item.get("transfer_source") and pd.notna(item["transfer_source"]) else None,
                     "accuracy": clean_float(item.get("accuracy"), 100.0),
-                    "periods": periods_by_item.get(iid, [])
+                    "totalSales": total_sales,
+                    "isDormant": not is_active,
+                    "periods": item_periods
                 }
                 res.append(item_dict)
             return res
         finally:
             con.close()
 
-def get_workspace(project_id: str) -> Dict[str, Any]:
-    """Loads all items, overrides, settings, and filters for that project."""
+def get_workspace(project_id: str, include_dormant: bool = False) -> Dict[str, Any]:
+    """Loads all items, overrides, settings, and filters for that project, excluding dormant SKUs from analysis."""
     project = get_project_by_id(project_id)
-    items = get_project_items(project_id)
+    items = get_project_items(project_id, include_dormant=include_dormant)
     filters = get_saved_filters_for_project(project_id)
     transitions = get_in_transition_for_project(project_id)
     kpis = compute_project_kpis(project_id)
+    dormant_count = get_project_dormant_count(project_id)
     return {
         "project": project,
         "items": items,
         "filters": filters,
         "transitions": transitions,
-        "kpis": kpis
+        "kpis": kpis,
+        "dormant_count": dormant_count,
+        "excluded_dormant_count": dormant_count
     }
 
 def save_period_override(project_id: str, item_id: str, date: str, override_val: Optional[float]):
@@ -852,26 +900,34 @@ def bulk_upsert_in_transit(project_id: str, records: List[Dict[str, Any]], merge
             con.close()
 
 def compute_project_kpis(project_id: str) -> Dict[str, Any]:
-    """Computes real aggregate supply chain KPIs dynamically from DuckDB."""
+    """Computes real aggregate supply chain KPIs dynamically from DuckDB, excluding dormant SKUs (0 stock & 0 sales)."""
     with _LOCK:
         con = get_connection()
         try:
-            # Query aggregates from items
+            dormant_count = get_project_dormant_count(project_id)
+            # Query aggregates only from active, analyzable items
             row = con.execute("""
                 SELECT 
                     COUNT(*) as total_skus,
-                    SUM(on_hand * purchase_price) as total_inventory_value,
-                    SUM(order_now * purchase_price) as total_order_value,
-                    SUM(CASE WHEN days_of_supply > 90 THEN (days_of_supply - 90) * (purchase_price * mean_daily_demand) ELSE 0 END) as total_overstock,
-                    SUM(CASE WHEN days_of_supply < 14 THEN (14 - days_of_supply) * (sales_price * mean_daily_demand) ELSE 0 END) as total_stockout_loss,
-                    SUM(CASE WHEN model_type = 'zero' THEN on_hand * purchase_price ELSE 0 END) as total_dead_inv,
-                    AVG(accuracy) as avg_accuracy,
-                    AVG(days_of_supply) as avg_days_supply,
-                    SUM(mean_daily_demand * 365 * sales_price) as projected_annual_revenue,
-                    SUM(mean_daily_demand * 365 * purchase_price) as projected_annual_cogs
-                FROM items
-                WHERE project_id = ?
-            """, (project_id,)).fetchone()
+                    SUM(i.on_hand * i.purchase_price) as total_inventory_value,
+                    SUM(i.order_now * i.purchase_price) as total_order_value,
+                    SUM(CASE WHEN i.days_of_supply > 90 THEN (i.days_of_supply - 90) * (i.purchase_price * i.mean_daily_demand) ELSE 0 END) as total_overstock,
+                    SUM(CASE WHEN i.days_of_supply < 14 THEN (14 - i.days_of_supply) * (i.sales_price * i.mean_daily_demand) ELSE 0 END) as total_stockout_loss,
+                    SUM(CASE WHEN i.model_type = 'zero' THEN i.on_hand * i.purchase_price ELSE 0 END) as total_dead_inv,
+                    AVG(i.accuracy) as avg_accuracy,
+                    AVG(i.days_of_supply) as avg_days_supply,
+                    SUM(i.mean_daily_demand * 365 * i.sales_price) as projected_annual_revenue,
+                    SUM(i.mean_daily_demand * 365 * i.purchase_price) as projected_annual_cogs
+                FROM items i
+                LEFT JOIN (
+                    SELECT item_id, COALESCE(SUM(actual), 0.0) as total_sales
+                    FROM periods
+                    WHERE project_id = ?
+                    GROUP BY item_id
+                ) p ON i.id = p.item_id
+                WHERE i.project_id = ?
+                  AND (COALESCE(i.on_hand, 0) > 0 OR COALESCE(p.total_sales, 0) > 0)
+            """, (project_id, project_id)).fetchone()
 
             total_skus = row[0] or 0
             inv_val = float(row[1] or 0)
@@ -887,6 +943,21 @@ def compute_project_kpis(project_id: str) -> Dict[str, Any]:
             margin_pct = ((revenue - cogs) / revenue * 100.0) if revenue > 0 else 0.0
             turns = (cogs / inv_val) if inv_val > 0 else 0.0
 
+            active_orders_row = con.execute("""
+                SELECT COUNT(*)
+                FROM items i
+                LEFT JOIN (
+                    SELECT item_id, COALESCE(SUM(actual), 0.0) as total_sales
+                    FROM periods
+                    WHERE project_id = ?
+                    GROUP BY item_id
+                ) p ON i.id = p.item_id
+                WHERE i.project_id = ?
+                  AND (COALESCE(i.on_hand, 0) > 0 OR COALESCE(p.total_sales, 0) > 0)
+                  AND i.order_now > 0
+            """, (project_id, project_id)).fetchone()
+            active_orders_count = active_orders_row[0] if active_orders_row else 0
+
             return {
                 "totalSkus": total_skus,
                 "totalInventoryValue": round(inv_val, 2),
@@ -901,7 +972,9 @@ def compute_project_kpis(project_id: str) -> Dict[str, Any]:
                 "inventoryTurns": round(turns, 1),
                 "carryingCostSavings": round(overstock_val * 0.22, 2), # 22% annual carrying cost benchmark
                 "releasedCapital": round(overstock_val * 0.85, 2),
-                "activeOrdersCount": con.execute("SELECT COUNT(*) FROM items WHERE project_id = ? AND order_now > 0", (project_id,)).fetchone()[0] or 0
+                "activeOrdersCount": active_orders_count,
+                "dormantCount": dormant_count,
+                "excludedDormantCount": dormant_count
             }
         finally:
             con.close()
@@ -1690,19 +1763,34 @@ def upsert_items_and_periods(
                 except Exception:
                     pass
 
-            # Update project SKU count & timestamp
+            # Update project SKU count (active analyzable SKUs) & timestamp
             con.execute("""
                 UPDATE projects SET
-                    sku_count = (SELECT COUNT(*) FROM items WHERE project_id = ?),
+                    sku_count = (
+                        SELECT COUNT(*)
+                        FROM items i
+                        LEFT JOIN (
+                            SELECT item_id, COALESCE(SUM(actual), 0.0) as total_sales
+                            FROM periods
+                            WHERE project_id = ?
+                            GROUP BY item_id
+                        ) p ON i.id = p.item_id
+                        WHERE i.project_id = ?
+                          AND (COALESCE(i.on_hand, 0) > 0 OR COALESCE(p.total_sales, 0) > 0)
+                    ),
                     updated_at = ?
                 WHERE id = ?
-            """, (project_id, now_str, project_id))
+            """, (project_id, project_id, now_str, project_id))
+
+            dormant_cnt = get_project_dormant_count(project_id)
 
             return {
                 "success": True,
                 "project_id": project_id,
                 "items_upserted": items_upserted,
-                "periods_upserted": periods_upserted
+                "periods_upserted": periods_upserted,
+                "dormant_count": dormant_cnt,
+                "excluded_dormant_count": dormant_cnt
             }
         finally:
             con.close()
