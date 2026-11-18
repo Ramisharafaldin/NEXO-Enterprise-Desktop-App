@@ -111,8 +111,6 @@ def health_check():
     return {
         "status": "online",
         "app": "NEXO Enterprise Supply Chain Planning",
-        "version": APP_VERSION,
-        "current_version": f"v{APP_VERSION}",
         "duckdb_version": duckdb.__version__,
         "python_version": sys.version.split()[0],
         "installed_odbc_drivers": drivers,
@@ -2191,7 +2189,7 @@ def check_github_update():
     local_sha = ""
     # 1. Get local HEAD SHA
     try:
-        res = subprocess.run(["git", "rev-parse", "HEAD"], cwd=REPO_DIR, capture_output=True, text=True, timeout=4, creationflags=SUBPROCESS_FLAGS)
+        res = subprocess.run(["git", "rev-parse", "HEAD"], cwd=REPO_DIR, capture_output=True, text=True, timeout=4)
         if res.returncode == 0:
             local_sha = res.stdout.strip()
     except Exception:
@@ -2200,7 +2198,7 @@ def check_github_update():
     # 2. Try git fetch origin main
     git_fetch_ok = False
     try:
-        fetch_res = subprocess.run(["git", "fetch", "origin", "main"], cwd=REPO_DIR, capture_output=True, text=True, timeout=8, creationflags=SUBPROCESS_FLAGS)
+        fetch_res = subprocess.run(["git", "fetch", "origin", "main"], cwd=REPO_DIR, capture_output=True, text=True, timeout=8)
         if fetch_res.returncode == 0:
             git_fetch_ok = True
     except Exception:
@@ -2208,24 +2206,22 @@ def check_github_update():
 
     if git_fetch_ok:
         try:
-            remote_res = subprocess.run(["git", "rev-parse", "origin/main"], cwd=REPO_DIR, capture_output=True, text=True, timeout=4, creationflags=SUBPROCESS_FLAGS)
+            remote_res = subprocess.run(["git", "rev-parse", "origin/main"], cwd=REPO_DIR, capture_output=True, text=True, timeout=4)
             remote_sha = remote_res.stdout.strip()
 
-            msg_res = subprocess.run(["git", "log", "-1", "--pretty=%s", "origin/main"], cwd=REPO_DIR, capture_output=True, text=True, timeout=4, creationflags=SUBPROCESS_FLAGS)
+            msg_res = subprocess.run(["git", "log", "-1", "--pretty=%s", "origin/main"], cwd=REPO_DIR, capture_output=True, text=True, timeout=4)
             commit_msg = msg_res.stdout.strip() if msg_res.returncode == 0 else "Latest improvements"
 
-            date_res = subprocess.run(["git", "log", "-1", "--pretty=%cd", "--date=short", "origin/main"], cwd=REPO_DIR, capture_output=True, text=True, timeout=4, creationflags=SUBPROCESS_FLAGS)
+            date_res = subprocess.run(["git", "log", "-1", "--pretty=%cd", "--date=short", "origin/main"], cwd=REPO_DIR, capture_output=True, text=True, timeout=4)
             commit_date = date_res.stdout.strip() if date_res.returncode == 0 else ""
 
-            diff_res = subprocess.run(["git", "diff", "--name-only", "HEAD", "origin/main"], cwd=REPO_DIR, capture_output=True, text=True, timeout=4, creationflags=SUBPROCESS_FLAGS)
+            diff_res = subprocess.run(["git", "diff", "--name-only", "HEAD", "origin/main"], cwd=REPO_DIR, capture_output=True, text=True, timeout=4)
             changed_files = len([f for f in diff_res.stdout.splitlines() if f.strip()]) if diff_res.returncode == 0 else 0
 
             is_available = bool(local_sha and remote_sha and local_sha != remote_sha)
 
             return {
                 "update_available": is_available,
-                "version": APP_VERSION,
-                "current_version": f"v{APP_VERSION}",
                 "local_sha": local_sha[:7] if local_sha else "c9ee199",
                 "remote_sha": remote_sha[:7] if remote_sha else "",
                 "commit_message": commit_msg,
@@ -2249,8 +2245,6 @@ def check_github_update():
                 is_available = bool(local_sha and remote_sha and local_sha[:7] != remote_sha[:7])
                 return {
                     "update_available": is_available,
-                    "version": APP_VERSION,
-                    "current_version": f"v{APP_VERSION}",
                     "local_sha": local_sha[:7] if local_sha else "c9ee199",
                     "remote_sha": remote_sha[:7],
                     "commit_message": commit_msg,
@@ -2264,7 +2258,7 @@ def check_github_update():
     # Offline / Local fallback
     commit_msg = "Current local version"
     try:
-        msg_res = subprocess.run(["git", "log", "-1", "--pretty=%s", "HEAD"], cwd=REPO_DIR, capture_output=True, text=True, timeout=3, creationflags=SUBPROCESS_FLAGS)
+        msg_res = subprocess.run(["git", "log", "-1", "--pretty=%s", "HEAD"], cwd=REPO_DIR, capture_output=True, text=True, timeout=3)
         if msg_res.returncode == 0 and msg_res.stdout.strip():
             commit_msg = msg_res.stdout.strip()
     except Exception:
@@ -2272,8 +2266,6 @@ def check_github_update():
 
     return {
         "update_available": False,
-        "version": APP_VERSION,
-        "current_version": f"v{APP_VERSION}",
         "local_sha": local_sha[:7] if local_sha else "c9ee199",
         "remote_sha": local_sha[:7] if local_sha else "c9ee199",
         "commit_message": commit_msg,
@@ -2291,13 +2283,13 @@ def apply_github_update():
     output_log = []
 
     # Step 1: git fetch origin main
-    fetch_res = subprocess.run(["git", "fetch", "origin", "main"], cwd=REPO_DIR, capture_output=True, text=True, timeout=45, creationflags=SUBPROCESS_FLAGS)
+    fetch_res = subprocess.run(["git", "fetch", "origin", "main"], cwd=REPO_DIR, capture_output=True, text=True, timeout=45)
     output_log.append(f"git fetch: {fetch_res.stdout} {fetch_res.stderr}")
     if fetch_res.returncode != 0:
         raise HTTPException(status_code=500, detail=f"Failed to fetch updates from GitHub: {fetch_res.stderr}")
 
     # Step 2: git reset --hard origin/main
-    reset_res = subprocess.run(["git", "reset", "--hard", "origin/main"], cwd=REPO_DIR, capture_output=True, text=True, timeout=20, creationflags=SUBPROCESS_FLAGS)
+    reset_res = subprocess.run(["git", "reset", "--hard", "origin/main"], cwd=REPO_DIR, capture_output=True, text=True, timeout=20)
     output_log.append(f"git reset: {reset_res.stdout} {reset_res.stderr}")
     if reset_res.returncode != 0:
         raise HTTPException(status_code=500, detail=f"Failed to reset working copy: {reset_res.stderr}")
@@ -2305,12 +2297,12 @@ def apply_github_update():
     # Step 3: Install any new python dependencies
     req_file = os.path.join(REPO_DIR, "backend", "requirements.txt")
     if os.path.exists(req_file):
-        pip_res = subprocess.run([sys.executable, "-m", "pip", "install", "-q", "-r", req_file], cwd=REPO_DIR, capture_output=True, text=True, timeout=60, creationflags=SUBPROCESS_FLAGS)
+        pip_res = subprocess.run([sys.executable, "-m", "pip", "install", "-q", "-r", req_file], cwd=REPO_DIR, capture_output=True, text=True, timeout=60)
         output_log.append(f"pip install: {pip_res.stdout} {pip_res.stderr}")
 
     # Step 4: Rebuild frontend dist/ via npm run build
     npm_cmd = "npm.cmd" if os.name == "nt" else "npm"
-    build_res = subprocess.run([npm_cmd, "run", "build"], cwd=REPO_DIR, capture_output=True, text=True, shell=True, timeout=120, creationflags=SUBPROCESS_FLAGS)
+    build_res = subprocess.run([npm_cmd, "run", "build"], cwd=REPO_DIR, capture_output=True, text=True, shell=True, timeout=120)
     output_log.append(f"npm run build: {build_res.stdout} {build_res.stderr}")
     if build_res.returncode != 0:
         raise HTTPException(status_code=500, detail=f"Update downloaded but frontend build failed: {build_res.stderr}")
