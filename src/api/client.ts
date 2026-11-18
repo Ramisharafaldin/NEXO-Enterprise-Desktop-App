@@ -46,7 +46,16 @@ export interface ProjectSummary {
   updated_at: string;
   dataset_name?: string;
   sku_count: number;
+  item_count?: number;
+  is_active?: boolean;
+  granularity?: string;
+  currency_code?: string;
   status: string;
+}
+
+export interface ProjectsResponse {
+  projects: ProjectSummary[];
+  active_project_id?: string;
 }
 
 export interface SqlServerConfig {
@@ -165,10 +174,17 @@ export const api = {
   /**
    * Projects management
    */
-  async getProjects(): Promise<ProjectSummary[]> {
+  async getProjects(): Promise<ProjectsResponse> {
     const res = await fetch(`${API_BASE}/projects`);
     if (!res.ok) throw new Error('Failed to fetch projects');
-    return res.json();
+    const data = await res.json();
+    if (Array.isArray(data)) {
+      return {
+        projects: data,
+        active_project_id: data.find((p: ProjectSummary) => p.is_active)?.id || (data[0] ? data[0].id : undefined)
+      };
+    }
+    return data;
   },
 
   async createProject(name: string, description: string = '', dataset_name: string = ''): Promise<ProjectSummary> {
@@ -178,6 +194,18 @@ export const api = {
       body: JSON.stringify({ name, description, dataset_name }),
     });
     if (!res.ok) throw new Error('Failed to create project');
+    return res.json();
+  },
+
+  async activateProject(projectId: string): Promise<{ success: boolean; project_id: string; active_project_id: string; message: string }> {
+    const res = await fetch(`${API_BASE}/projects/${projectId}/activate`, { method: 'POST' });
+    if (!res.ok) throw new Error('Failed to activate project');
+    return res.json();
+  },
+
+  async saveProject(projectId: string): Promise<{ success: boolean; project_id: string; message: string }> {
+    const res = await fetch(`${API_BASE}/projects/${projectId}/save`, { method: 'POST' });
+    if (!res.ok) throw new Error('Failed to save project');
     return res.json();
   },
 

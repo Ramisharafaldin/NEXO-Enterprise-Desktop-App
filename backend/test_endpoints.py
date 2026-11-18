@@ -7,9 +7,10 @@ if repo_dir not in sys.path:
     sys.path.insert(0, repo_dir)
 
 import asyncio
+import uuid
 import httpx
 from backend.server import app
-from backend.database import init_db
+from backend.database import init_db, get_connection, close_db
 
 async def run_tests():
     init_db()
@@ -23,7 +24,8 @@ async def run_tests():
         # 2. List projects
         r = await client.get('/api/projects')
         assert r.status_code == 200, f'projects failed: {r.text}'
-        projs = r.json()
+        projs_data = r.json()
+        projs = projs_data['projects'] if isinstance(projs_data, dict) else projs_data
         assert len(projs) > 0, 'No projects returned'
         pid = next((p['id'] for p in projs if p.get('sku_count', 0) > 0), projs[0]['id'])
         print(f'2. Projects list PASSED ({len(projs)} projects, active: {pid})')
@@ -313,7 +315,61 @@ async def run_tests():
 
         print(f'18. Exclude Zero-Stock & Zero-Sales SKUs PASSED (Dormant excluded from all views/kpis/exports, non-destructively preserved in DuckDB)')
 
-        print('\n=== ALL 18 BACKEND & DATA HUB ENDPOINTS TESTED AND VERIFIED 100% OPERATIONAL! ===')
+        # 19. Persistent Multi-Project & DuckDB Restart Verification
+        new_proj_name = f"Test_Project_{uuid.uuid4().hex[:6]}"
+        r_new_proj = await client.post('/api/projects', json={
+            'name': new_proj_name,
+            'description': 'Persistent DuckDB automated test project',
+            'dataset_name': f"{new_proj_name}.xlsx"
+        })
+        assert r_new_proj.status_code == 200, f"Create project failed: {r_new_proj.text}"
+        new_proj_id = r_new_proj.json()['id']
+
+        # Import inventory items and sales periods into this project
+        test_items = [
+            {'code': 'PERSIST-SKU-1', 'description': 'Persistent Item One', 'category': 'Hardware', 'location': 'Cairo Hub', 'on_hand': 120.0, 'purchase_price': 45.0, 'sales_price': 90.0},
+            {'code': 'PERSIST-SKU-2', 'description': 'Persistent Item Two', 'category': 'Hardware', 'location': 'Cairo Hub', 'on_hand': 60.0, 'purchase_price': 30.0, 'sales_price': 60.0}
+        ]
+        test_periods = [
+            {'code': 'PERSIST-SKU-1', 'date': '2026-01-01', 'actual': 15.0, 'revenue': 1350.0},
+            {'code': 'PERSIST-SKU-1', 'date': '2026-02-01', 'actual': 20.0, 'revenue': 1800.0},
+            {'code': 'PERSIST-SKU-2', 'date': '2026-01-01', 'actual': 10.0, 'revenue': 600.0}
+        ]
+        r_bulk = await client.post(f'/api/projects/{new_proj_id}/items/bulk', json={
+            'items': test_items,
+            'periods': test_periods,
+            'merge_mode': 'merge'
+        })
+        assert r_bulk.status_code == 200, f"Bulk save items failed: {r_bulk.text}"
+
+        # Save and checkpoint project workspace
+        r_save = await client.post(f'/api/projects/{new_proj_id}/save')
+        assert r_save.status_code == 200, f"Save project failed: {r_save.text}"
+
+        # Simulate complete app shutdown and database disconnect
+        close_db()
+
+        # Reopen connection directly from disk file to verify persistence across restarts
+        con_reopened = get_connection()
+        try:
+            persisted_proj = con_reopened.execute("SELECT id, name, item_count FROM projects WHERE id = ?", (new_proj_id,)).fetchone()
+            assert persisted_proj is not None, f"Project {new_proj_id} not found in DuckDB after restart"
+            assert persisted_proj[1] == new_proj_name
+
+            persisted_items = con_reopened.execute("SELECT code, on_hand FROM project_items WHERE project_id = ?", (new_proj_id,)).fetchall()
+            assert len(persisted_items) == 2, f"Expected 2 project_items, found {len(persisted_items)}"
+
+            persisted_periods = con_reopened.execute("SELECT code, period, qty_sold FROM project_periods WHERE project_id = ?", (new_proj_id,)).fetchall()
+            assert len(persisted_periods) == 3, f"Expected 3 project_periods, found {len(persisted_periods)}"
+
+            settings_active = con_reopened.execute("SELECT active_project_id FROM app_settings WHERE id = 'global_settings'").fetchone()
+            assert settings_active is not None and settings_active[0] == new_proj_id, "active_project_id in app_settings must match new_proj_id"
+        finally:
+            con_reopened.close()
+
+        print(f'19. Multi-Project DuckDB Persistence & Restart PASSED (New project {new_proj_id} + rows completely restored from disk)')
+
+        print('\n=== ALL 19 BACKEND & DATA HUB ENDPOINTS TESTED AND VERIFIED 100% OPERATIONAL! ===')
 
 if __name__ == '__main__':
     asyncio.run(run_tests())

@@ -72,10 +72,14 @@ else:
 from database import (
     init_db,
     close_db,
+    flush_db,
     list_projects,
     get_project_by_id,
     create_new_project,
     delete_project_by_id,
+    activate_project,
+    save_project_workspace,
+    get_active_project_id,
     is_analyzable_sku,
     get_project_dormant_count,
     get_project_items,
@@ -167,7 +171,10 @@ class CreateProjectRequest(BaseModel):
 
 @app.get("/api/projects")
 def get_all_projects():
-    return list_projects()
+    return {
+        "projects": list_projects(),
+        "active_project_id": get_active_project_id()
+    }
 
 @app.post("/api/projects")
 def create_project_endpoint(req: CreateProjectRequest):
@@ -181,6 +188,20 @@ def get_project_endpoint(project_id: str):
     if not p:
         raise HTTPException(status_code=404, detail="Project not found")
     return p
+
+@app.post("/api/projects/{project_id}/activate")
+def activate_project_endpoint(project_id: str):
+    res = activate_project(project_id)
+    if not res.get("success"):
+        raise HTTPException(status_code=404, detail=res.get("message", "Project not found"))
+    return res
+
+@app.post("/api/projects/{project_id}/save")
+def save_project_endpoint(project_id: str):
+    res = save_project_workspace(project_id)
+    if not res.get("success"):
+        raise HTTPException(status_code=404, detail=res.get("message", "Project not found"))
+    return res
 
 @app.delete("/api/projects/{project_id}")
 def delete_project_endpoint(project_id: str):

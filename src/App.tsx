@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useCallback, useMemo, useRef } from 'react';
-import { TrendingUp } from 'lucide-react';
+import { TrendingUp, CheckCircle2 } from 'lucide-react';
 import { InventoryItem, ModelType, ReplenishmentStrategy, AppSettings, isAnalyzableItem } from './engine/types';
 import { getInitialInventoryItems } from './engine/sampleData';
 import {
@@ -55,6 +55,7 @@ export const App: React.FC = () => {
   const [explainingItem, setExplainingItem] = useState<InventoryItem | null>(null);
   const [isServerConnected, setIsServerConnected] = useState(false);
   const [isSyncing, setIsSyncing] = useState(false);
+  const [toastMessage, setToastMessage] = useState<{ text: string; type: 'success' | 'error' } | null>(null);
 
   // Modals state
   const [isSqlServerModalOpen, setIsSqlServerModalOpen] = useState(false);
@@ -93,6 +94,13 @@ export const App: React.FC = () => {
           setActiveDataset(ws.project.dataset_name || ws.project.name);
         }
         setIsServerConnected(true);
+      } else if (ws && ws.project) {
+        setActiveProjectId(projectId);
+        setActiveDataset(ws.project.dataset_name || ws.project.name);
+        setItems([]);
+        setSelectedItemId('');
+        setDormantCount(0);
+        setIsServerConnected(true);
       } else {
         // Fallback to sample data if project has 0 items
         const initial = getInitialInventoryItems().filter(isAnalyzableItem);
@@ -113,23 +121,26 @@ export const App: React.FC = () => {
   }, []);
 
   // Fetch list of projects from DuckDB
-  const refreshProjects = useCallback(async () => {
+  const refreshProjects = useCallback(async (): Promise<string | undefined> => {
     try {
-      const projs = await api.getProjects();
+      const res = await api.getProjects();
+      const projs = res.projects || [];
       setProjects(projs);
-      if (projs.length > 0) {
-        const found = projs.find(p => p.id === activeProjectId);
-        if (!found) {
-          setActiveProjectId(projs[0].id);
-          setActiveDataset(projs[0].dataset_name || projs[0].name);
-        } else {
-          setActiveDataset(found.dataset_name || found.name);
-        }
+      
+      const targetPid = res.active_project_id || (projs.find(p => p.id === activeProjectId) ? activeProjectId : (projs[0]?.id || 'proj_default_retail'));
+      if (targetPid && targetPid !== activeProjectId) {
+        setActiveProjectId(targetPid);
+      }
+      const found = projs.find(p => p.id === targetPid);
+      if (found) {
+        setActiveDataset(found.dataset_name || found.name);
       }
       setIsServerConnected(true);
+      return targetPid;
     } catch (err) {
       console.warn('Could not fetch projects list:', err);
       setIsServerConnected(false);
+      return undefined;
     }
   }, [activeProjectId]);
 
@@ -144,8 +155,12 @@ export const App: React.FC = () => {
       }
     }).catch(err => console.warn('Could not load settings on startup:', err));
 
-    refreshProjects();
-    loadProject(activeProjectId);
+    refreshProjects().then((targetPid) => {
+      const pidToLoad = targetPid || activeProjectId;
+      if (pidToLoad) {
+        loadProject(pidToLoad);
+      }
+    });
   }, []);
 
   const selectedItem = items.find(i => i.id === selectedItemId) || items[0];
@@ -334,7 +349,7 @@ export const App: React.FC = () => {
   };
 
   // Export Project to Real Excel (Native Windows Save As in Desktop Mode)
-  const handleSaveProject = async () => {
+  const handleExportExcel = async () => {
     try {
       await api.downloadExcelExport(activeProjectId, 'all', `${activeDataset.replace('.xlsx', '')}_Export.xlsx`);
     } catch {
@@ -361,6 +376,28 @@ export const App: React.FC = () => {
       const wsInv = XLSX.utils.json_to_sheet(invData);
       XLSX.utils.book_append_sheet(wb, wsInv, 'Inventory Planning');
       XLSX.writeFile(wb, `${activeDataset.replace('.xlsx', '')}_Export.xlsx`);
+    }
+  };
+
+  // Save Project and active workspace immediately to DuckDB with feedback toast
+  const handleSaveProject = async () => {
+    try {
+      setIsSyncing(true);
+      await api.saveProject(activeProjectId);
+      await refreshProjects();
+      setToastMessage({
+        text: language === 'ar' ? 'تم حفظ مساحة العمل والمشروع بنجاح في DuckDB' : 'Project and workspace saved successfully to DuckDB',
+        type: 'success'
+      });
+      setTimeout(() => setToastMessage(null), 3000);
+    } catch (err: any) {
+      setToastMessage({
+        text: language === 'ar' ? `فشل حفظ المشروع: ${err.message || ''}` : `Failed to save project: ${err.message || ''}`,
+        type: 'error'
+      });
+      setTimeout(() => setToastMessage(null), 4000);
+    } finally {
+      setIsSyncing(false);
     }
   };
 
@@ -536,7 +573,7 @@ export const App: React.FC = () => {
         onNewProject={() => setActiveTab('start')}
         onOpenProject={() => setActiveTab('start')}
         onSaveProject={handleSaveProject}
-        onExportExcel={() => api.downloadExcelExport(activeProjectId, activeDataset)}
+        onExportExcel={handleExportExcel}
         onRecalculateAll={handleRecalculateAll}
         onOpenSettings={() => setActiveTab('settings')}
         onOpenDataHub={() => setActiveTab('data-hub')}
@@ -566,11 +603,11 @@ export const App: React.FC = () => {
               language={language}
               projects={projects}
               activeProjectId={activeProjectId}
-              onSelectProject={async (projId) => {
+              onSelectProject={async (projId, targetTab) => {
                 await loadProject(projId);
                 const p = projects.find(x => x.id === projId);
                 if (p) setActiveDataset(p.dataset_name || p.name);
-                setActiveTab('demand');
+                setActiveTab(targetTab || 'demand');
               }}
               onRefreshProjects={refreshProjects}
               onLoadExample={handleLoadExample}
@@ -737,6 +774,20 @@ export const App: React.FC = () => {
         settings={settings}
         language={language}
       />
+
+      {/* Floating Notification Toast */}
+      {toastMessage && (
+        <div
+          className={`fixed bottom-6 ${
+            language === 'ar' ? 'left-6' : 'right-6'
+          } z-50 px-4 py-2.5 rounded-lg shadow-xl flex items-center gap-2 text-sm font-medium transition-all ${
+            toastMessage.type === 'success' ? 'bg-emerald-600 text-white' : 'bg-rose-600 text-white'
+          }`}
+        >
+          <CheckCircle2 className="w-4 h-4 shrink-0" />
+          <span>{toastMessage.text}</span>
+        </div>
+      )}
     </div>
   );
 };

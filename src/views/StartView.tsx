@@ -30,8 +30,8 @@ interface StartViewProps {
   language: Language;
   projects: ProjectSummary[];
   activeProjectId: string;
-  onSelectProject: (projectId: string) => void;
-  onRefreshProjects: () => void;
+  onSelectProject: (projectId: string, targetTab?: any) => void;
+  onRefreshProjects: () => Promise<any> | void;
   onLoadExample: (exampleKey: 'retail' | 'drp' | 'mrp' | 'multichannel' | 'weekly') => void;
 }
 
@@ -83,8 +83,8 @@ export const StartView: React.FC<StartViewProps> = ({
     setIsCreatingProject(true);
     try {
       const proj = await api.createProject(newProjectName.trim(), newProjectDesc.trim(), 'Custom Workspace');
-      onRefreshProjects();
-      onSelectProject(proj.id);
+      await onRefreshProjects();
+      onSelectProject(proj.id, 'data-hub');
       setIsNewProjectModalOpen(false);
       setNewProjectName('');
       setNewProjectDesc('');

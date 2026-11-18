@@ -5,6 +5,7 @@ Persists projects, items, periods, overrides, model settings, and configurations
 """
 
 import os
+from pathlib import Path
 import json
 import uuid
 import datetime
@@ -36,15 +37,16 @@ def clean_opt_float(val: Any) -> Optional[float]:
     except (ValueError, TypeError):
         return None
 
-DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "nexo_workspace.duckdb")
+BASE_DIR = Path(__file__).resolve().parent
+DB_PATH = str(BASE_DIR / "nexo_workspace.duckdb")
 _LOCK = threading.RLock()
 
 def get_connection():
     """Returns a DuckDB connection to the local database file."""
     return duckdb.connect(DB_PATH)
 
-def close_db():
-    """Flushes WAL to disk and cleanly closes any database resources."""
+def flush_db():
+    """Forces DuckDB WAL changes to be flushed immediately to disk via CHECKPOINT."""
     with _LOCK:
         try:
             con = duckdb.connect(DB_PATH)
@@ -53,24 +55,98 @@ def close_db():
         except Exception:
             pass
 
+def close_db():
+    """Flushes WAL to disk and cleanly closes any database resources."""
+    flush_db()
+
+def _ensure_projects_table(con):
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS projects (
+            id VARCHAR PRIMARY KEY,
+            name VARCHAR NOT NULL,
+            description VARCHAR,
+            granularity VARCHAR DEFAULT 'monthly',
+            currency_code VARCHAR DEFAULT 'EGP',
+            item_count INTEGER DEFAULT 0,
+            sku_count INTEGER DEFAULT 0,
+            created_at VARCHAR,
+            updated_at VARCHAR,
+            dataset_name VARCHAR,
+            status VARCHAR DEFAULT 'active'
+        )
+    """)
+    existing_cols = [c[1].lower() for c in con.execute("PRAGMA table_info('projects')").fetchall()]
+    if "granularity" not in existing_cols:
+        try:
+            con.execute("ALTER TABLE projects ADD COLUMN granularity VARCHAR DEFAULT 'monthly'")
+        except Exception:
+            pass
+    if "currency_code" not in existing_cols:
+        try:
+            con.execute("ALTER TABLE projects ADD COLUMN currency_code VARCHAR DEFAULT 'EGP'")
+        except Exception:
+            pass
+    if "item_count" not in existing_cols:
+        try:
+            con.execute("ALTER TABLE projects ADD COLUMN item_count INTEGER DEFAULT 0")
+        except Exception:
+            pass
+
+def _ensure_persistent_project_tables(con):
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS project_items (
+            project_id VARCHAR,
+            code VARCHAR,
+            description VARCHAR,
+            category VARCHAR,
+            location VARCHAR,
+            on_hand DOUBLE DEFAULT 0.0,
+            on_order DOUBLE DEFAULT 0.0,
+            lead_time DOUBLE DEFAULT 30.0,
+            lt_variability DOUBLE DEFAULT 5.0,
+            service_level DOUBLE DEFAULT 0.95,
+            moq DOUBLE DEFAULT 1.0,
+            batch_rounding DOUBLE DEFAULT 1.0,
+            cost DOUBLE DEFAULT 0.0,
+            price DOUBLE DEFAULT 0.0,
+            supplier VARCHAR,
+            PRIMARY KEY (project_id, code, location)
+        )
+    """)
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS project_periods (
+            project_id VARCHAR,
+            code VARCHAR,
+            location VARCHAR,
+            period VARCHAR,
+            qty_sold DOUBLE DEFAULT 0.0,
+            revenue DOUBLE DEFAULT 0.0,
+            PRIMARY KEY (project_id, code, location, period)
+        )
+    """)
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS project_in_transit (
+            project_id VARCHAR,
+            id VARCHAR,
+            code VARCHAR,
+            location VARCHAR,
+            po_number VARCHAR,
+            qty_in_transit DOUBLE DEFAULT 0.0,
+            expected_date VARCHAR,
+            supplier VARCHAR,
+            status VARCHAR
+        )
+    """)
+
 def init_db():
-    """Initializes tables in DuckDB if they do not exist."""
+    """Initializes tables in DuckDB if they do not exist, anchoring state to disk."""
     with _LOCK:
         con = get_connection()
         try:
-            # 1. Projects table
-            con.execute("""
-                CREATE TABLE IF NOT EXISTS projects (
-                    id VARCHAR PRIMARY KEY,
-                    name VARCHAR NOT NULL,
-                    description VARCHAR,
-                    created_at VARCHAR,
-                    updated_at VARCHAR,
-                    dataset_name VARCHAR,
-                    sku_count INTEGER DEFAULT 0,
-                    status VARCHAR DEFAULT 'active'
-                )
-            """)
+            # 1. Projects and persistent multi-project tables
+            _ensure_projects_table(con)
+            _ensure_persistent_project_tables(con)
+            _ensure_settings_table(con)
 
             # 2. Items table
             con.execute("""
@@ -234,38 +310,19 @@ def init_db():
                 )
             """)
 
-            # 9. App Settings table (global enterprise preferences & parameters)
-            con.execute("""
-                CREATE TABLE IF NOT EXISTS app_settings (
-                    id VARCHAR PRIMARY KEY,
-                    language VARCHAR DEFAULT 'en',
-                    currency_code VARCHAR DEFAULT 'EGP',
-                    currency_symbol VARCHAR DEFAULT 'ج.م',
-                    currency_position VARCHAR DEFAULT 'after',
-                    decimal_places INTEGER DEFAULT 2,
-                    exchange_rate DOUBLE DEFAULT 1.0,
-                    analysis_lookback_periods INTEGER DEFAULT 12,
-                    forecast_horizon_periods INTEGER DEFAULT 12,
-                    period_granularity VARCHAR DEFAULT 'monthly',
-                    default_forecast_model VARCHAR DEFAULT 'auto',
-                    default_service_level DOUBLE DEFAULT 0.95,
-                    default_replenishment_policy VARCHAR DEFAULT 'periodic',
-                    default_order_cycle_days DOUBLE DEFAULT 30.0,
-                    default_lead_time_days DOUBLE DEFAULT 7.0,
-                    overstock_threshold_days DOUBLE DEFAULT 90.0,
-                    dead_stock_days DOUBLE DEFAULT 60.0,
-                    abc_a_cutoff DOUBLE DEFAULT 80.0,
-                    abc_b_cutoff DOUBLE DEFAULT 95.0,
-                    xyz_x_cv DOUBLE DEFAULT 0.5,
-                    xyz_y_cv DOUBLE DEFAULT 1.0,
-                    updated_at VARCHAR
-                )
-            """)
+            # 9. Ensure App Settings table
+            _ensure_settings_table(con)
 
-            # Check if default project exists, if not seed sample data
-            res = con.execute("SELECT COUNT(*) FROM projects").fetchone()
-            if res and res[0] == 0:
-                _seed_initial_project(con)
+            # Check if initial template seeding was done; never wipe or overwrite user projects
+            seed_row = con.execute("SELECT initial_seed_done FROM app_settings WHERE id = 'global_settings'").fetchone()
+            seed_done = seed_row[0] if seed_row and seed_row[0] else 'false'
+            if str(seed_done).lower() != 'true':
+                proj_count = con.execute("SELECT COUNT(*) FROM projects").fetchone()[0]
+                if proj_count == 0:
+                    _seed_initial_project(con)
+                con.execute("UPDATE app_settings SET initial_seed_done = 'true' WHERE id = 'global_settings'")
+            
+            con.execute("CHECKPOINT;")
 
         finally:
             con.close()
@@ -460,14 +517,117 @@ def _seed_initial_project(con):
         ('filt_3', ?, 'Lead Time > 40 Days', 'and', 'lead_time_days', '>', '40', ?)
     """, (project_id, now_str, project_id, now_str, project_id, now_str))
 
+    # Mirror into persistent project tables (project_items, project_periods, project_in_transit)
+    con.execute("DELETE FROM project_items WHERE project_id = ?", (project_id,))
+    con.execute("""
+        INSERT INTO project_items (
+            project_id, code, description, category, location, on_hand, on_order,
+            lead_time, lt_variability, service_level, moq, batch_rounding, cost, price, supplier
+        )
+        SELECT 
+            project_id, code, description, category, location, on_hand, on_order,
+            lead_time_days, lead_time_variance_days, service_level, min_batch, batch_rounding,
+            purchase_price, sales_price, supplier
+        FROM items
+        WHERE project_id = ?
+    """, (project_id,))
 
-def list_projects() -> List[Dict[str, Any]]:
-    """Returns all projects stored in DuckDB."""
+    con.execute("DELETE FROM project_periods WHERE project_id = ?", (project_id,))
+    con.execute("""
+        INSERT INTO project_periods (
+            project_id, code, location, period, qty_sold, revenue
+        )
+        SELECT 
+            p.project_id, i.code, i.location, p.date, p.actual, p.revenue
+        FROM periods p
+        JOIN items i ON p.item_id = i.id
+        WHERE p.project_id = ?
+    """, (project_id,))
+
+    con.execute("DELETE FROM project_in_transit WHERE project_id = ?", (project_id,))
+    con.execute("""
+        INSERT INTO project_in_transit (
+            project_id, id, code, location, po_number, qty_in_transit, expected_date, supplier, status
+        )
+        SELECT 
+            project_id, id, item_code, destination, order_no, quantity, eta_date, carrier, status
+        FROM in_transition
+        WHERE project_id = ?
+    """, (project_id,))
+
+    # Update app_settings active_project_id and mark initial seed done
+    con.execute("UPDATE app_settings SET active_project_id = ?, initial_seed_done = 'true' WHERE id = 'global_settings'", (project_id,))
+    con.execute("CHECKPOINT;")
+
+
+def get_active_project_id() -> str:
+    """Returns active project id from app_settings, falling back to first project or default."""
     with _LOCK:
         con = get_connection()
         try:
-            df = con.execute("SELECT id, name, description, created_at, updated_at, dataset_name, sku_count, status FROM projects ORDER BY updated_at DESC").fetchdf()
-            return df.to_dict(orient="records")
+            row = con.execute("SELECT active_project_id FROM app_settings WHERE id = 'global_settings'").fetchone()
+            if row and row[0]:
+                p_id = str(row[0])
+                chk = con.execute("SELECT id FROM projects WHERE id = ?", (p_id,)).fetchone()
+                if chk:
+                    return p_id
+            first = con.execute("SELECT id FROM projects ORDER BY updated_at DESC LIMIT 1").fetchone()
+            if first and first[0]:
+                return str(first[0])
+            return "proj_default_retail"
+        except Exception:
+            return "proj_default_retail"
+        finally:
+            con.close()
+
+def set_active_project_id(project_id: str):
+    """Sets active_project_id in app_settings and flushes immediately with CHECKPOINT."""
+    with _LOCK:
+        con = get_connection()
+        try:
+            con.execute("UPDATE app_settings SET active_project_id = ? WHERE id = 'global_settings'", (project_id,))
+            con.execute("CHECKPOINT;")
+        finally:
+            con.close()
+
+def list_projects() -> List[Dict[str, Any]]:
+    """Returns all projects stored in DuckDB with live item_count and active state."""
+    with _LOCK:
+        con = get_connection()
+        try:
+            active_pid = get_active_project_id()
+            df = con.execute("""
+                SELECT 
+                    p.id, p.name, p.description, 
+                    COALESCE(p.granularity, 'monthly') as granularity,
+                    COALESCE(p.currency_code, 'EGP') as currency_code,
+                    COALESCE(p.item_count, p.sku_count, 0) as item_count,
+                    COALESCE(p.sku_count, p.item_count, 0) as sku_count,
+                    p.created_at, p.updated_at, p.dataset_name, p.status
+                FROM projects p
+                ORDER BY p.updated_at DESC
+            """).fetchdf()
+            projs = df.to_dict(orient="records")
+            for p in projs:
+                p["is_active"] = (p["id"] == active_pid)
+                # Compute live item_count (analyzable items)
+                cnt_row = con.execute("""
+                    SELECT COUNT(*)
+                    FROM items i
+                    LEFT JOIN (
+                        SELECT item_id, COALESCE(SUM(actual), 0.0) as total_sales
+                        FROM periods
+                        WHERE project_id = ?
+                        GROUP BY item_id
+                    ) s ON i.id = s.item_id
+                    WHERE i.project_id = ?
+                      AND (COALESCE(i.on_hand, 0) > 0 OR COALESCE(s.total_sales, 0) > 0)
+                """, (p["id"], p["id"])).fetchone()
+                cnt = cnt_row[0] if cnt_row else 0
+                if cnt > 0:
+                    p["item_count"] = cnt
+                    p["sku_count"] = cnt
+            return projs
         finally:
             con.close()
 
@@ -476,7 +636,16 @@ def get_project_by_id(project_id: str) -> Optional[Dict[str, Any]]:
     with _LOCK:
         con = get_connection()
         try:
-            df = con.execute("SELECT * FROM projects WHERE id = ?", (project_id,)).fetchdf()
+            df = con.execute("""
+                SELECT 
+                    id, name, description,
+                    COALESCE(granularity, 'monthly') as granularity,
+                    COALESCE(currency_code, 'EGP') as currency_code,
+                    COALESCE(item_count, sku_count, 0) as item_count,
+                    COALESCE(sku_count, item_count, 0) as sku_count,
+                    created_at, updated_at, dataset_name, status
+                FROM projects WHERE id = ?
+            """, (project_id,)).fetchdf()
             if df.empty:
                 return None
             return df.iloc[0].to_dict()
@@ -484,16 +653,29 @@ def get_project_by_id(project_id: str) -> Optional[Dict[str, Any]]:
             con.close()
 
 def create_new_project(name: str, description: str = "", dataset_name: str = "") -> Dict[str, Any]:
-    """Creates a new project in DuckDB."""
+    """Creates a new project in DuckDB, sets it as active, and immediately checkpoints."""
     project_id = f"proj_{uuid.uuid4().hex[:10]}"
     now_str = datetime.datetime.utcnow().isoformat()
     with _LOCK:
         con = get_connection()
         try:
             con.execute("""
-                INSERT INTO projects (id, name, description, created_at, updated_at, dataset_name, sku_count, status)
-                VALUES (?, ?, ?, ?, ?, ?, 0, 'active')
+                INSERT INTO projects (id, name, description, granularity, currency_code, item_count, sku_count, created_at, updated_at, dataset_name, status)
+                VALUES (?, ?, ?, 'monthly', 'EGP', 0, 0, ?, ?, ?, 'active')
             """, (project_id, name, description, now_str, now_str, dataset_name))
+
+            # Ensure active working tables and persistent tables are clear for this fresh project
+            con.execute("DELETE FROM periods WHERE project_id = ?", (project_id,))
+            con.execute("DELETE FROM items WHERE project_id = ?", (project_id,))
+            con.execute("DELETE FROM in_transition WHERE project_id = ?", (project_id,))
+            con.execute("DELETE FROM project_items WHERE project_id = ?", (project_id,))
+            con.execute("DELETE FROM project_periods WHERE project_id = ?", (project_id,))
+            con.execute("DELETE FROM project_in_transit WHERE project_id = ?", (project_id,))
+
+            # Set active_project_id in app_settings
+            con.execute("UPDATE app_settings SET active_project_id = ? WHERE id = 'global_settings'", (project_id,))
+            con.execute("CHECKPOINT;")
+
             return {
                 "id": project_id,
                 "name": name,
@@ -501,8 +683,165 @@ def create_new_project(name: str, description: str = "", dataset_name: str = "")
                 "created_at": now_str,
                 "updated_at": now_str,
                 "dataset_name": dataset_name,
+                "granularity": "monthly",
+                "currency_code": "EGP",
+                "item_count": 0,
                 "sku_count": 0,
                 "status": "active"
+            }
+        finally:
+            con.close()
+
+def save_project_workspace(project_id: str) -> Dict[str, Any]:
+    """
+    Copies active workspace rows (items, periods, in_transition) into project_items,
+    project_periods, project_in_transit for project_id, updates item_count & updated_at,
+    sets active_project_id in app_settings, and calls flush_db().
+    """
+    now_str = datetime.datetime.utcnow().isoformat()
+    with _LOCK:
+        con = get_connection()
+        try:
+            # 1. Sync items into project_items
+            con.execute("DELETE FROM project_items WHERE project_id = ?", (project_id,))
+            con.execute("""
+                INSERT INTO project_items (
+                    project_id, code, description, category, location, on_hand, on_order,
+                    lead_time, lt_variability, service_level, moq, batch_rounding, cost, price, supplier
+                )
+                SELECT 
+                    project_id, code, description, category, location, on_hand, on_order,
+                    lead_time_days, lead_time_variance_days, service_level, min_batch, batch_rounding,
+                    purchase_price, sales_price, supplier
+                FROM items
+                WHERE project_id = ?
+            """, (project_id,))
+
+            # 2. Sync periods into project_periods
+            con.execute("DELETE FROM project_periods WHERE project_id = ?", (project_id,))
+            con.execute("""
+                INSERT INTO project_periods (
+                    project_id, code, location, period, qty_sold, revenue
+                )
+                SELECT 
+                    p.project_id, i.code, i.location, p.date, p.actual, p.revenue
+                FROM periods p
+                JOIN items i ON p.item_id = i.id
+                WHERE p.project_id = ?
+            """, (project_id,))
+
+            # 3. Sync in_transition into project_in_transit
+            con.execute("DELETE FROM project_in_transit WHERE project_id = ?", (project_id,))
+            con.execute("""
+                INSERT INTO project_in_transit (
+                    project_id, id, code, location, po_number, qty_in_transit, expected_date, supplier, status
+                )
+                SELECT 
+                    project_id, id, item_code, destination, order_no, quantity, eta_date, carrier, status
+                FROM in_transition
+                WHERE project_id = ?
+            """, (project_id,))
+
+            # 4. Live count of analyzable items
+            count_row = con.execute("""
+                SELECT COUNT(*)
+                FROM items i
+                LEFT JOIN (
+                    SELECT item_id, COALESCE(SUM(actual), 0.0) as total_sales
+                    FROM periods
+                    WHERE project_id = ?
+                    GROUP BY item_id
+                ) s ON i.id = s.item_id
+                WHERE i.project_id = ?
+                  AND (COALESCE(i.on_hand, 0) > 0 OR COALESCE(s.total_sales, 0) > 0)
+            """, (project_id, project_id)).fetchone()
+            item_cnt = count_row[0] if count_row else 0
+
+            con.execute("""
+                UPDATE projects SET
+                    item_count = ?,
+                    sku_count = ?,
+                    updated_at = ?
+                WHERE id = ?
+            """, (item_cnt, item_cnt, now_str, project_id))
+
+            con.execute("UPDATE app_settings SET active_project_id = ? WHERE id = 'global_settings'", (project_id,))
+            con.execute("CHECKPOINT;")
+
+            return {
+                "success": True,
+                "project_id": project_id,
+                "item_count": item_cnt,
+                "updated_at": now_str,
+                "message": f"Project {project_id} saved and checkpointed to DuckDB successfully."
+            }
+        finally:
+            con.close()
+
+def activate_project(project_id: str) -> Dict[str, Any]:
+    """
+    Sets project_id as active_project_id in app_settings, restores items/periods from
+    project_items/project_periods if items table is empty for this project,
+    updates updated_at timestamp, and flushes to disk with flush_db().
+    """
+    now_str = datetime.datetime.utcnow().isoformat()
+    with _LOCK:
+        con = get_connection()
+        try:
+            # Check if project exists
+            p = con.execute("SELECT id, name FROM projects WHERE id = ?", (project_id,)).fetchone()
+            if not p:
+                raise ValueError(f"Project {project_id} does not exist")
+
+            # Check if active working table `items` has data for this project
+            items_count = con.execute("SELECT COUNT(*) FROM items WHERE project_id = ?", (project_id,)).fetchone()[0]
+            if items_count == 0:
+                # Check if project_items has data to restore
+                pi_count = con.execute("SELECT COUNT(*) FROM project_items WHERE project_id = ?", (project_id,)).fetchone()[0]
+                if pi_count > 0:
+                    con.execute("""
+                        INSERT INTO items (
+                            id, project_id, code, description, category, location, channel, supplier,
+                            sales_price, purchase_price, margin, on_hand, on_order, backorders,
+                            lead_time_days, lead_time_variance_days, order_cycle_days, service_level,
+                            min_batch, batch_rounding, model_type, replenishment_strategy,
+                            check_state, approval_state, abc_class, xyz_class,
+                            safety_stock, reorder_point, order_now, order_now_value, days_of_supply,
+                            accuracy, mean_daily_demand, updated_at
+                        )
+                        SELECT
+                            project_id || '_' || code, project_id, code, description, category, location, 'Direct', supplier,
+                            price, cost, ROUND((price - cost)/NULLIF(price, 0)*100, 1), on_hand, on_order, 0.0,
+                            lead_time, lt_variability, 30.0, service_level,
+                            moq, batch_rounding, 'auto', 'periodic',
+                            'checked', 'unapproved', 'C', 'Y',
+                            0.0, 0.0, 0.0, 0.0, 0.0,
+                            95.0, 5.0, ?
+                        FROM project_items
+                        WHERE project_id = ?
+                    """, (now_str, project_id))
+
+                    con.execute("""
+                        INSERT INTO periods (
+                            id, project_id, item_id, date, actual, forecast, model, conf_upper, conf_lower, override, promotion, revenue
+                        )
+                        SELECT
+                            'per_' || i.id || '_' || pp.period, pp.project_id, i.id, pp.period, pp.qty_sold, pp.qty_sold, pp.qty_sold,
+                            ROUND(pp.qty_sold * 1.15), ROUND(pp.qty_sold * 0.85), NULL, 0.0, pp.revenue
+                        FROM project_periods pp
+                        JOIN items i ON pp.project_id = i.project_id AND pp.code = i.code AND pp.location = i.location
+                        WHERE pp.project_id = ?
+                    """, (project_id,))
+
+            con.execute("UPDATE projects SET updated_at = ? WHERE id = ?", (now_str, project_id))
+            con.execute("UPDATE app_settings SET active_project_id = ? WHERE id = 'global_settings'", (project_id,))
+            con.execute("CHECKPOINT;")
+
+            return {
+                "success": True,
+                "project_id": project_id,
+                "active_project_id": project_id,
+                "message": f"Project {project_id} activated successfully."
             }
         finally:
             con.close()
@@ -512,13 +851,25 @@ def delete_project_by_id(project_id: str):
     with _LOCK:
         con = get_connection()
         try:
+            con.execute("DELETE FROM project_periods WHERE project_id = ?", (project_id,))
+            con.execute("DELETE FROM project_items WHERE project_id = ?", (project_id,))
+            con.execute("DELETE FROM project_in_transit WHERE project_id = ?", (project_id,))
             con.execute("DELETE FROM periods WHERE project_id = ?", (project_id,))
             con.execute("DELETE FROM forecast_overrides WHERE project_id = ?", (project_id,))
             con.execute("DELETE FROM model_settings WHERE project_id = ?", (project_id,))
             con.execute("DELETE FROM items WHERE project_id = ?", (project_id,))
             con.execute("DELETE FROM saved_filters WHERE project_id = ?", (project_id,))
             con.execute("DELETE FROM in_transition WHERE project_id = ?", (project_id,))
+            con.execute("DELETE FROM daily_sales WHERE project_id = ?", (project_id,))
             con.execute("DELETE FROM projects WHERE id = ?", (project_id,))
+
+            curr_active = con.execute("SELECT active_project_id FROM app_settings WHERE id = 'global_settings'").fetchone()
+            if curr_active and curr_active[0] == project_id:
+                next_p = con.execute("SELECT id FROM projects ORDER BY updated_at DESC LIMIT 1").fetchone()
+                next_id = next_p[0] if next_p else "proj_default_retail"
+                con.execute("UPDATE app_settings SET active_project_id = ? WHERE id = 'global_settings'", (next_id,))
+
+            con.execute("CHECKPOINT;")
         finally:
             con.close()
 
@@ -895,6 +1246,19 @@ def bulk_upsert_in_transit(project_id: str, records: List[Dict[str, Any]], merge
             except Exception:
                 pass
 
+            # Mirror in_transition to project_in_transit and checkpoint
+            con.execute("DELETE FROM project_in_transit WHERE project_id = ?", (project_id,))
+            con.execute("""
+                INSERT INTO project_in_transit (
+                    project_id, id, code, location, po_number, qty_in_transit, expected_date, supplier, status
+                )
+                SELECT
+                    project_id, id, item_code, destination, order_no, quantity, eta_date, origin, status
+                FROM in_transition
+                WHERE project_id = ?
+            """, (project_id,))
+            con.execute("CHECKPOINT;")
+
             return count
         finally:
             con.close()
@@ -1003,9 +1367,22 @@ def _ensure_settings_table(con):
             abc_b_cutoff DOUBLE DEFAULT 95.0,
             xyz_x_cv DOUBLE DEFAULT 0.5,
             xyz_y_cv DOUBLE DEFAULT 1.0,
+            active_project_id VARCHAR DEFAULT 'proj_default_retail',
+            initial_seed_done VARCHAR DEFAULT 'false',
             updated_at VARCHAR
         )
     """)
+    cols = [c[1].lower() for c in con.execute("PRAGMA table_info('app_settings')").fetchall()]
+    if "active_project_id" not in cols:
+        try:
+            con.execute("ALTER TABLE app_settings ADD COLUMN active_project_id VARCHAR DEFAULT 'proj_default_retail'")
+        except Exception:
+            pass
+    if "initial_seed_done" not in cols:
+        try:
+            con.execute("ALTER TABLE app_settings ADD COLUMN initial_seed_done VARCHAR DEFAULT 'false'")
+        except Exception:
+            pass
 
 def get_app_settings() -> Dict[str, Any]:
     """Retrieves persistent application settings from DuckDB."""
@@ -1019,7 +1396,7 @@ def get_app_settings() -> Dict[str, Any]:
                     decimal_places, exchange_rate, analysis_lookback_periods, forecast_horizon_periods,
                     period_granularity, default_forecast_model, default_service_level, default_replenishment_policy,
                     default_order_cycle_days, default_lead_time_days, overstock_threshold_days, dead_stock_days,
-                    abc_a_cutoff, abc_b_cutoff, xyz_x_cv, xyz_y_cv, updated_at
+                    abc_a_cutoff, abc_b_cutoff, xyz_x_cv, xyz_y_cv, active_project_id, initial_seed_done, updated_at
                 FROM app_settings
                 WHERE id = 'global_settings'
             """).fetchone()
@@ -1032,13 +1409,13 @@ def get_app_settings() -> Dict[str, Any]:
                         decimal_places, exchange_rate, analysis_lookback_periods, forecast_horizon_periods,
                         period_granularity, default_forecast_model, default_service_level, default_replenishment_policy,
                         default_order_cycle_days, default_lead_time_days, overstock_threshold_days, dead_stock_days,
-                        abc_a_cutoff, abc_b_cutoff, xyz_x_cv, xyz_y_cv, updated_at
+                        abc_a_cutoff, abc_b_cutoff, xyz_x_cv, xyz_y_cv, active_project_id, initial_seed_done, updated_at
                     ) VALUES (
                         'global_settings', 'en', 'EGP', 'ج.م', 'after',
                         2, 1.0, 12, 12,
                         'monthly', 'auto', 0.95, 'periodic',
                         30.0, 7.0, 90.0, 60.0,
-                        80.0, 95.0, 0.5, 1.0, ?
+                        80.0, 95.0, 0.5, 1.0, 'proj_default_retail', 'false', ?
                     )
                 """, (now_str,))
                 return {
@@ -1062,6 +1439,8 @@ def get_app_settings() -> Dict[str, Any]:
                     "abc_b_cutoff": 95.0,
                     "xyz_x_cv": 0.5,
                     "xyz_y_cv": 1.0,
+                    "active_project_id": "proj_default_retail",
+                    "initial_seed_done": "false",
                     "updated_at": now_str
                 }
 
@@ -1086,7 +1465,9 @@ def get_app_settings() -> Dict[str, Any]:
                 "abc_b_cutoff": clean_float(row[17], 95.0),
                 "xyz_x_cv": clean_float(row[18], 0.5),
                 "xyz_y_cv": clean_float(row[19], 1.0),
-                "updated_at": row[20]
+                "active_project_id": row[20] or "proj_default_retail",
+                "initial_seed_done": row[21] or "false",
+                "updated_at": row[22]
             }
         finally:
             con.close()
@@ -1107,13 +1488,13 @@ def save_app_settings(updates: Dict[str, Any]) -> Dict[str, Any]:
                         decimal_places, exchange_rate, analysis_lookback_periods, forecast_horizon_periods,
                         period_granularity, default_forecast_model, default_service_level, default_replenishment_policy,
                         default_order_cycle_days, default_lead_time_days, overstock_threshold_days, dead_stock_days,
-                        abc_a_cutoff, abc_b_cutoff, xyz_x_cv, xyz_y_cv, updated_at
+                        abc_a_cutoff, abc_b_cutoff, xyz_x_cv, xyz_y_cv, active_project_id, initial_seed_done, updated_at
                     ) VALUES (
                         'global_settings', 'en', 'EGP', 'ج.م', 'after',
                         2, 1.0, 12, 12,
                         'monthly', 'auto', 0.95, 'periodic',
                         30.0, 7.0, 90.0, 60.0,
-                        80.0, 95.0, 0.5, 1.0, ?
+                        80.0, 95.0, 0.5, 1.0, 'proj_default_retail', 'false', ?
                     )
                 """, (now_str,))
 
@@ -1122,7 +1503,7 @@ def save_app_settings(updates: Dict[str, Any]) -> Dict[str, Any]:
                 "decimal_places", "exchange_rate", "analysis_lookback_periods", "forecast_horizon_periods",
                 "period_granularity", "default_forecast_model", "default_service_level", "default_replenishment_policy",
                 "default_order_cycle_days", "default_lead_time_days", "overstock_threshold_days", "dead_stock_days",
-                "abc_a_cutoff", "abc_b_cutoff", "xyz_x_cv", "xyz_y_cv"
+                "abc_a_cutoff", "abc_b_cutoff", "xyz_x_cv", "xyz_y_cv", "active_project_id", "initial_seed_done"
             }
             set_clauses = ["updated_at = ?"]
             params = [now_str]
@@ -1133,6 +1514,7 @@ def save_app_settings(updates: Dict[str, Any]) -> Dict[str, Any]:
 
             params.append('global_settings')
             con.execute(f"UPDATE app_settings SET {', '.join(set_clauses)} WHERE id = ?", params)
+            con.execute("CHECKPOINT;")
         finally:
             con.close()
     return get_app_settings()
@@ -1763,9 +2145,41 @@ def upsert_items_and_periods(
                 except Exception:
                     pass
 
-            # Update project SKU count (active analyzable SKUs) & timestamp
+            # Mirror working items to persistent project_items
+            con.execute("DELETE FROM project_items WHERE project_id = ?", (project_id,))
+            con.execute("""
+                INSERT INTO project_items (
+                    project_id, code, description, category, location, on_hand, on_order,
+                    lead_time, lt_variability, service_level, moq, batch_rounding, cost, price, supplier
+                )
+                SELECT
+                    project_id, code, description, category, location, on_hand, on_order,
+                    lead_time_days, lead_time_variance_days, service_level, min_batch, batch_rounding,
+                    purchase_price, sales_price, supplier
+                FROM items
+                WHERE project_id = ?
+            """, (project_id,))
+
+            # Mirror working periods to persistent project_periods
+            con.execute("DELETE FROM project_periods WHERE project_id = ?", (project_id,))
+            con.execute("""
+                INSERT INTO project_periods (
+                    project_id, code, location, period, qty_sold, revenue
+                )
+                SELECT
+                    p.project_id, i.code, i.location, p.date, p.actual, p.revenue
+                FROM periods p
+                JOIN items i ON p.item_id = i.id
+                WHERE p.project_id = ?
+            """, (project_id,))
+
+            # Total items count
+            total_items_count = con.execute("SELECT COUNT(*) FROM items WHERE project_id = ?", (project_id,)).fetchone()[0]
+
+            # Update project SKU count (active analyzable SKUs), item_count & timestamp
             con.execute("""
                 UPDATE projects SET
+                    item_count = ?,
                     sku_count = (
                         SELECT COUNT(*)
                         FROM items i
@@ -1780,7 +2194,10 @@ def upsert_items_and_periods(
                     ),
                     updated_at = ?
                 WHERE id = ?
-            """, (project_id, project_id, now_str, project_id))
+            """, (total_items_count, project_id, project_id, now_str, project_id))
+
+            con.execute("UPDATE app_settings SET active_project_id = ? WHERE id = 'global_settings'", (project_id,))
+            con.execute("CHECKPOINT;")
 
             dormant_cnt = get_project_dormant_count(project_id)
 

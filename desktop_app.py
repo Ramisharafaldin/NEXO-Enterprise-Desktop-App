@@ -172,7 +172,7 @@ def wait_for_backend(port: int, timeout: float = 15.0) -> bool:
 
 import webview
 from generate_icon import create_nexo_icon
-from backend.database import close_db
+from backend.database import close_db, flush_db
 
 class DesktopApi:
     """JavaScript API bridge exposed as window.pywebview.api."""
@@ -229,7 +229,7 @@ def restart_desktop_process():
     """
     time.sleep(0.5)
     try:
-        from backend.database import close_db
+        from backend.database import close_db, flush_db
         close_db()
     except Exception as e:
         logger.warning(f"Error closing db during restart: {e}")
@@ -258,6 +258,15 @@ def restart_desktop_process():
         logger.error(f"Failed to spawn restart process: {e}")
     finally:
         os._exit(0)
+
+def on_closing():
+    """Clean window close callback: execute flush_db() and close_db() cleanly before exiting."""
+    logger.info("Window closing event received. Checkpointing and shutting down DuckDB.")
+    try:
+        flush_db()
+        close_db()
+    except Exception as e:
+        logger.warning(f"Error during on_closing db flush: {e}")
 
 def on_closed():
     """Safe shutdown callback: flush DuckDB and terminate process."""
@@ -320,6 +329,7 @@ def main():
         background_color="#343D46",
     )
     api.set_window(window)
+    window.events.closing += on_closing
     window.events.closed += on_closed
 
     # 5. Define persistent storage path for WebView2 to prevent temporary folder race conditions
