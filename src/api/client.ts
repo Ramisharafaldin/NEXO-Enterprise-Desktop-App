@@ -26,6 +26,8 @@ export interface UpdateInfo {
   commit_date: string;
   files_changed: number;
   offline: boolean;
+  version?: string;
+  current_version?: string;
   error?: string;
 }
 

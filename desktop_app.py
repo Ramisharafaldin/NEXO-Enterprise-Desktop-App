@@ -23,7 +23,10 @@ import threading
 import base64
 import urllib.request
 import ctypes
+import subprocess
 from typing import Optional
+
+SUBPROCESS_FLAGS = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
 
 # Setup directories
 WORKSPACE_DIR = os.path.dirname(os.path.abspath(__file__))

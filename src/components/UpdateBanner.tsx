@@ -103,8 +103,8 @@ export const UpdateBanner: React.FC<UpdateBannerProps> = ({
           <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0" />
           <span className="font-semibold">
             {isAr
-              ? `أنت تستخدم أحدث إصدار من NEXO (${updateInfo?.local_sha || 'c9ee199'}). لا توجد تحديثات جديدة.`
-              : `NEXO is up to date (${updateInfo?.local_sha || 'c9ee199'}). No new updates found.`}
+              ? `أنت تستخدم أحدث إصدار من NEXO (${updateInfo?.current_version || 'v0.1.0'}). لا توجد تحديثات جديدة.`
+              : `NEXO is up to date (${updateInfo?.current_version || 'v0.1.0'}). No new updates found.`}
           </span>
         </div>
         <button onClick={() => setApplyStatus(null)} className="text-emerald-300 hover:text-white cursor-pointer">
@@ -155,15 +155,18 @@ export const UpdateBanner: React.FC<UpdateBannerProps> = ({
             <div className="p-1 rounded bg-[#2196F3]/20 text-[#00E5FF] border border-[#2196F3]/40">
               <Rocket className="w-4 h-4 animate-bounce" />
             </div>
-            <div>
+            <div className="flex items-center flex-wrap gap-1.5">
               <span className="font-bold text-white text-[12px]">
                 {isAr ? 'يتوفر تحديث جديد لتطبيق NEXO' : 'A new update is available for NEXO'}
               </span>
-              <span className="text-slate-300 mx-1.5">—</span>
-              <span className="text-[#38BDF8] font-medium font-mono">
+              <span className="text-[10px] px-1.5 py-0.5 rounded bg-blue-900/60 text-blue-200 border border-blue-500/40 font-mono">
+                {isAr ? `الإصدار الحالي: ${updateInfo.current_version || 'v0.1.0'}` : `Current: ${updateInfo.current_version || 'v0.1.0'}`}
+              </span>
+              <span className="text-slate-400 mx-1">—</span>
+              <span className="text-[#38BDF8] font-medium font-mono text-[11px]">
                 {updateInfo.commit_message || (isAr ? 'تحسينات جديدة على النظام' : 'New enhancements')}
               </span>
-              <span className="mx-2 text-[10px] px-1.5 py-0.5 rounded bg-slate-800 text-slate-300 font-mono border border-slate-700">
+              <span className="text-[10px] px-1.5 py-0.2 rounded bg-slate-800 text-slate-300 font-mono border border-slate-700">
                 {updateInfo.remote_sha}
               </span>
             </div>
@@ -176,15 +179,15 @@ export const UpdateBanner: React.FC<UpdateBannerProps> = ({
               className="flex items-center gap-1.5 px-3.5 py-1 bg-[#2196F3] hover:bg-blue-500 text-white font-bold rounded text-[11px] shadow-sm transition cursor-pointer"
             >
               <DownloadCloud className="w-3.5 h-3.5" />
-              <span>{isAr ? 'تحديث الآن وإعادة التشغيل' : 'Update & Restart Now'}</span>
+              <span>{isAr ? 'موافقة وتحديث الآن' : 'Approve & Update Now'}</span>
             </button>
 
             <button
               onClick={() => setIsDismissed(true)}
-              title={isAr ? 'لاحقاً' : 'Later'}
+              title={isAr ? 'تجاهل الآن' : 'Dismiss'}
               className="flex items-center gap-1 px-2.5 py-1 bg-slate-800 hover:bg-slate-700 text-slate-300 hover:text-white rounded border border-slate-700 text-[11px] transition cursor-pointer"
             >
-              <span>{isAr ? 'لاحقاً' : 'Later'}</span>
+              <span>{isAr ? 'تجاهل الآن' : 'Dismiss'}</span>
               <X className="w-3 h-3 text-slate-400" />
             </button>
           </div>

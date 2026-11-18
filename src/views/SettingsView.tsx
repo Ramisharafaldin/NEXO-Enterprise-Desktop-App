@@ -702,6 +702,13 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                 </div>
 
                 <div className="flex items-center justify-between">
+                  <span className="text-slate-500 font-medium">{isAr ? 'الإصدار الحالي' : 'Current Version'}:</span>
+                  <span className="font-mono font-bold text-slate-800 bg-white px-2 py-0.5 rounded border border-slate-200">
+                    {updateInfo?.current_version || 'v0.1.0'}
+                  </span>
+                </div>
+
+                <div className="flex items-center justify-between">
                   <span className="text-slate-500 font-medium">{isAr ? 'الإصدار المثبت محلياً' : 'Local Commit SHA'}:</span>
                   <span className="font-mono font-bold text-slate-800 bg-white px-2 py-0.5 rounded border border-slate-200">
                     {updateInfo?.local_sha || 'c9ee199'}
