@@ -253,9 +253,12 @@ export const DataHubView: React.FC<DataHubViewProps> = ({
         mergeMode,
         columnMapping
       );
+      const formattedRows = (res.rows_processed || 0).toLocaleString();
+      const elapsedStr = res.elapsed_seconds != null ? ` في ${res.elapsed_seconds.toFixed(2)} ثانية` : '';
+      const elapsedStrEn = res.elapsed_seconds != null ? ` in ${res.elapsed_seconds.toFixed(2)}s` : '';
       showNotification('success', isAr 
-        ? `تم استيراد ${res.rows_processed} صنف بنجاح وحفظها في قاعدة بيانات DuckDB!` 
-        : `Successfully ingested ${res.rows_processed} rows into DuckDB workspace!`
+        ? `تم استيراد ${formattedRows} سجل مباشرة إلى DuckDB${elapsedStr} بنجاح!` 
+        : `Successfully ingested ${formattedRows} rows directly into DuckDB${elapsedStrEn}!`
       );
       setSelectedFile(null);
       setInspectData(null);

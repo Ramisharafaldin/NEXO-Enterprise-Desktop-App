@@ -8,6 +8,7 @@ if repo_dir not in sys.path:
 
 import asyncio
 import uuid
+import time
 import httpx
 from backend.server import app
 from backend.database import init_db, get_connection, close_db
@@ -238,14 +239,16 @@ async def run_tests():
 
         # B) Stockout SKU: on_hand = 0, actual = 25.0 -> MUST BE INCLUDED
         stockout_id = f"{pid}_stockout_test"
+        per_stockout_id = f"per_{uuid.uuid4().hex[:8]}"
+        con.execute("DELETE FROM periods WHERE id = 'per_stockout_test'")
         con.execute("""
             INSERT INTO items (id, project_id, code, description, category, location, on_hand, purchase_price, sales_price)
             VALUES (?, ?, 'SKU-STOCKOUT-TEST', 'Stockout SKU with Demand', 'General', 'Main WH', 0.0, 50.0, 100.0)
         """, (stockout_id, pid))
         con.execute("""
             INSERT INTO periods (id, project_id, item_id, date, actual, forecast)
-            VALUES ('per_stockout_test', ?, ?, '2025-10', 25.0, 25.0)
-        """, (pid, stockout_id))
+            VALUES (?, ?, ?, '2025-10', 25.0, 25.0)
+        """, (per_stockout_id, pid, stockout_id))
 
         # C) Deadstock/New Stock SKU: on_hand = 40.0, actual = 0.0 -> MUST BE INCLUDED
         deadstock_id = f"{pid}_deadstock_test"
@@ -369,7 +372,54 @@ async def run_tests():
 
         print(f'19. Multi-Project DuckDB Persistence & Restart PASSED (New project {new_proj_id} + rows completely restored from disk)')
 
-        print('\n=== ALL 19 BACKEND & DATA HUB ENDPOINTS TESTED AND VERIFIED 100% OPERATIONAL! ===')
+        # 20. 25,000-Row Direct DuckDB Stream Ingestion Benchmark (< 3s & exact sums)
+        bench_lines = ["CODE,LOCA,SALE_DATE,QTY_SOLD,REVENUE"]
+        for i in range(25000):
+            sku = f"SKU_BENCH_{i % 100}"
+            day = (i % 28) + 1
+            bench_lines.append(f"{sku},Main Warehouse,2026-03-{day:02d},2.0,100.0")
+        bench_csv_bytes = "\n".join(bench_lines).encode("utf-8")
+
+        t_start = time.perf_counter()
+        r_bench = await client.post(
+            '/api/files/import-typed',
+            files={'file': ('benchmark_25k_sales.csv', bench_csv_bytes, 'text/csv')},
+            data={'import_type': 'sales', 'project_id': pid, 'merge_mode': 'merge'}
+        )
+        bench_duration = time.perf_counter() - t_start
+        assert r_bench.status_code == 200, f"Benchmark import failed: {r_bench.text}"
+        bench_json = r_bench.json()
+        assert bench_json['success'] is True, f"Benchmark import failed: {bench_json}"
+        assert bench_json['rows_processed'] == 25000, f"Expected 25,000 rows, got {bench_json['rows_processed']}"
+        assert bench_duration < 3.0, f"Benchmark took too long: {bench_duration:.3f}s (must be < 3.0s)"
+        assert bench_json.get('elapsed_seconds', 0) < 3.0, f"Backend reported elapsed time >= 3.0s: {bench_json.get('elapsed_seconds')}"
+
+        con_bench = get_connection()
+        try:
+            ds_bench = con_bench.execute("""
+                SELECT COUNT(*), SUM(qty_sold), SUM(revenue)
+                FROM daily_sales
+                WHERE project_id = ? AND item_code LIKE 'SKU_BENCH_%'
+            """, (pid,)).fetchone()
+            assert ds_bench[0] == 25000, f"Expected 25,000 daily_sales records, found {ds_bench[0]}"
+            assert abs(ds_bench[1] - 50000.0) < 1e-4, f"Expected 50000.0 total qty, got {ds_bench[1]}"
+            assert abs(ds_bench[2] - 2500000.0) < 1e-4, f"Expected 2500000.0 total rev, got {ds_bench[2]}"
+
+            p_bench = con_bench.execute("""
+                SELECT COUNT(DISTINCT i.code), SUM(p.actual), SUM(p.revenue)
+                FROM periods p
+                JOIN items i ON p.item_id = i.id
+                WHERE p.project_id = ? AND i.code LIKE 'SKU_BENCH_%' AND p.date = '2026-03'
+            """, (pid,)).fetchone()
+            assert p_bench[0] == 100, f"Expected 100 distinct SKUs in periods, got {p_bench[0]}"
+            assert abs(p_bench[1] - 50000.0) < 1e-4, f"Expected 50000.0 aggregated actual, got {p_bench[1]}"
+            assert abs(p_bench[2] - 2500000.0) < 1e-4, f"Expected 2500000.0 aggregated rev, got {p_bench[2]}"
+        finally:
+            con_bench.close()
+
+        print(f'20. 25,000-Row Direct DuckDB Stream Ingestion Benchmark PASSED (Processed in {bench_duration:.3f}s, Throughput: {25000/bench_duration:,.0f} rows/s, Exact Aggregation Verified)')
+
+        print('\n=== ALL 20 BACKEND & DATA HUB ENDPOINTS TESTED AND VERIFIED 100% OPERATIONAL! ===')
 
 if __name__ == '__main__':
     asyncio.run(run_tests())

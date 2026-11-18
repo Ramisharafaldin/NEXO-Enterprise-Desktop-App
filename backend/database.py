@@ -42,8 +42,14 @@ DB_PATH = str(BASE_DIR / "nexo_workspace.duckdb")
 _LOCK = threading.RLock()
 
 def get_connection():
-    """Returns a DuckDB connection to the local database file."""
-    return duckdb.connect(DB_PATH)
+    """Returns a DuckDB connection to the local database file with memory cap and performance pragmas."""
+    con = duckdb.connect(DB_PATH)
+    try:
+        con.execute("SET memory_limit='512MB';")
+        con.execute("SET preserve_insertion_order=false;")
+    except Exception:
+        pass
+    return con
 
 def flush_db():
     """Forces DuckDB WAL changes to be flushed immediately to disk via CHECKPOINT."""

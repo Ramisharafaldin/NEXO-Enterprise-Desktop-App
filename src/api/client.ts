@@ -500,7 +500,7 @@ export const api = {
     newProjectName?: string,
     mergeMode: 'merge' | 'replace' = 'merge',
     columnMapping?: Record<string, string>
-  ): Promise<{ success: boolean; project_id: string; rows_processed: number; items_upserted: number; periods_upserted: number; message: string }> {
+  ): Promise<{ success: boolean; project_id: string; rows_processed: number; items_upserted: number; periods_upserted: number; elapsed_seconds?: number; message: string }> {
     const formData = new FormData();
     formData.append('file', file);
     formData.append('import_type', importType);
