@@ -13,3 +13,6 @@ NEXO_ANATOMICAL_AUDIT_REPORT.md
 
 .python_exe.txt
 *.log
+
+.python_exe.txt
+*.log
