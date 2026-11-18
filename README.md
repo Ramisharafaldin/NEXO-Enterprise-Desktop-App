@@ -1,9 +1,15 @@
-﻿# NEXO Enterprise Planning
+﻿# NEXO — Enterprise Demand & Supply Chain Planning
 
-## Install via Terminal
-```bash
-git clone [https://github.com/YOUR_USERNAME/nexo.git
-cd](https://github.com/YOUR_USERNAME/nexo.git
-cd) nexo
+## 1. Download & Install via Terminal
+```powershell
+git clone [https://github.com/Ramisharafaldin/NEXO-Enterprise-Desktop-App.git
+cd](https://github.com/Ramisharafaldin/NEXO-Enterprise-Desktop-App.git
+cd) NEXO-Enterprise-Desktop-App
 .\setup.bat
+```
+
+## 2. Pull Updates from GitHub
+```powershell
+git pull
+npm run build
 ```
