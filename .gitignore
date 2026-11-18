@@ -1,4 +1,4 @@
-﻿node_modules/
+node_modules/
 dist/
 __pycache__/
 *.py[cod]
@@ -9,4 +9,7 @@ __pycache__/
 .antigravity/
 *_SPEC.md
 NEXO_ANATOMICAL_AUDIT_REPORT.md
+*.log
+
+.python_exe.txt
 *.log
