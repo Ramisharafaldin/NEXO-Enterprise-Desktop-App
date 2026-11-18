@@ -1,0 +1,22 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 120 120" width="120" height="120" fill="none">
+  <defs>
+    <linearGradient id="nexoBlue" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#38BDF8" />
+      <stop offset="100%" stop-color="#2196F3" />
+    </linearGradient>
+    <linearGradient id="nexoDark" x1="0%" y1="100%" x2="100%" y2="0%">
+      <stop offset="0%" stop-color="#1E293B" />
+      <stop offset="100%" stop-color="#343D46" />
+    </linearGradient>
+  </defs>
+  <!-- خلفية دائرية مربعة بألوان الواجهة -->
+  <rect x="6" y="6" width="108" height="108" rx="24" fill="url(#nexoDark)" stroke="#2196F3" stroke-width="3" />
+  <!-- الضلع الأيسر لحرف N -->
+  <path d="M34 88V32H48V88H34Z" fill="#F8FAFC" />
+  <!-- الضلع الأيمن لحرف N -->
+  <path d="M72 88V32H86V88H72Z" fill="#F8FAFC" />
+  <!-- الضلع المائل الذكي لحرف N (يرمز لمنحنى التوقع وسلاسل الإمداد) -->
+  <path d="M34 32H49L86 88H71L34 32Z" fill="url(#nexoBlue)" />
+  <!-- نقطة بيانات مضيئة في أعلى اليمين -->
+  <circle cx="79" cy="23" r="4.5" fill="#38BDF8" />
+</svg>

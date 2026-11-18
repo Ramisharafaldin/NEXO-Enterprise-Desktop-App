@@ -1,0 +1,11 @@
+﻿node_modules/
+dist/
+__pycache__/
+*.py[cod]
+*.duckdb
+*.duckdb.wal
+.env
+.vscode/
+.antigravity/
+*_SPEC.md
+NEXO_ANATOMICAL_AUDIT_REPORT.md
