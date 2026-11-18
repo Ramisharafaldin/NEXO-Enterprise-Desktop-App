@@ -2,7 +2,7 @@ import React, { useState, useEffect, useMemo } from 'react';
 import { InventoryItem, AppSettings, isAnalyzableItem } from '../engine/types';
 import { translations, Language } from '../i18n/translations';
 import { formatCurrency, getCurrencySymbol } from '../utils/formatters';
-import { api, DashboardKpis } from '../api/client';
+import { api, DashboardKpis, DashboardSummaryResponse } from '../api/client';
 import { 
   ResponsiveContainer, 
   BarChart, 
@@ -50,6 +50,7 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
   const currSymbol = getCurrencySymbol(settings?.currency_code || 'EGP', language);
 
   const [dbKpis, setDbKpis] = useState<DashboardKpis | null>(null);
+  const [dashboardSummary, setDashboardSummary] = useState<DashboardSummaryResponse | null>(null);
   const [isRefreshing, setIsRefreshing] = useState(false);
   const [showTilesMenu, setShowTilesMenu] = useState(false);
 
@@ -89,15 +90,22 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
     });
   };
 
-  // Fetch real KPIs from DuckDB
+  // Fetch real KPIs & pre-aggregated summary from DuckDB backend
   const fetchKpis = async () => {
     if (!projectId) return;
     setIsRefreshing(true);
     try {
-      const res = await api.getKpis(projectId);
-      setDbKpis(res);
+      const summary = await api.getDashboard(projectId);
+      setDashboardSummary(summary);
+      if (summary.kpis) {
+        setDbKpis(summary.kpis);
+      }
     } catch (e) {
-      console.warn('Dashboard: Failed to load backend KPIs, calculating locally', e);
+      console.warn('Dashboard: Failed to load backend summary, falling back to local calculation', e);
+      try {
+        const res = await api.getKpis(projectId);
+        setDbKpis(res);
+      } catch (err) {}
     } finally {
       setIsRefreshing(false);
     }
@@ -116,16 +124,17 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
   const activeItems = useMemo(() => (items || []).filter(isAnalyzableItem), [items]);
 
   // Aggregated KPIs (DuckDB backend prioritised, fallback to local item computations)
-  const totalInventoryValue = dbKpis?.totalInventoryValue ?? activeItems.reduce((sum, i) => sum + (i.inventoryValue || (i.onHand * i.salesPrice) || 0), 0);
-  const totalOrdersToPlaceValue = activeItems.reduce((sum, i) => sum + (i.orderNowValue || 0), 0);
-  const totalOrdersToPlaceUnits = activeItems.reduce((sum, i) => sum + (i.orderNow || 0), 0);
-  const stockoutItems = activeItems.filter(i => i.isStockout || i.onHand <= 0);
-  const overstockItems = activeItems.filter(i => i.isOverstock);
-  const totalOverstockValue = dbKpis?.totalOverstockValue ?? activeItems.reduce((sum, i) => sum + (i.overstockValue || 0), 0);
-  const totalWriteOffValue = activeItems.reduce((sum, i) => sum + (i.expectedWriteOffValue || 0), 0);
+  const totalInventoryValue = dashboardSummary?.kpis?.totalInventoryValue ?? dbKpis?.totalInventoryValue ?? activeItems.reduce((sum, i) => sum + (i.inventoryValue || (i.onHand * i.salesPrice) || 0), 0);
+  const totalOrdersToPlaceValue = dashboardSummary?.total_orders_value ?? activeItems.reduce((sum, i) => sum + (i.orderNowValue || 0), 0);
+  const totalOrdersToPlaceUnits = dashboardSummary?.total_orders_units ?? activeItems.reduce((sum, i) => sum + (i.orderNow || 0), 0);
+  const stockoutCount = dashboardSummary?.stockout_count ?? activeItems.filter(i => i.isStockout || i.onHand <= 0).length;
+  const overstockCount = dashboardSummary?.overstock_count ?? activeItems.filter(i => i.isOverstock).length;
+  const totalOverstockValue = dashboardSummary?.total_overstock_value ?? dbKpis?.totalOverstockValue ?? activeItems.reduce((sum, i) => sum + (i.overstockValue || 0), 0);
+  const totalWriteOffValue = dashboardSummary?.total_write_off_value ?? activeItems.reduce((sum, i) => sum + (i.expectedWriteOffValue || 0), 0);
   const avgWmape = activeItems.length > 0 ? (activeItems.reduce((sum, i) => sum + (i.wmape || 0), 0) / activeItems.length) : 0;
-  const avgAccuracy = dbKpis?.overallForecastAccuracy ?? (100 - avgWmape);
-  const avgTurnover = dbKpis?.inventoryTurns ?? (activeItems.length > 0 ? (activeItems.reduce((sum, i) => sum + (i.turnoverRatio || 0), 0) / activeItems.length) : 0);
+  const avgAccuracy = dashboardSummary?.kpis?.overallForecastAccuracy ?? dbKpis?.overallForecastAccuracy ?? (100 - avgWmape);
+  const avgTurnover = dashboardSummary?.kpis?.inventoryTurns ?? dbKpis?.inventoryTurns ?? (activeItems.length > 0 ? (activeItems.reduce((sum, i) => sum + (i.turnoverRatio || 0), 0) / activeItems.length) : 0);
+  const totalActiveSkus = dashboardSummary?.active_skus ?? activeItems.length;
 
   const uniqueLocations = Array.from(new Set(activeItems.map(i => i.location || (isAr ? 'المركز الرئيسي' : 'Main Hub'))));
   const locationCount = uniqueLocations.length || 1;
@@ -138,25 +147,40 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
   const classAVal = classAItems.reduce((sum, i) => sum + (i.inventoryValue || (i.onHand * i.salesPrice) || 0), 0);
   const classBVal = classBItems.reduce((sum, i) => sum + (i.inventoryValue || (i.onHand * i.salesPrice) || 0), 0);
   const classCVal = classCItems.reduce((sum, i) => sum + (i.inventoryValue || (i.onHand * i.salesPrice) || 0), 0);
-  const abcSum = classAVal + classBVal + classCVal;
+  const localAbcSum = classAVal + classBVal + classCVal;
 
-  const abcData = [
+  const localAbcData = [
     { 
-      name: isAr ? `فئة A (${classAItems.length} صنف / ${abcSum > 0 ? Math.round((classAVal / abcSum) * 100) : 0}%)` : `Class A (${classAItems.length} SKUs / ${abcSum > 0 ? Math.round((classAVal / abcSum) * 100) : 0}%)`, 
+      name: isAr ? `فئة A (${classAItems.length} صنف / ${localAbcSum > 0 ? Math.round((classAVal / localAbcSum) * 100) : 0}%)` : `Class A (${classAItems.length} SKUs / ${localAbcSum > 0 ? Math.round((classAVal / localAbcSum) * 100) : 0}%)`, 
       value: Math.round(classAVal), 
       color: '#10B981' 
     },
     { 
-      name: isAr ? `فئة B (${classBItems.length} صنف / ${abcSum > 0 ? Math.round((classBVal / abcSum) * 100) : 0}%)` : `Class B (${classBItems.length} SKUs / ${abcSum > 0 ? Math.round((classBVal / abcSum) * 100) : 0}%)`, 
+      name: isAr ? `فئة B (${classBItems.length} صنف / ${localAbcSum > 0 ? Math.round((classBVal / localAbcSum) * 100) : 0}%)` : `Class B (${classBItems.length} SKUs / ${localAbcSum > 0 ? Math.round((classBVal / localAbcSum) * 100) : 0}%)`, 
       value: Math.round(classBVal), 
       color: '#2196F3' 
     },
     { 
-      name: isAr ? `فئة C (${classCItems.length} صنف / ${abcSum > 0 ? Math.round((classCVal / abcSum) * 100) : 0}%)` : `Class C (${classCItems.length} SKUs / ${abcSum > 0 ? Math.round((classCVal / abcSum) * 100) : 0}%)`, 
+      name: isAr ? `فئة C (${classCItems.length} صنف / ${localAbcSum > 0 ? Math.round((classCVal / localAbcSum) * 100) : 0}%)` : `Class C (${classCItems.length} SKUs / ${localAbcSum > 0 ? Math.round((classCVal / localAbcSum) * 100) : 0}%)`, 
       value: Math.round(classCVal), 
       color: '#94A3B8' 
     },
   ];
+
+  const finalAbcData = useMemo(() => {
+    if (dashboardSummary?.abc_data && dashboardSummary.abc_data.length > 0) {
+      return dashboardSummary.abc_data.map(d => ({
+        name: isAr ? (d.name_ar || d.name) : d.name,
+        value: d.value,
+        color: d.color
+      }));
+    }
+    return localAbcData;
+  }, [dashboardSummary, localAbcData, isAr]);
+
+  const abcSum = useMemo(() => {
+    return finalAbcData.reduce((sum, d) => sum + d.value, 0);
+  }, [finalAbcData]);
 
   // Chart data: Orders by Category
   const categoryOrderMap: Record<string, number> = {};
@@ -166,10 +190,17 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
       categoryOrderMap[cat] = (categoryOrderMap[cat] || 0) + (i.orderNowValue || 0);
     }
   });
-  const categoryOrdersData = Object.entries(categoryOrderMap).map(([name, value]) => ({ 
+  const localCategoryOrdersData = Object.entries(categoryOrderMap).map(([name, value]) => ({ 
     name, 
     value: Math.round(value) 
   }));
+
+  const finalCategoryOrdersData = useMemo(() => {
+    if (dashboardSummary?.category_orders && dashboardSummary.category_orders.length > 0) {
+      return dashboardSummary.category_orders;
+    }
+    return localCategoryOrdersData;
+  }, [dashboardSummary, localCategoryOrdersData]);
 
   const tileLabels: Record<string, string> = {
     inventoryValue: t.dashboard.cards.inventoryValue,
@@ -287,7 +318,7 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
                   {formatCurrency(totalInventoryValue, settings, language)}
                 </span>
                 <div className="text-[12px] text-slate-500 mt-1 flex items-center gap-1.5">
-                  <span className="font-semibold text-slate-700">{activeItems.length} {isAr ? 'صنف' : 'SKUs'}</span> 
+                  <span className="font-semibold text-slate-700">{totalActiveSkus} {isAr ? 'صنف' : 'SKUs'}</span> 
                   <span>{isAr ? `عبر ${locationCount} موقع توزيع` : `across ${locationCount} distribution locations`}</span>
                 </div>
               </div>
@@ -353,10 +384,10 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
               </div>
               <div className="mt-2">
                 <span className="text-2xl font-bold text-rose-600 font-mono">
-                  {stockoutItems.length} {isAr ? 'صنف' : 'SKUs'}
+                  {stockoutCount} {isAr ? 'صنف' : 'SKUs'}
                 </span>
                 <div className="text-[12px] text-rose-700 mt-1 font-semibold">
-                  {stockoutItems.length > 0 
+                  {stockoutCount > 0 
                     ? (isAr ? 'يلزم توريد عاجل لمنع النفاذ' : 'Critical replenishment required')
                     : (isAr ? 'مستويات الأمان مكتملة' : 'Safety stock levels fully met')}
                 </div>
@@ -377,7 +408,7 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
                   {formatCurrency(totalOverstockValue, settings, language)}
                 </div>
                 <span className="text-[11.5px] text-slate-500">
-                  {overstockItems.length} {isAr ? 'أصناف تتجاوز الحد الأقصى' : 'items over max target'}
+                  {overstockCount} {isAr ? 'أصناف تتجاوز الحد الأقصى' : 'items over max target'}
                 </span>
               </div>
               <Package className="w-8 h-8 text-amber-200" />
@@ -428,9 +459,9 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
                 {isAr ? `توزيع ميزانية أوامر الشراء المقترحة حسب المجموعة (${currSymbol})` : `Planned Purchase Order Capital by Category (${currSymbol})`}
               </h3>
               <div className="flex-1 w-full min-h-0">
-                {categoryOrdersData.length > 0 ? (
+                {finalCategoryOrdersData.length > 0 ? (
                   <ResponsiveContainer width="100%" height="100%">
-                    <BarChart data={categoryOrdersData} margin={{ top: 10, right: 20, left: 0, bottom: 5 }}>
+                    <BarChart data={finalCategoryOrdersData} margin={{ top: 10, right: 20, left: 0, bottom: 5 }}>
                       <CartesianGrid stroke="#F1F5F9" vertical={false} />
                       <XAxis dataKey="name" tick={{ fontSize: 10, fill: '#64748B' }} stroke="#CBD5E1" />
                       <YAxis tick={{ fontSize: 10, fill: '#64748B' }} stroke="#CBD5E1" />
@@ -467,7 +498,7 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
                     <ResponsiveContainer width="100%" height="100%">
                       <PieChart>
                         <Pie
-                          data={abcData}
+                          data={finalAbcData}
                           dataKey="value"
                           nameKey="name"
                           cx="50%"
@@ -476,7 +507,7 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
                           outerRadius={85}
                           paddingAngle={3}
                         >
-                          {abcData.map((entry, index) => (
+                          {finalAbcData.map((entry, index) => (
                             <Cell key={`cell-${index}`} fill={entry.color} />
                           ))}
                         </Pie>
@@ -492,7 +523,7 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
                       </PieChart>
                     </ResponsiveContainer>
                     <div className="space-y-1.5 text-[11px] pr-4 shrink-0">
-                      {abcData.map(d => (
+                      {finalAbcData.map(d => (
                         <div key={d.name} className="flex items-center gap-2">
                           <span className="w-2.5 h-2.5 rounded-full shrink-0" style={{ backgroundColor: d.color }} />
                           <span className="text-slate-600 font-medium truncate max-w-[150px]">{d.name}</span>

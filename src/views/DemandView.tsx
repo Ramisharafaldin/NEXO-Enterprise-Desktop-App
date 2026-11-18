@@ -1,7 +1,8 @@
-import React, { useState, useMemo, useRef, useEffect } from 'react';
+import React, { useState, useMemo, useRef, useEffect, useCallback } from 'react';
 import { InventoryItem, ModelType, ReplenishmentStrategy, AppSettings, isAnalyzableItem } from '../engine/types';
 import { translations, Language } from '../i18n/translations';
 import { getCurrencySymbol } from '../utils/formatters';
+import { api } from '../api/client';
 import { 
   ResponsiveContainer, 
   ComposedChart, 
@@ -42,6 +43,7 @@ interface DemandViewProps {
   onOpenSettings?: () => void;
   settings?: AppSettings;
   language: Language;
+  projectId?: string;
 }
 
 export const DemandView: React.FC<DemandViewProps> = ({
@@ -55,6 +57,7 @@ export const DemandView: React.FC<DemandViewProps> = ({
   onOpenSettings,
   settings,
   language,
+  projectId = 'proj_default_retail',
 }) => {
   const t = translations[language];
   const isAr = language === 'ar';
@@ -105,8 +108,57 @@ export const DemandView: React.FC<DemandViewProps> = ({
   // Pane 3 State
   const [inspectorTab, setInspectorTab] = useState<'forecasting' | 'model' | 'inventory' | 'kpis'>('forecasting');
 
+  // Server-side pagination state (capped at 50 rows per page to prevent Edge WebView2 Error code 39)
+  const [page, setPage] = useState(1);
+  const pageSize = 50;
+  const [totalCount, setTotalCount] = useState(0);
+  const [totalPages, setTotalPages] = useState(1);
+  const [paginatedItems, setPaginatedItems] = useState<InventoryItem[]>([]);
+  const [debouncedSearch, setDebouncedSearch] = useState('');
+  const [isLoadingList, setIsLoadingList] = useState(false);
+
+  // Debounce tree search input (300ms)
+  useEffect(() => {
+    const handler = setTimeout(() => {
+      setDebouncedSearch(treeSearch);
+      setPage(1);
+    }, 300);
+    return () => clearTimeout(handler);
+  }, [treeSearch]);
+
+  const fetchDemandPage = useCallback(async () => {
+    if (!projectId) return;
+    setIsLoadingList(true);
+    try {
+      const res = await api.getDemand({
+        projectId,
+        page,
+        pageSize,
+        search: debouncedSearch,
+        includeDormant: false
+      });
+      setPaginatedItems(res.items || []);
+      setTotalCount(res.total_count ?? (res.items || []).length);
+      setTotalPages(res.total_pages ?? Math.max(1, Math.ceil((res.total_count || 1) / pageSize)));
+      if (res.items && res.items.length > 0 && !selectedItem) {
+        onSelectItem(res.items[0]);
+      }
+    } catch (err) {
+      console.warn('Failed to load server-side demand page:', err);
+    } finally {
+      setIsLoadingList(false);
+    }
+  }, [projectId, page, pageSize, debouncedSearch, selectedItem, onSelectItem]);
+
+  useEffect(() => {
+    fetchDemandPage();
+  }, [fetchDemandPage]);
+
   // Strict Defensive Exclusion: Filter out any dormant SKUs (onHand <= 0 && totalSales <= 0)
-  const activeItems = useMemo(() => (items || []).filter(isAnalyzableItem), [items]);
+  const activeItems = useMemo(() => {
+    if (paginatedItems.length > 0) return paginatedItems;
+    return (items || []).filter(isAnalyzableItem).slice(0, 50);
+  }, [paginatedItems, items]);
 
   // Categories group
   const categories = useMemo(() => {
@@ -272,6 +324,30 @@ export const DemandView: React.FC<DemandViewProps> = ({
               </div>
             );
           })}
+        </div>
+
+        {/* Pagination Bar for Demand Tree (50 SKUs / page) */}
+        <div className="p-2 bg-[#F1F5F9] border-t border-[#CBD5E1] flex items-center justify-between text-[10px] text-slate-600 shrink-0">
+          <span className="font-mono font-medium">
+            {isAr ? `صفحة ${page} / ${totalPages}` : `Pg ${page}/${totalPages}`}
+            <span className="text-slate-400 font-normal ml-1">({totalCount || activeItems.length})</span>
+          </span>
+          <div className="flex items-center gap-1">
+            <button
+              onClick={() => setPage(p => Math.max(1, p - 1))}
+              disabled={page <= 1 || isLoadingList}
+              className="px-2 py-0.5 rounded border border-slate-300 bg-white hover:bg-slate-50 disabled:opacity-40 disabled:cursor-not-allowed font-medium text-[10px] cursor-pointer"
+            >
+              {isAr ? 'السابق' : 'Prev'}
+            </button>
+            <button
+              onClick={() => setPage(p => Math.min(totalPages, p + 1))}
+              disabled={page >= totalPages || isLoadingList}
+              className="px-2 py-0.5 rounded border border-slate-300 bg-white hover:bg-slate-50 disabled:opacity-40 disabled:cursor-not-allowed font-medium text-[10px] cursor-pointer"
+            >
+              {isAr ? 'التالي' : 'Next'}
+            </button>
+          </div>
         </div>
 
         {/* Bottom: Filter Box (Radios & Checkboxes) */}

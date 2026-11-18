@@ -238,6 +238,78 @@ export interface ProjectsResponse {
   active_project_id?: string;
 }
 
+export interface PaginatedInventoryResponse {
+  project_id: string;
+  page: number;
+  page_size: number;
+  total_count: number;
+  total_pages: number;
+  summary_counts: {
+    all: number;
+    to_buy: number;
+    stockout_risk: number;
+    overstock: number;
+    in_transit: number;
+  };
+  count: number;
+  dormant_count?: number;
+  excluded_dormant_count?: number;
+  items: InventoryItem[];
+  kpis?: DashboardKpis;
+}
+
+export interface PaginatedDemandResponse {
+  project_id: string;
+  page: number;
+  page_size: number;
+  total_count: number;
+  total_pages: number;
+  count: number;
+  dormant_count?: number;
+  excluded_dormant_count?: number;
+  categories: string[];
+  series: InventoryItem[];
+  items: InventoryItem[];
+}
+
+export interface DashboardSummaryResponse {
+  project_id: string;
+  active_skus: number;
+  dormant_count: number;
+  excluded_dormant_count: number;
+  kpis: DashboardKpis;
+  stockout_count: number;
+  overstock_count: number;
+  total_orders_value: number;
+  total_orders_units: number;
+  total_overstock_value: number;
+  total_write_off_value: number;
+  abc_data: Array<{ class: string; name: string; name_ar: string; count: number; value: number; color: string }>;
+  category_orders: Array<{ name: string; value: number }>;
+  top_risk_items: Array<{
+    id: string;
+    code: string;
+    description: string;
+    category: string;
+    location: string;
+    onHand: number;
+    reorderPoint: number;
+    orderNow: number;
+    orderNowValue: number;
+    daysOfSupply: number;
+  }>;
+  top_overstock_items: Array<{
+    id: string;
+    code: string;
+    description: string;
+    category: string;
+    location: string;
+    onHand: number;
+    overstockValue: number;
+    daysOfSupply: number;
+  }>;
+}
+
 export interface SqlServerConfig {
   server?: string;
   server_host?: string;
@@ -417,6 +489,60 @@ export const api = {
   async getProjectItems(projectId: string, includeDormant: boolean = false): Promise<{ project_id: string; count: number; items: InventoryItem[]; dormant_count?: number; excluded_dormant_count?: number; }> {
     const res = await fetch(`${API_BASE}/projects/${projectId}/items?include_dormant=${includeDormant}`);
     if (!res.ok) throw new Error(`Failed to load items: ${res.statusText}`);
+    return res.json();
+  },
+
+  /**
+   * Paginated Supply Chain Analytical Endpoints
+   */
+  async getInventory(params?: {
+    projectId?: string;
+    page?: number;
+    pageSize?: number;
+    search?: string;
+    filterTab?: string;
+    location?: string;
+    includeDormant?: boolean;
+  }): Promise<PaginatedInventoryResponse> {
+    const q = new URLSearchParams();
+    if (params?.projectId) q.append('project_id', params.projectId);
+    if (params?.page) q.append('page', String(params.page));
+    if (params?.pageSize) q.append('page_size', String(params.pageSize));
+    if (params?.search) q.append('search', params.search);
+    if (params?.filterTab) q.append('filter_tab', params.filterTab);
+    if (params?.location) q.append('location', params.location);
+    if (params?.includeDormant != null) q.append('include_dormant', String(params.includeDormant));
+
+    const res = await fetch(`${API_BASE}/inventory?${q.toString()}`);
+    if (!res.ok) throw new Error(`Failed to load inventory: ${res.statusText}`);
+    return res.json();
+  },
+
+  async getDemand(params?: {
+    projectId?: string;
+    page?: number;
+    pageSize?: number;
+    search?: string;
+    category?: string;
+    includeDormant?: boolean;
+  }): Promise<PaginatedDemandResponse> {
+    const q = new URLSearchParams();
+    if (params?.projectId) q.append('project_id', params.projectId);
+    if (params?.page) q.append('page', String(params.page));
+    if (params?.pageSize) q.append('page_size', String(params.pageSize));
+    if (params?.search) q.append('search', params.search);
+    if (params?.category) q.append('category', params.category);
+    if (params?.includeDormant != null) q.append('include_dormant', String(params.includeDormant));
+
+    const res = await fetch(`${API_BASE}/demand?${q.toString()}`);
+    if (!res.ok) throw new Error(`Failed to load demand: ${res.statusText}`);
+    return res.json();
+  },
+
+  async getDashboard(projectId?: string): Promise<DashboardSummaryResponse> {
+    const url = projectId ? `${API_BASE}/dashboard?project_id=${encodeURIComponent(projectId)}` : `${API_BASE}/dashboard`;
+    const res = await fetch(url);
+    if (!res.ok) throw new Error(`Failed to load dashboard: ${res.statusText}`);
     return res.json();
   },
 

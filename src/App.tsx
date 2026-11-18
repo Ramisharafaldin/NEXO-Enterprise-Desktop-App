@@ -631,6 +631,7 @@ export const App: React.FC = () => {
             selectedItem ? (
               <DemandView
                 items={items}
+                projectId={activeProjectId}
                 selectedItem={selectedItem}
                 onSelectItem={i => setSelectedItemId(i.id)}
                 onModelChange={handleModelChange}
@@ -692,6 +693,7 @@ export const App: React.FC = () => {
           {activeTab === 'dashboard' && (
             <DashboardView
               items={items}
+              projectId={activeProjectId}
               settings={settings}
               language={language}
             />

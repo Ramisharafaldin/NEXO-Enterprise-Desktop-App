@@ -91,6 +91,9 @@ try:
         is_analyzable_sku,
         get_project_dormant_count,
         get_project_items,
+        get_project_items_paginated,
+        get_project_dashboard_summary,
+        get_project_categories,
         get_workspace,
         save_period_override,
         update_item_parameters,
@@ -128,6 +131,9 @@ except (ImportError, ModuleNotFoundError):
         is_analyzable_sku,
         get_project_dormant_count,
         get_project_items,
+        get_project_items_paginated,
+        get_project_dashboard_summary,
+        get_project_categories,
         get_workspace,
         save_period_override,
         update_item_parameters,
@@ -253,10 +259,15 @@ def delete_project_endpoint(project_id: str):
     delete_project_by_id(project_id)
     return {"success": True, "message": f"Project {project_id} deleted"}
 
-# Workspace load endpoint (loads all items, overrides, settings, and filters for project)
+# Workspace load endpoint (loads slim paginated items, overrides, settings, and filters for project)
 @app.get("/api/projects/{project_id}/workspace")
-def get_project_workspace_endpoint(project_id: str, include_dormant: bool = Query(False)):
-    ws = get_workspace(project_id, include_dormant=include_dormant)
+def get_project_workspace_endpoint(
+    project_id: str,
+    include_dormant: bool = Query(False),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(100, ge=1)
+):
+    ws = get_workspace(project_id, include_dormant=include_dormant, page=page, page_size=page_size)
     if not ws["project"]:
         raise HTTPException(status_code=404, detail="Project not found")
     return ws
@@ -325,51 +336,85 @@ def get_items_endpoint(project_id: str, include_dormant: bool = Query(False)):
     }
 
 # ==============================================================================
-# Supply Chain Analytical Endpoints (Strict Zero-Stock & Zero-Sales Exclusion)
+# Supply Chain Analytical Endpoints (Strict Server-Side Pagination & Slim SQL Aggregations)
 # ==============================================================================
 
 @app.get("/api/inventory")
-def get_inventory_endpoint(project_id: Optional[str] = Query(None), include_dormant: bool = Query(False)):
+def get_inventory_endpoint(
+    project_id: Optional[str] = Query(None),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(100, ge=1, le=250),
+    search: str = Query(""),
+    filter_tab: str = Query("all"),
+    location: str = Query(""),
+    include_dormant: bool = Query(False)
+):
     pid = _resolve_project_id(project_id)
-    items = get_project_items(pid, include_dormant=include_dormant)
+    paginated = get_project_items_paginated(
+        project_id=pid,
+        page=page,
+        page_size=page_size,
+        search=search,
+        filter_tab=filter_tab,
+        location=location,
+        include_dormant=include_dormant,
+        include_periods=False
+    )
     dormant_count = get_project_dormant_count(pid)
     kpis = compute_project_kpis(pid)
     return {
         "project_id": pid,
-        "count": len(items),
+        "page": paginated["page"],
+        "page_size": paginated["page_size"],
+        "total_count": paginated["total_count"],
+        "total_pages": paginated["total_pages"],
+        "summary_counts": paginated["summary_counts"],
+        "count": len(paginated["items"]),
         "dormant_count": dormant_count,
         "excluded_dormant_count": dormant_count,
-        "items": items,
+        "items": paginated["items"],
         "kpis": kpis
     }
 
 @app.get("/api/demand")
-def get_demand_endpoint(project_id: Optional[str] = Query(None), include_dormant: bool = Query(False)):
+def get_demand_endpoint(
+    project_id: Optional[str] = Query(None),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(50, ge=1, le=100),
+    search: str = Query(""),
+    category: str = Query(""),
+    include_dormant: bool = Query(False)
+):
     pid = _resolve_project_id(project_id)
-    items = get_project_items(pid, include_dormant=include_dormant)
+    paginated = get_project_items_paginated(
+        project_id=pid,
+        page=page,
+        page_size=page_size,
+        search=search,
+        category=category,
+        include_dormant=include_dormant,
+        include_periods=True
+    )
     dormant_count = get_project_dormant_count(pid)
+    categories = get_project_categories(pid)
     return {
         "project_id": pid,
-        "count": len(items),
+        "page": paginated["page"],
+        "page_size": paginated["page_size"],
+        "total_count": paginated["total_count"],
+        "total_pages": paginated["total_pages"],
+        "count": len(paginated["items"]),
         "dormant_count": dormant_count,
         "excluded_dormant_count": dormant_count,
-        "series": items,
-        "items": items
+        "categories": categories,
+        "series": paginated["items"],
+        "items": paginated["items"]
     }
 
 @app.get("/api/dashboard")
 def get_dashboard_endpoint(project_id: Optional[str] = Query(None)):
     pid = _resolve_project_id(project_id)
-    kpis = compute_project_kpis(pid)
-    dormant_count = get_project_dormant_count(pid)
-    items = get_project_items(pid, include_dormant=False)
-    return {
-        "project_id": pid,
-        "active_skus": len(items),
-        "dormant_count": dormant_count,
-        "excluded_dormant_count": dormant_count,
-        "kpis": kpis
-    }
+    return get_project_dashboard_summary(pid)
 
 @app.get("/api/reports")
 def get_reports_endpoint(project_id: Optional[str] = Query(None)):

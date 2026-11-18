@@ -450,7 +450,94 @@ async def run_tests():
 
         print(f'21. Live Upload & DuckDB Ingestion Progress Polling PASSED (Job {test_job_id} tracked to 100% done)')
 
-        print('\n=== ALL 21 BACKEND & DATA HUB ENDPOINTS TESTED AND VERIFIED 100% OPERATIONAL! ===')
+        # 22. 30,000-SKU Stress Test: Server-Side Pagination & Pre-Aggregated Dashboard (Fix WebView2 Code 39 Crash)
+        stress_pid = "proj_stress_30k"
+        con_stress = get_connection()
+        try:
+            con_stress.execute("DELETE FROM items WHERE project_id = ?", (stress_pid,))
+            con_stress.execute("""
+                INSERT OR REPLACE INTO projects (id, name, dataset_name, sku_count, created_at, updated_at)
+                VALUES (?, 'Stress Test 30k Project', 'stress_30k.csv', 30000, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+            """, (stress_pid,))
+            con_stress.execute(f"""
+                INSERT INTO items (
+                    id, project_id, code, name, category, location, on_hand, safety_stock,
+                    reorder_point, order_now, order_now_value, sales_price, lead_time_days,
+                    abc_class, xyz_class, service_level, model_type, is_stockout, is_overstock,
+                    created_at, updated_at
+                )
+                SELECT 
+                    '{stress_pid}_sku_' || range,
+                    '{stress_pid}',
+                    'SKU_STRESS_' || range,
+                    'Stress Item ' || range,
+                    CASE WHEN range % 3 = 0 THEN 'Electronics' WHEN range % 3 = 1 THEN 'Groceries' ELSE 'Apparel' END,
+                    'Main DC',
+                    CASE WHEN range % 5 = 0 THEN 0.0 ELSE 50.0 + (range % 100) END,
+                    20.0,
+                    30.0,
+                    CASE WHEN range % 5 = 0 THEN 40.0 ELSE 0.0 END,
+                    CASE WHEN range % 5 = 0 THEN 40.0 * 25.0 ELSE 0.0 END,
+                    25.0,
+                    14,
+                    CASE WHEN range % 10 < 2 THEN 'A' WHEN range % 10 < 5 THEN 'B' ELSE 'C' END,
+                    'X',
+                    0.95,
+                    'constant',
+                    (range % 5 = 0),
+                    (range % 20 = 0),
+                    CURRENT_TIMESTAMP,
+                    CURRENT_TIMESTAMP
+                FROM range(1, 30001);
+            """)
+            con_stress.execute("CHECKPOINT")
+        finally:
+            con_stress.close()
+
+        # Test paginated Inventory (100 rows per page)
+        t_inv_start = time.perf_counter()
+        r_inv = await client.get(f'/api/inventory?project_id={stress_pid}&page=1&page_size=100')
+        t_inv_duration = time.perf_counter() - t_inv_start
+        assert r_inv.status_code == 200, f"Paginated inventory failed: {r_inv.text}"
+        inv_json = r_inv.json()
+        assert inv_json['total_count'] == 30000, f"Expected 30000, got {inv_json['total_count']}"
+        assert inv_json['total_pages'] == 300, f"Expected 300 pages, got {inv_json['total_pages']}"
+        assert len(inv_json['items']) == 100, f"Expected 100 items slice, got {len(inv_json['items'])}"
+        assert inv_json['summary_counts']['all'] == 30000, f"Summary counts incorrect: {inv_json['summary_counts']}"
+        assert inv_json['summary_counts']['stockout_risk'] == 6000, f"Expected 6000 stockouts, got {inv_json['summary_counts']['stockout_risk']}"
+        assert t_inv_duration < 0.20, f"Paginated inventory too slow: {t_inv_duration:.3f}s"
+
+        # Test paginated Demand (50 rows per page)
+        t_dem_start = time.perf_counter()
+        r_dem = await client.get(f'/api/demand?project_id={stress_pid}&page=1&page_size=50')
+        t_dem_duration = time.perf_counter() - t_dem_start
+        assert r_dem.status_code == 200, f"Paginated demand failed: {r_dem.text}"
+        dem_json = r_dem.json()
+        assert dem_json['total_count'] == 30000, f"Expected 30000, got {dem_json['total_count']}"
+        assert dem_json['total_pages'] == 600, f"Expected 600 pages, got {dem_json['total_pages']}"
+        assert len(dem_json['series']) == 50, f"Expected 50 series slice, got {len(dem_json['series'])}"
+        assert len(dem_json['categories']) >= 3, f"Expected >= 3 categories, got {len(dem_json['categories'])}"
+        assert t_dem_duration < 0.20, f"Paginated demand too slow: {t_dem_duration:.3f}s"
+
+        # Test pre-aggregated Dashboard (< 100ms, NO raw 30k SKU dump)
+        t_dash_start = time.perf_counter()
+        r_dash = await client.get(f'/api/dashboard?project_id={stress_pid}')
+        t_dash_duration = time.perf_counter() - t_dash_start
+        assert r_dash.status_code == 200, f"Dashboard summary failed: {r_dash.text}"
+        dash_json = r_dash.json()
+        assert dash_json['active_skus'] == 30000, f"Expected 30000 active skus, got {dash_json['active_skus']}"
+        assert dash_json['kpis']['totalInventoryValue'] > 0
+        assert len(dash_json['abc_data']) == 3, f"Expected 3 ABC classes, got {len(dash_json['abc_data'])}"
+        assert len(dash_json['category_orders']) >= 3, f"Expected category orders, got {len(dash_json['category_orders'])}"
+        assert len(dash_json['top_risk_items']) <= 15
+        assert len(dash_json['top_overstock_items']) <= 15
+        assert 'items' not in dash_json, "Raw 30,000 items should NEVER be returned by /api/dashboard"
+        assert len(r_dash.content) < 25000, f"Dashboard response payload too large: {len(r_dash.content)} bytes (should be slim < 25KB)"
+        assert t_dash_duration < 0.15, f"Dashboard summary too slow: {t_dash_duration:.3f}s"
+
+        print(f'22. 30,000-SKU Pagination & Pre-Aggregated Dashboard Stress Test PASSED (Inv: {t_inv_duration*1000:.1f}ms, Dem: {t_dem_duration*1000:.1f}ms, Dash: {t_dash_duration*1000:.1f}ms, Payload: {len(r_dash.content):,} bytes)')
+
+        print('\n=== ALL 22 BACKEND & DATA HUB ENDPOINTS TESTED AND VERIFIED 100% OPERATIONAL! ===')
 
 if __name__ == '__main__':
     asyncio.run(run_tests())

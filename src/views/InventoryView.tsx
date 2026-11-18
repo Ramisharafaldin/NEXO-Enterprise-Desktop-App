@@ -1,4 +1,4 @@
-import React, { useState, useRef, useEffect, useMemo } from 'react';
+import React, { useState, useRef, useEffect, useMemo, useCallback } from 'react';
 import { InventoryItem, ReplenishmentStrategy, AppSettings, isAnalyzableItem } from '../engine/types';
 import { translations, Language } from '../i18n/translations';
 import { formatCurrency, getCurrencySymbol } from '../utils/formatters';
@@ -76,7 +76,81 @@ export const InventoryView: React.FC<InventoryViewProps> = ({
 
   const [activeFilterTab, setActiveFilterTab] = useState<'all' | 'toOrder' | 'stockout' | 'overstock' | 'transition' | string>('all');
   const [searchTerm, setSearchTerm] = useState('');
+  const [debouncedSearch, setDebouncedSearch] = useState('');
   const [showInTransitionOnly, setShowInTransitionOnly] = useState(false);
+
+  // Server-side pagination state (capped at 100 rows per page to prevent Edge WebView2 Error code 39)
+  const [page, setPage] = useState(1);
+  const pageSize = 100;
+  const [totalCount, setTotalCount] = useState(0);
+  const [totalPages, setTotalPages] = useState(1);
+  const [summaryCounts, setSummaryCounts] = useState<{
+    all: number;
+    to_buy: number;
+    stockout_risk: number;
+    overstock: number;
+    in_transit: number;
+  }>({ all: 0, to_buy: 0, stockout_risk: 0, overstock: 0, in_transit: 0 });
+  const [paginatedItems, setPaginatedItems] = useState<InventoryItem[]>([]);
+  const [isLoadingPage, setIsLoadingPage] = useState(false);
+
+  // Debounce search input (300ms)
+  useEffect(() => {
+    const handler = setTimeout(() => {
+      setDebouncedSearch(searchTerm);
+      setPage(1);
+    }, 300);
+    return () => clearTimeout(handler);
+  }, [searchTerm]);
+
+  const handleFilterTabChange = (tab: string) => {
+    setActiveFilterTab(tab);
+    setPage(1);
+  };
+
+  // Fetch paginated inventory slice directly from DuckDB
+  const fetchInventoryPage = useCallback(async () => {
+    setIsLoadingPage(true);
+    try {
+      const res = await api.getInventory({
+        projectId,
+        page,
+        pageSize,
+        search: debouncedSearch,
+        filterTab: activeFilterTab,
+        includeDormant: false
+      });
+      setPaginatedItems(res.items || []);
+      setTotalCount(res.total_count ?? (res.items || []).length);
+      setTotalPages(res.total_pages ?? Math.max(1, Math.ceil((res.total_count || 1) / pageSize)));
+      if (res.summary_counts) {
+        setSummaryCounts(res.summary_counts);
+      }
+    } catch (err) {
+      console.warn('Failed to load server-side paginated inventory, using local slice:', err);
+      const fallbackList = (items || []).filter(isAnalyzableItem);
+      const filtered = fallbackList.filter(item => {
+        const matches = !debouncedSearch ||
+          item.code.toLowerCase().includes(debouncedSearch.toLowerCase()) ||
+          item.description.toLowerCase().includes(debouncedSearch.toLowerCase());
+        if (!matches) return false;
+        if (activeFilterTab === 'toOrder') return (item.orderNow || 0) > 0;
+        if (activeFilterTab === 'stockout') return !!item.isStockout;
+        if (activeFilterTab === 'overstock') return !!item.isOverstock;
+        if (activeFilterTab === 'transition') return (item.onOrder || 0) > 0;
+        return true;
+      });
+      setTotalCount(filtered.length);
+      setTotalPages(Math.max(1, Math.ceil(filtered.length / pageSize)));
+      setPaginatedItems(filtered.slice((page - 1) * pageSize, page * pageSize));
+    } finally {
+      setIsLoadingPage(false);
+    }
+  }, [projectId, page, pageSize, debouncedSearch, activeFilterTab, items]);
+
+  useEffect(() => {
+    fetchInventoryPage();
+  }, [fetchInventoryPage]);
 
   // Saved Filters from DuckDB
   const [savedFilters, setSavedFilters] = useState<SavedFilter[]>([]);
@@ -315,54 +389,54 @@ export const InventoryView: React.FC<InventoryViewProps> = ({
       <div className="flex items-center justify-between px-3 h-8 bg-[#ECEFF1] border-b border-[#CBD5E1] shrink-0 overflow-x-auto">
         <div className="flex items-center gap-1">
           <button
-            onClick={() => setActiveFilterTab('all')}
+            onClick={() => handleFilterTabChange('all')}
             className={`px-3 py-1 rounded-t border-t border-x text-[11px] font-semibold transition cursor-pointer ${
               activeFilterTab === 'all'
                 ? 'bg-white border-[#CBD5E1] border-b-transparent text-[#2196F3] shadow-xs'
                 : 'border-transparent text-slate-600 hover:bg-[#E2E8F0]'
             }`}
           >
-            {t.inventory.filterTabs.all} ({activeItems.length})
+            {t.inventory.filterTabs.all} ({summaryCounts.all || totalCount || activeItems.length})
           </button>
           <button
-            onClick={() => setActiveFilterTab('toOrder')}
+            onClick={() => handleFilterTabChange('toOrder')}
             className={`px-3 py-1 rounded-t border-t border-x text-[11px] font-semibold transition cursor-pointer ${
               activeFilterTab === 'toOrder'
                 ? 'bg-white border-[#CBD5E1] border-b-transparent text-[#2196F3] shadow-xs'
                 : 'border-transparent text-slate-600 hover:bg-[#E2E8F0]'
             }`}
           >
-            {t.inventory.filterTabs.toOrder} ({toOrderCount})
+            {t.inventory.filterTabs.toOrder} ({summaryCounts.to_buy})
           </button>
           <button
-            onClick={() => setActiveFilterTab('stockout')}
+            onClick={() => handleFilterTabChange('stockout')}
             className={`px-3 py-1 rounded-t border-t border-x text-[11px] font-semibold transition cursor-pointer ${
               activeFilterTab === 'stockout'
                 ? 'bg-white border-[#CBD5E1] border-b-transparent text-rose-600 shadow-xs'
                 : 'border-transparent text-slate-600 hover:bg-[#E2E8F0]'
             }`}
           >
-            {t.inventory.filterTabs.stockoutRisk} ({stockoutCount})
+            {t.inventory.filterTabs.stockoutRisk} ({summaryCounts.stockout_risk})
           </button>
           <button
-            onClick={() => setActiveFilterTab('overstock')}
+            onClick={() => handleFilterTabChange('overstock')}
             className={`px-3 py-1 rounded-t border-t border-x text-[11px] font-semibold transition cursor-pointer ${
               activeFilterTab === 'overstock'
                 ? 'bg-white border-[#CBD5E1] border-b-transparent text-amber-600 shadow-xs'
                 : 'border-transparent text-slate-600 hover:bg-[#E2E8F0]'
             }`}
           >
-            {t.inventory.filterTabs.overstocked} ({overstockCount})
+            {t.inventory.filterTabs.overstocked} ({summaryCounts.overstock})
           </button>
           <button
-            onClick={() => setActiveFilterTab('transition')}
+            onClick={() => handleFilterTabChange('transition')}
             className={`px-3 py-1 rounded-t border-t border-x text-[11px] font-semibold transition cursor-pointer ${
               activeFilterTab === 'transition'
                 ? 'bg-white border-[#CBD5E1] border-b-transparent text-emerald-600 shadow-xs'
                 : 'border-transparent text-slate-600 hover:bg-[#E2E8F0]'
             }`}
           >
-            {t.inventory.filterTabs.inTransition} ({transitionCount})
+            {isAr ? 'شحنات بالطريق' : 'In-Transit'} ({summaryCounts.in_transit})
           </button>
 
           {/* Dynamic Saved Filter Tabs */}
@@ -588,7 +662,7 @@ export const InventoryView: React.FC<InventoryViewProps> = ({
             </tr>
           </thead>
           <tbody>
-            {filteredItems.map((item, idx) => {
+            {(paginatedItems.length > 0 ? paginatedItems : filteredItems.slice(0, 100)).map((item, idx) => {
               const isToOrder = (item.orderNow || 0) > 0;
               return (
                 <tr 
@@ -715,6 +789,53 @@ export const InventoryView: React.FC<InventoryViewProps> = ({
             })}
           </tbody>
         </table>
+      </div>
+
+      {/* 4. High-Efficiency Server-Side Pagination Bar */}
+      <div className="h-10 bg-white border-t border-[#CBD5E1] px-4 flex items-center justify-between shrink-0 text-xs text-slate-600">
+        <div className="flex items-center gap-2">
+          <span className="font-semibold text-slate-800">
+            {isAr ? 'عرض' : 'Showing'}
+          </span>
+          <span className="font-mono font-bold text-slate-900">
+            {totalCount === 0 ? 0 : (page - 1) * pageSize + 1} - {Math.min(page * pageSize, totalCount)}
+          </span>
+          <span>{isAr ? 'من أصل' : 'of'}</span>
+          <span className="font-mono font-bold text-[#2196F3]">
+            {totalCount.toLocaleString()}
+          </span>
+          <span>{isAr ? 'صنف نشط' : 'active SKUs'}</span>
+          {isLoadingPage && (
+            <span className="inline-flex items-center gap-1 text-[11px] text-cyan-600 bg-cyan-50 px-2 py-0.5 rounded font-medium">
+              <span className="animate-spin inline-block w-2.5 h-2.5 border-2 border-cyan-500 border-t-transparent rounded-full" />
+              {isAr ? 'جاري التحميل...' : 'Loading...'}
+            </span>
+          )}
+        </div>
+
+        <div className="flex items-center gap-2">
+          <span className="text-[11px] text-slate-500 font-mono">
+            {isAr ? `صفحة ${page} من ${totalPages}` : `Page ${page} of ${totalPages}`}
+          </span>
+
+          <div className="flex items-center gap-1">
+            <button
+              onClick={() => setPage(p => Math.max(1, p - 1))}
+              disabled={page <= 1 || isLoadingPage}
+              className="px-2.5 py-1 rounded border border-[#CBD5E1] bg-white hover:bg-slate-50 disabled:opacity-40 disabled:cursor-not-allowed font-medium text-xs transition cursor-pointer flex items-center gap-1"
+            >
+              {isAr ? 'السابق' : 'Previous'}
+            </button>
+
+            <button
+              onClick={() => setPage(p => Math.min(totalPages, p + 1))}
+              disabled={page >= totalPages || isLoadingPage}
+              className="px-2.5 py-1 rounded border border-[#CBD5E1] bg-white hover:bg-slate-50 disabled:opacity-40 disabled:cursor-not-allowed font-medium text-xs transition cursor-pointer flex items-center gap-1"
+            >
+              {isAr ? 'التالي' : 'Next'}
+            </button>
+          </div>
+        </div>
       </div>
 
       {/* New Filter Builder Modal */}

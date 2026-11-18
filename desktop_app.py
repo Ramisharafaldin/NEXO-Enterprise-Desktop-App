@@ -43,6 +43,12 @@ if sys.platform == "win32" and not getattr(subprocess, "_nexo_silent_patched", F
     subprocess.Popen = _SilentPopen
     subprocess._nexo_silent_patched = True
 
+# 3. Edge WebView2 low-RAM optimization flags (prevents Error code 39 renderer heap exhaustion)
+os.environ.setdefault(
+    "WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS",
+    "--disable-gpu-shader-disk-cache --renderer-process-limit=2 --js-flags=--max-old-space-size=1024"
+)
+
 import time
 import socket
 import logging

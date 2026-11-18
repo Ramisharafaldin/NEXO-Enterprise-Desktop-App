@@ -1003,17 +1003,430 @@ def get_project_items(project_id: str, include_dormant: bool = False) -> List[Di
         finally:
             con.close()
 
-def get_workspace(project_id: str, include_dormant: bool = False) -> Dict[str, Any]:
-    """Loads all items, overrides, settings, and filters for that project, excluding dormant SKUs from analysis."""
+def get_project_categories(project_id: str) -> List[str]:
+    """Returns list of distinct categories for a project."""
+    with _LOCK:
+        con = get_connection()
+        try:
+            rows = con.execute("""
+                SELECT DISTINCT COALESCE(NULLIF(TRIM(category), ''), 'General')
+                FROM items
+                WHERE project_id = ?
+                ORDER BY 1 ASC
+            """, (project_id,)).fetchall()
+            return [r[0] for r in rows if r[0]]
+        finally:
+            con.close()
+
+def get_project_items_paginated(
+    project_id: str,
+    page: int = 1,
+    page_size: int = 100,
+    search: str = "",
+    filter_tab: str = "all",
+    location: str = "",
+    category: str = "",
+    include_dormant: bool = False,
+    include_periods: bool = False
+) -> Dict[str, Any]:
+    """
+    High-performance SQL-paginated SKU query directly on DuckDB.
+    Returns ONLY the requested page slice (max page_size rows, default 100, capped at 250)
+    along with summary_counts and total_count calculated via SQL.
+    Prevents Edge WebView2 Error code 39 heap crashes on large projects.
+    """
+    page = max(1, page)
+    page_size = max(1, min(page_size, 250))
+    offset = (page - 1) * page_size
+
+    with _LOCK:
+        con = get_connection()
+        try:
+            # 1. Base dormant exclusion filter
+            base_where = "i.project_id = ?"
+            base_params: List[Any] = [project_id]
+
+            if not include_dormant:
+                base_where += " AND (COALESCE(i.on_hand, 0) > 0 OR COALESCE(p.total_sales, 0) > 0)"
+
+            # 2. Compute summary_counts across all analyzable items in project via fast SQL
+            summary_query = f"""
+                SELECT
+                    COUNT(*) as count_all,
+                    COUNT(CASE WHEN COALESCE(i.order_now, 0) > 0 THEN 1 END) as count_to_buy,
+                    COUNT(CASE WHEN i.is_stockout = TRUE OR COALESCE(i.on_hand, 0) <= 0 THEN 1 END) as count_stockout,
+                    COUNT(CASE WHEN i.is_overstock = TRUE THEN 1 END) as count_overstock,
+                    COUNT(CASE WHEN COALESCE(i.on_order, 0) > 0 THEN 1 END) as count_in_transit
+                FROM items i
+                LEFT JOIN (
+                    SELECT item_id, COALESCE(SUM(actual), 0.0) as total_sales
+                    FROM periods
+                    WHERE project_id = ?
+                    GROUP BY item_id
+                ) p ON i.id = p.item_id
+                WHERE {base_where}
+            """
+            summary_row = con.execute(summary_query, [project_id] + base_params).fetchone()
+            summary_counts = {
+                "all": int(summary_row[0] or 0) if summary_row else 0,
+                "to_buy": int(summary_row[1] or 0) if summary_row else 0,
+                "stockout_risk": int(summary_row[2] or 0) if summary_row else 0,
+                "overstock": int(summary_row[3] or 0) if summary_row else 0,
+                "in_transit": int(summary_row[4] or 0) if summary_row else 0,
+            }
+
+            # 3. Dynamic filter conditions for the requested view slice
+            filter_clauses = [base_where]
+            filter_params: List[Any] = list(base_params)
+
+            if search and search.strip():
+                s = f"%{search.strip().lower()}%"
+                filter_clauses.append("(LOWER(i.code) LIKE ? OR LOWER(COALESCE(i.description, '')) LIKE ? OR LOWER(COALESCE(i.category, '')) LIKE ? OR LOWER(COALESCE(i.location, '')) LIKE ?)")
+                filter_params.extend([s, s, s, s])
+
+            if location and location.strip():
+                filter_clauses.append("LOWER(TRIM(i.location)) = LOWER(TRIM(?))")
+                filter_params.append(location.strip())
+
+            if category and category.strip():
+                filter_clauses.append("LOWER(TRIM(i.category)) = LOWER(TRIM(?))")
+                filter_params.append(category.strip())
+
+            ft = filter_tab.lower().strip()
+            if ft in ("to_buy", "toorder"):
+                filter_clauses.append("COALESCE(i.order_now, 0) > 0")
+            elif ft in ("stockout_risk", "stockout"):
+                filter_clauses.append("(i.is_stockout = TRUE OR COALESCE(i.on_hand, 0) <= 0)")
+            elif ft == "overstock":
+                filter_clauses.append("i.is_overstock = TRUE")
+            elif ft in ("in_transit", "transition"):
+                filter_clauses.append("COALESCE(i.on_order, 0) > 0")
+
+            full_filter_sql = " AND ".join(filter_clauses)
+
+            # 4. Total count matching current filters
+            count_query = f"""
+                SELECT COUNT(*)
+                FROM items i
+                LEFT JOIN (
+                    SELECT item_id, COALESCE(SUM(actual), 0.0) as total_sales
+                    FROM periods
+                    WHERE project_id = ?
+                    GROUP BY item_id
+                ) p ON i.id = p.item_id
+                WHERE {full_filter_sql}
+            """
+            count_row = con.execute(count_query, [project_id] + filter_params).fetchone()
+            total_count = int(count_row[0] or 0) if count_row else 0
+            total_pages = max(1, math.ceil(total_count / page_size))
+
+            # 5. Fetch ONLY the requested page slice
+            items_query = f"""
+                SELECT i.*, COALESCE(p.total_sales, 0.0) as total_sales
+                FROM items i
+                LEFT JOIN (
+                    SELECT item_id, COALESCE(SUM(actual), 0.0) as total_sales
+                    FROM periods
+                    WHERE project_id = ?
+                    GROUP BY item_id
+                ) p ON i.id = p.item_id
+                WHERE {full_filter_sql}
+                ORDER BY i.code ASC
+                LIMIT ? OFFSET ?
+            """
+            items_df = con.execute(items_query, [project_id] + filter_params + [page_size, offset]).fetchdf()
+
+            if items_df.empty:
+                return {
+                    "items": [],
+                    "total_count": total_count,
+                    "page": page,
+                    "page_size": page_size,
+                    "total_pages": total_pages,
+                    "summary_counts": summary_counts
+                }
+
+            # 6. Fetch periods ONLY for this page's items if requested
+            periods_by_item: Dict[str, List[Dict[str, Any]]] = {}
+            if include_periods:
+                item_ids = [str(x) for x in items_df["id"].tolist()]
+                if item_ids:
+                    placeholders = ",".join(["?"] * len(item_ids))
+                    periods_df = con.execute(f"""
+                        SELECT * FROM periods
+                        WHERE project_id = ? AND item_id IN ({placeholders})
+                        ORDER BY date ASC
+                    """, [project_id] + item_ids).fetchdf()
+
+                    if not periods_df.empty:
+                        for row in periods_df.to_dict(orient="records"):
+                            iid = str(row["item_id"])
+                            if iid not in periods_by_item:
+                                periods_by_item[iid] = []
+                            periods_by_item[iid].append({
+                                "date": str(row["date"]),
+                                "actual": clean_float(row["actual"], 0.0),
+                                "forecast": clean_opt_float(row.get("forecast")),
+                                "model": clean_opt_float(row.get("model")),
+                                "confUpper": clean_opt_float(row.get("conf_upper")),
+                                "confLower": clean_opt_float(row.get("conf_lower")),
+                                "override": clean_opt_float(row.get("override")),
+                                "promotion": clean_float(row.get("promotion"), 0.0)
+                            })
+
+            # Format items
+            res_items = []
+            for item in items_df.to_dict(orient="records"):
+                iid = str(item["id"])
+                tot_sales = clean_float(item.get("total_sales"), 0.0)
+                on_hand = clean_float(item.get("on_hand"), 0.0)
+                is_active = is_analyzable_sku(on_hand, tot_sales)
+
+                item_dict = {
+                    "id": str(item["id"]),
+                    "code": str(item["code"]),
+                    "description": str(item.get("description") or ""),
+                    "category": str(item.get("category") or "General"),
+                    "location": str(item.get("location") or "Default WH"),
+                    "channel": str(item.get("channel") or "Direct"),
+                    "supplier": str(item.get("supplier") or "Default Supplier"),
+                    "dc": str(item["dc"]) if item.get("dc") and pd.notna(item["dc"]) else None,
+                    "bomType": str(item["bom_type"]) if item.get("bom_type") and pd.notna(item["bom_type"]) else None,
+                    "salesPrice": clean_float(item.get("sales_price"), 0.0),
+                    "purchasePrice": clean_float(item.get("purchase_price"), 0.0),
+                    "margin": clean_float(item.get("margin"), 0.0),
+                    "onHand": on_hand,
+                    "onOrder": clean_float(item.get("on_order"), 0.0),
+                    "backorders": clean_float(item.get("backorders"), 0.0),
+                    "leadTimeDays": clean_float(item.get("lead_time_days"), 30.0),
+                    "leadTimeVarianceDays": clean_float(item.get("lead_time_variance_days"), 5.0),
+                    "orderCycleDays": clean_float(item.get("order_cycle_days"), 30.0),
+                    "serviceLevel": clean_float(item.get("service_level"), 0.95),
+                    "minBatch": clean_float(item.get("min_batch"), 1.0),
+                    "batchRounding": clean_float(item.get("batch_rounding"), 1.0),
+                    "shelfLifeDays": clean_opt_float(item.get("shelf_life_days")),
+                    "unitCbm": clean_opt_float(item.get("unit_cbm")),
+                    "unitWeightKg": clean_opt_float(item.get("unit_weight_kg")),
+                    "modelType": str(item.get("model_type") or "auto"),
+                    "replenishmentStrategy": str(item.get("replenishment_strategy") or "periodic"),
+                    "checkState": str(item.get("check_state") or "checked"),
+                    "approvalState": str(item.get("approval_state") or "unapproved"),
+                    "notes": str(item.get("notes") or ""),
+                    "abcClass": str(item.get("abc_class") or "C"),
+                    "xyzClass": str(item.get("xyz_class") or "Y"),
+                    "safetyStock": clean_float(item.get("safety_stock"), 0.0),
+                    "reorderPoint": clean_float(item.get("reorder_point"), 0.0),
+                    "maxInventory": clean_float(item.get("max_inventory"), 0.0),
+                    "orderNow": clean_float(item.get("order_now"), 0.0),
+                    "orderNowValue": clean_float(item.get("order_now_value"), 0.0),
+                    "daysOfSupply": clean_float(item.get("days_of_supply"), 0.0),
+                    "transferQty": clean_float(item.get("transfer_qty"), 0.0),
+                    "transferSource": str(item["transfer_source"]) if item.get("transfer_source") and pd.notna(item["transfer_source"]) else None,
+                    "accuracy": clean_float(item.get("accuracy"), 100.0),
+                    "isStockout": bool(item.get("is_stockout")),
+                    "isOverstock": bool(item.get("is_overstock")),
+                    "totalSales": tot_sales,
+                    "isDormant": not is_active,
+                    "periods": periods_by_item.get(iid, [])
+                }
+                res_items.append(item_dict)
+
+            return {
+                "items": res_items,
+                "total_count": total_count,
+                "page": page,
+                "page_size": page_size,
+                "total_pages": total_pages,
+                "summary_counts": summary_counts
+            }
+        finally:
+            con.close()
+
+def get_project_dashboard_summary(project_id: str) -> Dict[str, Any]:
+    """
+    Returns slim pre-aggregated dashboard KPI cards, ABC distribution, category breakdown,
+    and top risk items directly computed via DuckDB SQL without dumping tens of thousands of SKUs.
+    """
+    with _LOCK:
+        con = get_connection()
+        try:
+            kpis = compute_project_kpis(project_id)
+            dormant_count = get_project_dormant_count(project_id)
+
+            agg_row = con.execute("""
+                SELECT
+                    COUNT(CASE WHEN i.is_stockout = TRUE OR COALESCE(i.on_hand, 0) <= 0 THEN 1 END) as stockout_count,
+                    COUNT(CASE WHEN i.is_overstock = TRUE THEN 1 END) as overstock_count,
+                    COALESCE(SUM(COALESCE(i.order_now_value, i.order_now * i.sales_price, 0.0)), 0.0) as total_orders_value,
+                    COALESCE(SUM(COALESCE(i.order_now, 0.0)), 0.0) as total_orders_units,
+                    COALESCE(SUM(COALESCE(i.overstock_value, 0.0)), 0.0) as total_overstock_value,
+                    COALESCE(SUM(COALESCE(i.expected_write_off_value, 0.0)), 0.0) as total_write_off_value
+                FROM items i
+                LEFT JOIN (
+                    SELECT item_id, COALESCE(SUM(actual), 0.0) as total_sales
+                    FROM periods
+                    WHERE project_id = ?
+                    GROUP BY item_id
+                ) p ON i.id = p.item_id
+                WHERE i.project_id = ?
+                  AND (COALESCE(i.on_hand, 0) > 0 OR COALESCE(p.total_sales, 0) > 0)
+            """, (project_id, project_id)).fetchone()
+
+            stockout_count = int(agg_row[0] or 0) if agg_row else 0
+            overstock_count = int(agg_row[1] or 0) if agg_row else 0
+            total_orders_value = round(float(agg_row[2] or 0.0), 2) if agg_row else 0.0
+            total_orders_units = round(float(agg_row[3] or 0.0), 2) if agg_row else 0.0
+            total_overstock_val = round(float(agg_row[4] or 0.0), 2) if agg_row else 0.0
+            total_write_off_val = round(float(agg_row[5] or 0.0), 2) if agg_row else 0.0
+
+            # ABC Distribution
+            abc_rows = con.execute("""
+                SELECT
+                    UPPER(COALESCE(NULLIF(TRIM(i.abc_class), ''), 'C')) as abc,
+                    COUNT(*) as sku_count,
+                    COALESCE(SUM(i.on_hand * i.sales_price), 0.0) as total_val
+                FROM items i
+                LEFT JOIN (
+                    SELECT item_id, COALESCE(SUM(actual), 0.0) as total_sales
+                    FROM periods
+                    WHERE project_id = ?
+                    GROUP BY item_id
+                ) p ON i.id = p.item_id
+                WHERE i.project_id = ?
+                  AND (COALESCE(i.on_hand, 0) > 0 OR COALESCE(p.total_sales, 0) > 0)
+                GROUP BY UPPER(COALESCE(NULLIF(TRIM(i.abc_class), ''), 'C'))
+            """, (project_id, project_id)).fetchall()
+
+            abc_map = {r[0]: (r[1], float(r[2])) for r in abc_rows}
+            abc_sum = sum(v[1] for v in abc_map.values())
+
+            abc_colors = {'A': '#10B981', 'B': '#2196F3', 'C': '#94A3B8'}
+            abc_data = []
+            for cls in ['A', 'B', 'C']:
+                cnt, val = abc_map.get(cls, (0, 0.0))
+                pct = round((val / abc_sum * 100)) if abc_sum > 0 else 0
+                abc_data.append({
+                    "class": cls,
+                    "name": f"Class {cls} ({cnt} SKUs / {pct}%)",
+                    "name_ar": f"فئة {cls} ({cnt} صنف / {pct}%)",
+                    "count": cnt,
+                    "value": round(val, 2),
+                    "color": abc_colors[cls]
+                })
+
+            # Category Orders Breakdown (Top 10)
+            cat_rows = con.execute("""
+                SELECT
+                    COALESCE(NULLIF(TRIM(i.category), ''), 'General') as cat,
+                    COALESCE(SUM(COALESCE(i.order_now_value, i.order_now * i.sales_price, 0.0)), 0.0) as cat_val
+                FROM items i
+                LEFT JOIN (
+                    SELECT item_id, COALESCE(SUM(actual), 0.0) as total_sales
+                    FROM periods
+                    WHERE project_id = ?
+                    GROUP BY item_id
+                ) p ON i.id = p.item_id
+                WHERE i.project_id = ?
+                  AND (COALESCE(i.on_hand, 0) > 0 OR COALESCE(p.total_sales, 0) > 0)
+                  AND (COALESCE(i.order_now, 0) > 0 OR COALESCE(i.order_now_value, 0) > 0)
+                GROUP BY COALESCE(NULLIF(TRIM(i.category), ''), 'General')
+                ORDER BY cat_val DESC
+                LIMIT 10
+            """, (project_id, project_id)).fetchall()
+
+            category_orders = [{"name": r[0], "value": round(float(r[1]), 2)} for r in cat_rows]
+
+            # Top 15 Stockout Risk Items
+            top_risk_rows = con.execute("""
+                SELECT i.id, i.code, i.description, i.category, i.location, i.on_hand, i.reorder_point,
+                       i.order_now, COALESCE(i.order_now_value, i.order_now * i.sales_price, 0.0) as order_val,
+                       i.days_of_supply
+                FROM items i
+                LEFT JOIN (
+                    SELECT item_id, COALESCE(SUM(actual), 0.0) as total_sales
+                    FROM periods
+                    WHERE project_id = ?
+                    GROUP BY item_id
+                ) p ON i.id = p.item_id
+                WHERE i.project_id = ?
+                  AND (COALESCE(i.on_hand, 0) > 0 OR COALESCE(p.total_sales, 0) > 0)
+                  AND (i.is_stockout = TRUE OR COALESCE(i.on_hand, 0) <= 0)
+                ORDER BY order_val DESC
+                LIMIT 15
+            """, (project_id, project_id)).fetchall()
+            top_risk_items = [{
+                "id": str(r[0]), "code": str(r[1]), "description": str(r[2] or ""),
+                "category": str(r[3] or ""), "location": str(r[4] or ""),
+                "onHand": float(r[5] or 0), "reorderPoint": float(r[6] or 0),
+                "orderNow": float(r[7] or 0), "orderNowValue": round(float(r[8] or 0), 2),
+                "daysOfSupply": round(float(r[9] or 0), 1)
+            } for r in top_risk_rows]
+
+            # Top 15 Overstock Items
+            top_overstock_rows = con.execute("""
+                SELECT i.id, i.code, i.description, i.category, i.location, i.on_hand,
+                       COALESCE(i.overstock_value, 0.0) as over_val, i.days_of_supply
+                FROM items i
+                LEFT JOIN (
+                    SELECT item_id, COALESCE(SUM(actual), 0.0) as total_sales
+                    FROM periods
+                    WHERE project_id = ?
+                    GROUP BY item_id
+                ) p ON i.id = p.item_id
+                WHERE i.project_id = ?
+                  AND (COALESCE(i.on_hand, 0) > 0 OR COALESCE(p.total_sales, 0) > 0)
+                  AND i.is_overstock = TRUE
+                ORDER BY over_val DESC
+                LIMIT 15
+            """, (project_id, project_id)).fetchall()
+            top_overstock_items = [{
+                "id": str(r[0]), "code": str(r[1]), "description": str(r[2] or ""),
+                "category": str(r[3] or ""), "location": str(r[4] or ""),
+                "onHand": float(r[5] or 0), "overstockValue": round(float(r[6] or 0), 2),
+                "daysOfSupply": round(float(r[7] or 0), 1)
+            } for r in top_overstock_rows]
+
+            return {
+                "project_id": project_id,
+                "active_skus": kpis.get("totalSkus", 0),
+                "dormant_count": dormant_count,
+                "excluded_dormant_count": dormant_count,
+                "kpis": kpis,
+                "stockout_count": stockout_count,
+                "overstock_count": overstock_count,
+                "total_orders_value": total_orders_value,
+                "total_orders_units": total_orders_units,
+                "total_overstock_value": total_overstock_val,
+                "total_write_off_value": total_write_off_val,
+                "abc_data": abc_data,
+                "category_orders": category_orders,
+                "top_risk_items": top_risk_items,
+                "top_overstock_items": top_overstock_items
+            }
+        finally:
+            con.close()
+
+def get_workspace(project_id: str, include_dormant: bool = False, page: int = 1, page_size: int = 100) -> Dict[str, Any]:
+    """Loads slim paginated items, overrides, settings, and filters for project, preventing RAM exhaustion."""
     project = get_project_by_id(project_id)
-    items = get_project_items(project_id, include_dormant=include_dormant)
+    paginated = get_project_items_paginated(
+        project_id,
+        page=page,
+        page_size=page_size if page_size > 0 else 100,
+        include_dormant=include_dormant,
+        include_periods=True
+    )
     filters = get_saved_filters_for_project(project_id)
     transitions = get_in_transition_for_project(project_id)
     kpis = compute_project_kpis(project_id)
     dormant_count = get_project_dormant_count(project_id)
     return {
         "project": project,
-        "items": items,
+        "items": paginated["items"],
+        "total_count": paginated["total_count"],
+        "page": paginated["page"],
+        "page_size": paginated["page_size"],
+        "total_pages": paginated["total_pages"],
         "filters": filters,
         "transitions": transitions,
         "kpis": kpis,
