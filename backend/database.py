@@ -10,7 +10,7 @@ import uuid
 import datetime
 import math
 import threading
-from typing import Dict, List, Any, Optional
+from typing import Dict, List, Any, Optional, Tuple
 import duckdb
 import pandas as pd
 

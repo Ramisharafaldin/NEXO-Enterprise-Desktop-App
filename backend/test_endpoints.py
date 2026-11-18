@@ -183,6 +183,12 @@ async def run_tests():
         print(f'16. Lean 7-Column Inventory & Auto-Parameters PASSED (SKU-1001 LeadTime={item_check[1]}, SL={item_check[2]}, Price={item_check[4]})')
 
         # 17. Daily Sales POS Auto-Aggregation & Zero-Overwrite Test
+        con = get_connection()
+        con.execute("DELETE FROM daily_sales WHERE project_id = ? AND item_code = 'SKU-TEST-DAILY'", (pid,))
+        con.execute("DELETE FROM periods WHERE project_id = ? AND item_id IN (SELECT id FROM items WHERE project_id = ? AND code = 'SKU-TEST-DAILY')", (pid, pid))
+        con.execute("DELETE FROM items WHERE project_id = ? AND code = 'SKU-TEST-DAILY'", (pid,))
+        con.close()
+
         daily_sales_df = pd.DataFrame([
             {"كود الصنف": "SKU-TEST-DAILY", "الفرع / المخزن": "Main WH", "تاريخ البيع": "2025-10-01", "الكمية المباعة": 15.0, "قيمة المبيعات": 1500.0},
             {"كود الصنف": "SKU-TEST-DAILY", "الفرع / المخزن": "Main WH", "تاريخ البيع": "2025-10-01 14:30:00", "الكمية المباعة": 25.0, "قيمة المبيعات": 2500.0},
