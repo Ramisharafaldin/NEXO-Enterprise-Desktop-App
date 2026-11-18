@@ -153,6 +153,12 @@ class DesktopApi:
     def set_window(self, window):
         self._window = window
 
+    def restart_app(self):
+        """Cleanly restarts the NEXO desktop application."""
+        logger.info("restart_app called from JS API bridge.")
+        threading.Thread(target=restart_desktop_process, daemon=True).start()
+        return True
+
     def save_file_dialog(self, filename: str, base64_content: str):
         """
         Opens a native Windows Save As dialog and saves binary payload directly to disk.
@@ -187,6 +193,42 @@ class DesktopApi:
             logger.exception(f"Error in save_file_dialog: {e}")
             return None
         return None
+
+def restart_desktop_process():
+    """
+    Safely checkpoints DuckDB, spawns a new detached NEXO process, and exits the current instance.
+    """
+    time.sleep(0.5)
+    try:
+        from backend.database import close_db
+        close_db()
+    except Exception as e:
+        logger.warning(f"Error closing db during restart: {e}")
+
+    vbs_path = os.path.join(WORKSPACE_DIR, "NEXO.vbs")
+    if os.path.exists(vbs_path):
+        cmd = f'ping 127.0.0.1 -n 2 > nul & wscript.exe "{vbs_path}"'
+    else:
+        python_exe = sys.executable
+        app_py = os.path.join(WORKSPACE_DIR, "desktop_app.py")
+        cmd = f'ping 127.0.0.1 -n 2 > nul & "{python_exe}" "{app_py}"'
+
+    import subprocess
+    DETACHED_PROCESS = 0x00000008
+    CREATE_NO_WINDOW = 0x08000000
+    try:
+        subprocess.Popen(
+            cmd,
+            shell=True,
+            cwd=WORKSPACE_DIR,
+            creationflags=DETACHED_PROCESS | CREATE_NO_WINDOW,
+            close_fds=True
+        )
+        logger.info("Spawned detached process to restart NEXO. Terminating current instance.")
+    except Exception as e:
+        logger.error(f"Failed to spawn restart process: {e}")
+    finally:
+        os._exit(0)
 
 def on_closed():
     """Safe shutdown callback: flush DuckDB and terminate process."""

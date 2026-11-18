@@ -4,7 +4,7 @@
  */
 
 import { InventoryItem, DashboardKpis, ModelType, ReplenishmentStrategy, AppSettings } from '../engine/types';
-export type { AppSettings };
+export type { AppSettings, DashboardKpis };
 
 const getApiBase = (): string => {
   if (typeof window !== 'undefined' && window.location.origin.startsWith('http')) {
@@ -17,6 +17,24 @@ const getApiBase = (): string => {
 };
 
 const API_BASE = getApiBase();
+
+export interface UpdateInfo {
+  update_available: boolean;
+  local_sha: string;
+  remote_sha: string;
+  commit_message: string;
+  commit_date: string;
+  files_changed: number;
+  offline: boolean;
+  error?: string;
+}
+
+export interface ApplyUpdateResult {
+  status: string;
+  restart_required: boolean;
+  message: string;
+  log?: string;
+}
 
 export interface ProjectSummary {
   id: string;
@@ -403,8 +421,8 @@ export const api = {
   ): Promise<boolean> {
     const filename = defaultFilename || (
       templateType === 'sales' ? 'NEXO_Sales_Template.xlsx' :
-      templateType === 'inventory' ? 'NEXO_Inventory_Template.xlsx' :
-      'NEXO_InTransit_Template.xlsx'
+        templateType === 'inventory' ? 'NEXO_Inventory_Template.xlsx' :
+          'NEXO_InTransit_Template.xlsx'
     );
     const templateUrl = `${API_BASE}/templates/${templateType}`;
 
@@ -619,6 +637,43 @@ export const api = {
       const err = await res.json().catch(() => ({ detail: res.statusText }));
       throw new Error(err.detail || 'Failed to save settings');
     }
+    return res.json();
+  },
+
+  /**
+   * System & GitHub Auto-Update
+   */
+  async checkUpdate(): Promise<UpdateInfo> {
+    const res = await fetch(`${API_BASE}/system/check-update`);
+    if (!res.ok) throw new Error(`Update check failed: ${res.statusText}`);
+    return res.json();
+  },
+
+  async applyUpdate(): Promise<ApplyUpdateResult> {
+    const res = await fetch(`${API_BASE}/system/apply-update`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({ detail: res.statusText }));
+      throw new Error(err.detail || 'Failed to apply update from GitHub');
+    }
+    return res.json();
+  },
+
+  async restartApp(): Promise<{ status: string; message: string }> {
+    if (typeof window !== 'undefined' && (window as any).pywebview?.api?.restart_app) {
+      try {
+        (window as any).pywebview.api.restart_app();
+      } catch (e) {
+        console.warn('Native restart_app failed, falling back to REST endpoint', e);
+      }
+    }
+    const res = await fetch(`${API_BASE}/system/restart`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+    });
+    if (!res.ok) throw new Error('Failed to restart application');
     return res.json();
   }
 };

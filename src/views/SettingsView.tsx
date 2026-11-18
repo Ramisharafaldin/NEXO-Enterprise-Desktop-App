@@ -22,8 +22,12 @@ import {
   Layers,
   Sparkles,
   Sliders,
-  Percent
+  Percent,
+  Rocket,
+  DownloadCloud,
+  RefreshCw
 } from 'lucide-react';
+import { api, UpdateInfo } from '../api/client';
 
 interface SettingsViewProps {
   settings: AppSettings;
@@ -31,6 +35,7 @@ interface SettingsViewProps {
   onResetSettings: () => Promise<void>;
   language: Language;
   onLanguageChange: (lang: Language) => void;
+  onCheckUpdate?: () => void;
 }
 
 export const SettingsView: React.FC<SettingsViewProps> = ({
@@ -39,6 +44,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
   onResetSettings,
   language,
   onLanguageChange,
+  onCheckUpdate,
 }) => {
   const t = translations[language];
   const isAr = language === 'ar';
@@ -47,6 +53,47 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
   const [formData, setFormData] = useState<AppSettings>(settings);
   const [isSaving, setIsSaving] = useState(false);
   const [toastMessage, setToastMessage] = useState<{ text: string; type: 'success' | 'info' } | null>(null);
+
+  // GitHub Auto-Updater State
+  const [updateInfo, setUpdateInfo] = useState<UpdateInfo | null>(null);
+  const [isCheckingUpdate, setIsCheckingUpdate] = useState(false);
+  const [isApplyingUpdate, setIsApplyingUpdate] = useState(false);
+  const [updateResultStatus, setUpdateResultStatus] = useState<string | null>(null);
+
+  const handleManualCheck = async () => {
+    setIsCheckingUpdate(true);
+    setUpdateResultStatus(null);
+    try {
+      const res = await api.checkUpdate();
+      setUpdateInfo(res);
+      if (!res.update_available) {
+        setUpdateResultStatus('up_to_date');
+      }
+    } catch {
+      setUpdateResultStatus('error');
+    } finally {
+      setIsCheckingUpdate(false);
+    }
+  };
+
+  const handleApplyUpdateFromSettings = async () => {
+    setIsApplyingUpdate(true);
+    setUpdateResultStatus('applying');
+    try {
+      await api.applyUpdate();
+      setUpdateResultStatus('restarting');
+      setTimeout(async () => {
+        try {
+          await api.restartApp();
+        } catch {
+          window.location.reload();
+        }
+      }, 1200);
+    } catch (e: any) {
+      setIsApplyingUpdate(false);
+      alert(`Update failed: ${e.message}`);
+    }
+  };
 
   // Sync draft state if prop settings change externally
   useEffect(() => {
@@ -610,6 +657,117 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                 </div>
               </div>
             </div>
+          </section>
+
+          {/* 5. System & GitHub Auto-Updater Section */}
+          <section className="bg-white rounded-lg border border-[#CBD5E1] p-6 shadow-xs space-y-4">
+            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 border-b border-[#E2E8F0] pb-3">
+              <div className="flex items-center gap-2.5">
+                <div className="p-1.5 rounded bg-blue-50 text-[#2196F3] border border-blue-200">
+                  <Rocket className="w-4 h-4" />
+                </div>
+                <div>
+                  <h3 className="text-sm font-bold text-slate-900">
+                    {isAr ? 'النظام والتحديثات التلقائية (GitHub Auto-Updater)' : 'System & GitHub Auto-Updater'}
+                  </h3>
+                  <p className="text-[11px] text-slate-500">
+                    {isAr ? 'التحقق المباشر من تحديثات المستودع وتثبيت أحدث النسخ وإعادة تشغيل التطبيق بأمان' : 'Direct GitHub sync, automated rebuilds & zero-downtime restarts without touching DuckDB'}
+                  </p>
+                </div>
+              </div>
+
+              <button
+                type="button"
+                onClick={handleManualCheck}
+                disabled={isCheckingUpdate || isApplyingUpdate}
+                className="flex items-center gap-1.5 px-3 py-1.5 bg-[#F1F5F9] hover:bg-[#E2E8F0] text-slate-700 font-semibold rounded text-[11px] border border-[#CBD5E1] shadow-xs transition cursor-pointer disabled:opacity-50 shrink-0"
+              >
+                <RefreshCw className={`w-3.5 h-3.5 text-[#2196F3] ${isCheckingUpdate ? 'animate-spin' : ''}`} />
+                <span>{isCheckingUpdate ? (isAr ? 'جاري الفحص...' : 'Checking...') : (isAr ? 'التحقق من التحديثات الآن' : 'Check for Updates Now')}</span>
+              </button>
+            </div>
+
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-4 text-xs">
+              <div className="p-3.5 bg-[#F8F9FA] rounded border border-[#E2E8F0] space-y-2">
+                <div className="flex items-center justify-between">
+                  <span className="text-slate-500 font-medium">{isAr ? 'المستودع الرسمي' : 'Official Repository'}:</span>
+                  <a 
+                    href="https://github.com/Ramisharafaldin/NEXO-Enterprise-Desktop-App" 
+                    target="_blank" 
+                    rel="noreferrer"
+                    className="font-mono text-[#2196F3] hover:underline flex items-center gap-1 font-semibold text-[11px]"
+                  >
+                    <span>NEXO-Enterprise-Desktop-App</span>
+                  </a>
+                </div>
+
+                <div className="flex items-center justify-between">
+                  <span className="text-slate-500 font-medium">{isAr ? 'الإصدار المثبت محلياً' : 'Local Commit SHA'}:</span>
+                  <span className="font-mono font-bold text-slate-800 bg-white px-2 py-0.5 rounded border border-slate-200">
+                    {updateInfo?.local_sha || 'c9ee199'}
+                  </span>
+                </div>
+
+                <div className="flex items-center justify-between">
+                  <span className="text-slate-500 font-medium">{isAr ? 'أحدث إصدار على GitHub' : 'Remote Commit SHA'}:</span>
+                  <span className="font-mono font-bold text-slate-800 bg-white px-2 py-0.5 rounded border border-slate-200">
+                    {updateInfo?.remote_sha || updateInfo?.local_sha || 'c9ee199'}
+                  </span>
+                </div>
+              </div>
+
+              <div className="p-3.5 bg-[#F8F9FA] rounded border border-[#E2E8F0] flex flex-col justify-between">
+                <div>
+                  <span className="text-[10px] font-bold text-slate-500 uppercase block mb-1">
+                    {isAr ? 'حالة التحديث' : 'Update Status'}
+                  </span>
+                  {updateInfo?.update_available ? (
+                    <div className="space-y-1">
+                      <div className="flex items-center gap-1.5 text-amber-600 font-bold">
+                        <AlertCircle className="w-4 h-4" />
+                        <span>{isAr ? 'يتوفر إصدار جديد جاهز للتثبيت!' : 'New update available to install!'}</span>
+                      </div>
+                      <p className="text-[11px] text-slate-600 font-mono">
+                        {updateInfo.commit_message}
+                      </p>
+                    </div>
+                  ) : updateResultStatus === 'up_to_date' ? (
+                    <div className="flex items-center gap-1.5 text-emerald-600 font-bold">
+                      <CheckCircle2 className="w-4 h-4" />
+                      <span>{isAr ? 'أنت تستخدم أحدث إصدار متوفر.' : 'You are running the latest version.'}</span>
+                    </div>
+                  ) : (
+                    <span className="text-slate-600 font-medium">
+                      {isAr ? 'اضغط على زر التحقق للمزامنة مع GitHub.' : 'Click check button to query GitHub for latest commits.'}
+                    </span>
+                  )}
+                </div>
+
+                {updateInfo?.update_available && (
+                  <button
+                    type="button"
+                    onClick={handleApplyUpdateFromSettings}
+                    disabled={isApplyingUpdate}
+                    className="mt-3 w-full flex items-center justify-center gap-2 py-2 bg-[#2196F3] hover:bg-blue-600 text-white font-bold rounded text-xs shadow-sm transition cursor-pointer disabled:opacity-50"
+                  >
+                    <DownloadCloud className={`w-4 h-4 ${isApplyingUpdate ? 'animate-bounce' : ''}`} />
+                    <span>
+                      {isApplyingUpdate
+                        ? (updateResultStatus === 'restarting'
+                            ? (isAr ? 'جاري إعادة تشغيل NEXO...' : 'Restarting NEXO...')
+                            : (isAr ? 'جاري التحميل والبناء...' : 'Downloading & Rebuilding...'))
+                        : (isAr ? 'تحديث الآن وإعادة التشغيل' : 'Update & Restart Now')}
+                    </span>
+                  </button>
+                )}
+              </div>
+            </div>
+
+            <p className="text-[11px] text-slate-400">
+              {isAr
+                ? 'ملاحظة: عملية التحديث تسحب أحدث التعديلات البرمجية وتعيد بناء واجهة الويب تلقائياً مع الاحتفاظ الكامل ببيانات قاعدة بيانات DuckDB وملفات العمل دون أي مساس.'
+                : 'Note: Updates pull latest code and recompile React bundle while preserving all DuckDB workspace data intact.'}
+            </p>
           </section>
 
           {/* Sticky Bottom Action Strip */}

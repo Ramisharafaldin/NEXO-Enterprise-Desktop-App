@@ -1,21 +1,22 @@
-import React, { useState, useEffect, useCallback, useMemo } from 'react';
+import React, { useState, useEffect, useCallback, useMemo, useRef } from 'react';
 import { TrendingUp } from 'lucide-react';
 import { InventoryItem, ModelType, ReplenishmentStrategy, AppSettings } from './engine/types';
 import { getInitialInventoryItems } from './engine/sampleData';
-import { 
-  autoSelectModel, 
-  fitConstantModel, 
-  fitLinearTrendModel, 
-  fitSeasonalModel, 
-  fitIntermittentModel, 
+import {
+  autoSelectModel,
+  fitConstantModel,
+  fitLinearTrendModel,
+  fitSeasonalModel,
+  fitIntermittentModel,
   calculateItemReplenishment,
   classifyAbcXyz,
-  mean 
+  mean
 } from './engine/math';
 import { Language, translations } from './i18n/translations';
 import { DEFAULT_APP_SETTINGS, formatCurrency, getCurrencySymbol } from './utils/formatters';
 import { NavigationRail, MainTabId } from './components/NavigationRail';
 import { TopMenuBar } from './components/TopMenuBar';
+import { UpdateBanner } from './components/UpdateBanner';
 import { SqlServerModal } from './components/SqlServerModal';
 import { PlannedOrdersModal } from './components/PlannedOrdersModal';
 import { ContainersModal } from './components/ContainersModal';
@@ -40,12 +41,12 @@ export const App: React.FC = () => {
   const [language, setLanguage] = useState<Language>('en');
   const [activeTab, setActiveTab] = useState<MainTabId>('start');
   const [settings, setSettings] = useState<AppSettings>(DEFAULT_APP_SETTINGS);
-  
+
   // Projects & Active Dataset
   const [projects, setProjects] = useState<ProjectSummary[]>([]);
   const [activeProjectId, setActiveProjectId] = useState<string>('proj_default_retail');
   const [activeDataset, setActiveDataset] = useState('Retail Inventory Planning Example monthly.xlsx');
-  
+
   // Core Items State - Initialized immediately with standard benchmark data to prevent blank/null state
   const initialItems = useMemo(() => getInitialInventoryItems(), []);
   const [items, setItems] = useState<InventoryItem[]>(initialItems);
@@ -61,6 +62,14 @@ export const App: React.FC = () => {
   const [isDrpModalOpen, setIsDrpModalOpen] = useState(false);
   const [isBomModalOpen, setIsBomModalOpen] = useState(false);
   const [isAbcModalOpen, setIsAbcModalOpen] = useState(false);
+
+  // GitHub Auto-Updater check trigger
+  const checkUpdateRef = useRef<(() => Promise<void>) | null>(null);
+  const handleTriggerCheckUpdate = useCallback(() => {
+    if (checkUpdateRef.current) {
+      checkUpdateRef.current();
+    }
+  }, []);
 
   // Update HTML direction and language attribute
   useEffect(() => {
@@ -241,12 +250,12 @@ export const App: React.FC = () => {
   const handleOverrideChange = (itemId: string, periodDate: string, val: number | undefined) => {
     setItems(prev => prev.map(item => {
       if (item.id !== itemId) return item;
-      const updatedPeriods = item.periods.map(p => 
+      const updatedPeriods = item.periods.map(p =>
         p.date === periodDate ? { ...p, override: val, forecast: val !== undefined ? val : p.forecast } : p
       );
       const forecastVals = updatedPeriods.filter(p => p.forecast !== undefined).map(p => p.forecast!);
       const metrics = calculateItemReplenishment({ ...item, periods: updatedPeriods }, forecastVals, 30);
-      
+
       const updatedItem = {
         ...item,
         periods: updatedPeriods,
@@ -275,7 +284,7 @@ export const App: React.FC = () => {
     setItems(prev => prev.map(item => {
       if (item.id === itemId) {
         const nextState = item.approvalState === 'approved' ? 'unapproved' : 'approved';
-        api.updateItemParameters(activeProjectId, itemId, { approvalState: nextState }).catch(() => {});
+        api.updateItemParameters(activeProjectId, itemId, { approvalState: nextState }).catch(() => { });
         return {
           ...item,
           approvalState: nextState,
@@ -509,6 +518,12 @@ export const App: React.FC = () => {
 
   return (
     <div className={`h-screen w-screen flex flex-col bg-[#F8F9FA] text-[#1E293B] overflow-hidden ${language === 'ar' ? 'font-arabic' : 'font-sans'}`}>
+      {/* 0. Top GitHub Auto-Update Notification Banner */}
+      <UpdateBanner
+        language={language}
+        onRegisterCheck={fn => { checkUpdateRef.current = fn; }}
+      />
+
       {/* 1. Top Desktop Menu Strip & Action Toolbar */}
       <TopMenuBar
         language={language}
@@ -516,6 +531,7 @@ export const App: React.FC = () => {
         onNewProject={() => setActiveTab('start')}
         onOpenProject={() => setActiveTab('start')}
         onSaveProject={handleSaveProject}
+        onExportExcel={() => api.downloadExcelExport(activeProjectId, activeDataset)}
         onRecalculateAll={handleRecalculateAll}
         onOpenSettings={() => setActiveTab('settings')}
         onOpenDataHub={() => setActiveTab('data-hub')}
@@ -524,6 +540,7 @@ export const App: React.FC = () => {
         onOpenDrpModal={() => setIsDrpModalOpen(true)}
         onOpenBomModal={() => setIsBomModalOpen(true)}
         onOpenAbcModal={() => setIsAbcModalOpen(true)}
+        onCheckUpdate={handleTriggerCheckUpdate}
         activeDataset={activeDataset}
         isServerConnected={isServerConnected}
       />
@@ -642,6 +659,7 @@ export const App: React.FC = () => {
               settings={settings}
               onSaveSettings={handleSaveSettings}
               onResetSettings={handleResetSettings}
+              onCheckUpdate={handleTriggerCheckUpdate}
               language={language}
               onLanguageChange={setLanguage}
             />

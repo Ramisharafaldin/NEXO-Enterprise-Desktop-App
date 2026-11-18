@@ -35,6 +35,7 @@ interface TopMenuBarProps {
   onOpenDrpModal: () => void;
   onOpenBomModal: () => void;
   onOpenAbcModal: () => void;
+  onCheckUpdate?: () => void;
   activeDataset: string;
   isServerConnected: boolean;
 }
@@ -54,6 +55,7 @@ export const TopMenuBar: React.FC<TopMenuBarProps> = ({
   onOpenDrpModal,
   onOpenBomModal,
   onOpenAbcModal,
+  onCheckUpdate,
   activeDataset,
   isServerConnected,
 }) => {
@@ -248,6 +250,19 @@ export const TopMenuBar: React.FC<TopMenuBarProps> = ({
                   </div>
                   <span className="text-[10px] text-slate-400">v2.0</span>
                 </button>
+                <div className="border-t border-[#E2E8F0] my-1" />
+                <button
+                  onClick={() => {
+                    if (onCheckUpdate) onCheckUpdate();
+                    closeMenu();
+                  }}
+                  className="w-full text-left px-3 py-1.5 hover:bg-[#2196F3] hover:text-white flex items-center justify-between cursor-pointer"
+                >
+                  <div className="flex items-center gap-2">
+                    <RefreshCw className="w-3.5 h-3.5 text-[#2196F3]" />
+                    <span>{isAr ? 'التحقق من التحديثات...' : 'Check for Updates...'}</span>
+                  </div>
+                </button>
               </div>
             )}
           </div>
@@ -422,7 +437,19 @@ export const TopMenuBar: React.FC<TopMenuBarProps> = ({
               </div>
             </div>
 
-            <div className="p-3 bg-[#ECEFF1] border-t border-[#CBD5E1] flex justify-end">
+            <div className="p-3 bg-[#ECEFF1] border-t border-[#CBD5E1] flex items-center justify-between">
+              <button
+                type="button"
+                onClick={() => {
+                  setIsAboutModalOpen(false);
+                  if (onCheckUpdate) onCheckUpdate();
+                }}
+                className="flex items-center gap-1.5 px-3 py-1 bg-white border border-[#CBD5E1] hover:bg-slate-100 text-slate-700 font-semibold rounded text-[11px] transition shadow-xs cursor-pointer"
+              >
+                <RefreshCw className="w-3.5 h-3.5 text-[#2196F3]" />
+                <span>{isAr ? 'التحقق من التحديثات' : 'Check for Updates'}</span>
+              </button>
+
               <button
                 onClick={() => setIsAboutModalOpen(false)}
                 className="px-4 py-1 bg-[#2196F3] text-white font-semibold rounded text-[11px] hover:bg-blue-600 transition shadow-xs cursor-pointer"
