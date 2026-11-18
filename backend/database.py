@@ -146,7 +146,30 @@ def init_db():
                     conf_upper DOUBLE DEFAULT 0.0,
                     conf_lower DOUBLE DEFAULT 0.0,
                     override DOUBLE,
-                    promotion DOUBLE DEFAULT 0.0
+                    promotion DOUBLE DEFAULT 0.0,
+                    revenue DOUBLE DEFAULT 0.0
+                )
+            """)
+
+            # Ensure revenue column exists if periods was created earlier
+            existing_p_cols = [c[1].lower() for c in con.execute("PRAGMA table_info('periods')").fetchall()]
+            if "revenue" not in existing_p_cols:
+                try:
+                    con.execute("ALTER TABLE periods ADD COLUMN revenue DOUBLE DEFAULT 0.0")
+                except Exception:
+                    pass
+
+            # Daily sales staging and transactional log (zero detail loss)
+            con.execute("""
+                CREATE TABLE IF NOT EXISTS daily_sales (
+                    id VARCHAR PRIMARY KEY,
+                    project_id VARCHAR NOT NULL,
+                    item_code VARCHAR NOT NULL,
+                    location VARCHAR,
+                    sale_date VARCHAR NOT NULL,
+                    qty_sold DOUBLE DEFAULT 0.0,
+                    revenue DOUBLE DEFAULT 0.0,
+                    created_at VARCHAR
                 )
             """)
 
@@ -1280,6 +1303,43 @@ def get_erp_connection(conn_id: str) -> Optional[Dict[str, Any]]:
         finally:
             con.close()
 
+def record_daily_sales(project_id: str, records: List[Dict[str, Any]]) -> int:
+    """Stores raw daily sales transactions in daily_sales table without loss of transaction detail."""
+    if not records:
+        return 0
+    now_str = datetime.datetime.utcnow().isoformat()
+    inserted = 0
+    with _LOCK:
+        con = get_connection()
+        try:
+            con.execute("""
+                CREATE TABLE IF NOT EXISTS daily_sales (
+                    id VARCHAR PRIMARY KEY,
+                    project_id VARCHAR NOT NULL,
+                    item_code VARCHAR NOT NULL,
+                    location VARCHAR,
+                    sale_date VARCHAR NOT NULL,
+                    qty_sold DOUBLE DEFAULT 0.0,
+                    revenue DOUBLE DEFAULT 0.0,
+                    created_at VARCHAR
+                )
+            """)
+            for r in records:
+                sale_id = f"ds_{uuid.uuid4().hex[:10]}"
+                code = str(r.get("item_code", r.get("code", ""))).strip()
+                loc = str(r.get("location", "Main Warehouse")).strip()
+                date_val = str(r.get("sale_date", r.get("date", ""))).strip()
+                qty = clean_float(r.get("qty_sold", r.get("actual", 0.0)))
+                rev = clean_float(r.get("revenue", 0.0))
+                con.execute("""
+                    INSERT INTO daily_sales (id, project_id, item_code, location, sale_date, qty_sold, revenue, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """, (sale_id, project_id, code, loc, date_val, qty, rev, now_str))
+                inserted += 1
+            return inserted
+        finally:
+            con.close()
+
 def upsert_items_and_periods(
     project_id: str,
     items_data: List[Dict[str, Any]],
@@ -1538,8 +1598,30 @@ def upsert_items_and_periods(
 
             # Ingest periods if provided
             if periods_data:
+                # Pre-aggregate periods_data by (code, date) to sum actuals & revenue across repeated transactions
+                pre_agg_periods: Dict[Tuple[str, str], Dict[str, Any]] = {}
                 for per in periods_data:
-                    code = str(per.get("code", "")).strip()
+                    c = str(per.get("code", "")).strip()
+                    d = str(per.get("date", per.get("period", ""))).strip()
+                    if not c or not d:
+                        continue
+                    key = (c, d)
+                    if key not in pre_agg_periods:
+                        pre_agg_periods[key] = {
+                            "code": c,
+                            "item_id": per.get("item_id"),
+                            "date": d,
+                            "actual": 0.0,
+                            "revenue": 0.0,
+                            "forecast": per.get("forecast"),
+                            "override": per.get("override"),
+                            "promotion": clean_float(per.get("promotion", 0.0))
+                        }
+                    pre_agg_periods[key]["actual"] += clean_float(per.get("actual", per.get("qty_sold", 0.0)))
+                    pre_agg_periods[key]["revenue"] += clean_float(per.get("revenue", 0.0))
+
+                for per in pre_agg_periods.values():
+                    code = per["code"]
                     item_id = per.get("item_id") or existing_items_map.get(code)
                     if not item_id:
                         # Auto-create minimal item for this SKU if missing
@@ -1555,36 +1637,37 @@ def upsert_items_and_periods(
                         else:
                             continue
 
-                    date_str = str(per.get("date", per.get("period", ""))).strip()
-                    if not date_str:
-                        continue
-
-                    actual = clean_float(per.get("actual", per.get("qty_sold", 0.0)))
+                    date_str = per["date"]
+                    actual = per["actual"]
+                    rev_val = per["revenue"]
                     forecast = clean_opt_float(per.get("forecast"))
                     override = clean_opt_float(per.get("override"))
-                    promotion = clean_float(per.get("promotion", 0.0))
+                    promotion = per.get("promotion", 0.0)
 
                     # Check if period exists
                     existing_p = con.execute("SELECT id FROM periods WHERE project_id = ? AND item_id = ? AND date = ?", (project_id, item_id, date_str)).fetchone()
                     if existing_p:
                         con.execute("""
                             UPDATE periods SET
-                                actual = ?, forecast = COALESCE(?, forecast),
-                                override = COALESCE(?, override), promotion = ?
+                                actual = ?,
+                                revenue = ?,
+                                forecast = COALESCE(?, forecast),
+                                override = COALESCE(?, override),
+                                promotion = ?
                             WHERE id = ?
-                        """, (actual, forecast, override, promotion, existing_p[0]))
+                        """, (actual, rev_val, forecast, override, promotion, existing_p[0]))
                     else:
                         pid = f"per_{uuid.uuid4().hex[:10]}"
                         con.execute("""
                             INSERT INTO periods (
                                 id, project_id, item_id, date, actual, forecast, model,
-                                conf_upper, conf_lower, override, promotion
-                            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                conf_upper, conf_lower, override, promotion, revenue
+                            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """, (
                             pid, project_id, item_id, date_str, actual,
                             forecast or actual, forecast or actual,
                             round((forecast or actual) * 1.15), round((forecast or actual) * 0.85),
-                            override, promotion
+                            override, promotion, rev_val
                         ))
                     periods_upserted += 1
 

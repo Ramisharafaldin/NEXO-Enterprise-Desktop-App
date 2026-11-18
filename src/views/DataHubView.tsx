@@ -45,8 +45,8 @@ export const DataHubView: React.FC<DataHubViewProps> = ({
 
   const templateColumns = {
     sales: isAr
-      ? ['كود الصنف', 'الفرع / المخزن', 'الفترة / الشهر', 'الكمية المباعة', 'قيمة المبيعات']
-      : ['CODE', 'LOCA', 'PERIOD', 'QTY_SOLD', 'REVENUE'],
+      ? ['كود الصنف', 'الفرع / المخزن', 'تاريخ البيع', 'الكمية المباعة', 'قيمة المبيعات']
+      : ['CODE', 'LOCA', 'SALE_DATE', 'QTY_SOLD', 'REVENUE'],
     inventory: isAr
       ? ['كود الصنف', 'اسم الصنف', 'القسم / المجموعة', 'الفرع / المخزن', 'الرصيد المتوفر', 'سعر التكلفة', 'المورد']
       : ['CODE', 'DESC', 'CATI', 'LOCA', 'ONHA', 'COST', 'SUPP'],
@@ -178,7 +178,10 @@ export const DataHubView: React.FC<DataHubViewProps> = ({
     purchase_price: ['cost', 'purchase_price', 'unit_cost', 'purchase_cost', 'سعر التكلفة', 'التكلفة', 'سعر الشراء'],
     sales_price: ['price', 'sales_price', 'retail', 'selling_price', 'pric', 'سعر البيع', 'السعر'],
     supplier: ['supplier', 'supp', 'vendor', 'المورد', 'اسم المورد'],
-    period: ['period', 'date', 'month', 'period_date', 'الفترة / الشهر', 'الفترة', 'التاريخ', 'الشهر'],
+    period: [
+      'sale_date', 'date', 'transaction_date', 'period', 'period_date', 'month', 'invoice_date', 'saledate',
+      'تاريخ البيع', 'التاريخ', 'تاريخ الفاتورة', 'الفترة / الشهر', 'الفترة', 'الشهر', 'تاريخ الحركة', 'تاريخ العملية'
+    ],
     qty_sold: ['qty_sold', 'actual', 'sales_qty', 'quantity_sold', 'units_sold', 'الكمية المباعة', 'المبيعات', 'الكمية'],
     revenue: ['revenue', 'sales_value', 'amount', 'total_sales', 'قيمة المبيعات', 'الإيراد', 'المبلغ'],
     order_no: ['order_no', 'order', 'po_number', 'po', 'order_id', 'order_num', 'رقم أمر الشراء / الشحنة', 'رقم أمر الشراء', 'رقم الطلب', 'رقم الشحنة', 'رقم الأمر'],
@@ -216,7 +219,7 @@ export const DataHubView: React.FC<DataHubViewProps> = ({
       // Auto-detect importType if matching specialized template columns
       if (cols.some(c => ['حالة الشحنة', 'STATUS', 'EXPECTED_DATE', 'تاريخ الوصول المتوقع'].includes(c.trim()))) {
         setImportType('in_transit');
-      } else if (cols.some(c => ['الفترة / الشهر', 'PERIOD', 'QTY_SOLD', 'الكمية المباعة'].includes(c.trim()))) {
+      } else if (cols.some(c => ['تاريخ البيع', 'SALE_DATE', 'الفترة / الشهر', 'PERIOD', 'QTY_SOLD', 'الكمية المباعة'].includes(c.trim()))) {
         setImportType('sales');
       } else if (cols.some(c => ['الرصيد المتوفر', 'ONHA', 'مهلة التوريد (يوم)', 'LTIM'].includes(c.trim()))) {
         setImportType('inventory');
@@ -585,7 +588,9 @@ export const DataHubView: React.FC<DataHubViewProps> = ({
                       </span>
                     </div>
                     <p className="text-[11px] text-slate-500 mb-2.5">
-                      {isAr ? 'حركات المبيعات الشهرية أو الدورية لحساب التنبؤ بالطلب' : 'Periodic sales transactions and revenue history'}
+                      {isAr
+                        ? 'حركات المبيعات اليومية أو الشهرية — يدعم النظام تكرار الصنف في نفس اليوم ويقوم بالجمع التلقائي'
+                        : 'Daily or monthly sales transactions — repeated same-day SKU sales are summed automatically'}
                     </p>
                     <div className="flex flex-wrap gap-1">
                       {templateColumns.sales.map((col, idx) => (

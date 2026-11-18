@@ -9,8 +9,10 @@ if repo_dir not in sys.path:
 import asyncio
 import httpx
 from backend.server import app
+from backend.database import init_db
 
 async def run_tests():
+    init_db()
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url='http://test') as client:
         # 1. Health check
@@ -23,7 +25,7 @@ async def run_tests():
         assert r.status_code == 200, f'projects failed: {r.text}'
         projs = r.json()
         assert len(projs) > 0, 'No projects returned'
-        pid = projs[0]['id']
+        pid = next((p['id'] for p in projs if p.get('sku_count', 0) > 0), projs[0]['id'])
         print(f'2. Projects list PASSED ({len(projs)} projects, active: {pid})')
 
         # 3. Workspace load
@@ -180,7 +182,38 @@ async def run_tests():
         assert item_check is not None and item_check[1] > 0 and item_check[2] >= 0.90
         print(f'16. Lean 7-Column Inventory & Auto-Parameters PASSED (SKU-1001 LeadTime={item_check[1]}, SL={item_check[2]}, Price={item_check[4]})')
 
-        print('\n=== ALL 16 BACKEND & DATA HUB ENDPOINTS TESTED AND VERIFIED 100% OPERATIONAL! ===')
+        # 17. Daily Sales POS Auto-Aggregation & Zero-Overwrite Test
+        daily_sales_df = pd.DataFrame([
+            {"كود الصنف": "SKU-TEST-DAILY", "الفرع / المخزن": "Main WH", "تاريخ البيع": "2025-10-01", "الكمية المباعة": 15.0, "قيمة المبيعات": 1500.0},
+            {"كود الصنف": "SKU-TEST-DAILY", "الفرع / المخزن": "Main WH", "تاريخ البيع": "2025-10-01 14:30:00", "الكمية المباعة": 25.0, "قيمة المبيعات": 2500.0},
+            {"كود الصنف": "SKU-TEST-DAILY", "الفرع / المخزن": "Main WH", "تاريخ البيع": "2025-10-02", "الكمية المباعة": 10.0, "قيمة المبيعات": 1000.0},
+        ])
+        sales_buf = io.BytesIO()
+        daily_sales_df.to_excel(sales_buf, index=False)
+        sales_buf.seek(0)
+
+        r_daily_ingest = await client.post(
+            '/api/files/import-typed',
+            files={'file': ('Daily_Sales_Test.xlsx', sales_buf.getvalue(), 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')},
+            data={'import_type': 'sales', 'project_id': pid, 'merge_mode': 'merge'}
+        )
+        assert r_daily_ingest.status_code == 200 and r_daily_ingest.json()['success'] is True
+
+        con = get_connection()
+        p_row = con.execute("""
+            SELECT SUM(actual), SUM(revenue)
+            FROM periods p
+            JOIN items i ON p.item_id = i.id
+            WHERE p.project_id = ? AND i.code = 'SKU-TEST-DAILY' AND p.date = '2025-10'
+        """, (pid,)).fetchone()
+        ds_count = con.execute("SELECT COUNT(*) FROM daily_sales WHERE project_id = ? AND item_code = 'SKU-TEST-DAILY'", (pid,)).fetchone()[0]
+        con.close()
+
+        assert p_row is not None and p_row[0] == 50.0 and p_row[1] == 5000.0, f"Expected 50.0 actual and 5000.0 revenue, got {p_row}"
+        assert ds_count == 3, f"Expected 3 raw daily transactions in daily_sales, got {ds_count}"
+        print(f'17. Daily Sales POS Auto-Aggregation & Zero-Overwrite PASSED (Aggregated Actual={p_row[0]}, Revenue={p_row[1]}, Staged Transactions={ds_count})')
+
+        print('\n=== ALL 17 BACKEND & DATA HUB ENDPOINTS TESTED AND VERIFIED 100% OPERATIONAL! ===')
 
 if __name__ == '__main__':
     asyncio.run(run_tests())

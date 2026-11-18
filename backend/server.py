@@ -43,7 +43,7 @@ import io
 import json
 import uuid
 import datetime
-from typing import Dict, List, Any, Optional
+from typing import Dict, List, Any, Optional, Tuple
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Query, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse, FileResponse
@@ -94,6 +94,7 @@ from database import (
     save_erp_connection,
     get_erp_connections,
     get_erp_connection,
+    record_daily_sales,
     upsert_items_and_periods,
     get_connection,
     _LOCK
@@ -757,9 +758,12 @@ BILINGUAL_MAP: Dict[str, List[str]] = {
     "purchase_price": ["cost", "purchase_price", "unit_cost", "purchase_cost", "سعر التكلفة", "التكلفة", "سعر الشراء"],
     "sales_price": ["price", "sales_price", "retail", "selling_price", "pric", "سعر البيع", "السعر"],
     "supplier": ["supplier", "supp", "vendor", "المورد", "اسم المورد"],
-    "period": ["period", "date", "month", "period_date", "الفترة / الشهر", "الفترة", "التاريخ", "الشهر"],
-    "qty_sold": ["qty_sold", "actual", "sales_qty", "quantity_sold", "units_sold", "الكمية المباعة", "المبيعات", "الكمية"],
-    "revenue": ["revenue", "sales_value", "amount", "total_sales", "قيمة المبيعات", "الإيراد", "المبلغ"],
+    "period": [
+        "sale_date", "date", "transaction_date", "period", "period_date", "month", "invoice_date", "saledate",
+        "تاريخ البيع", "التاريخ", "تاريخ الفاتورة", "الفترة / الشهر", "الفترة", "الشهر", "تاريخ الحركة", "تاريخ العملية"
+    ],
+    "qty_sold": ["qty_sold", "actual", "sales_qty", "quantity_sold", "units_sold", "الكمية المباعة", "المبيعات", "الكمية", "كمية المبيعات"],
+    "revenue": ["revenue", "sales_value", "amount", "total_sales", "قيمة المبيعات", "الإيراد", "المبلغ", "إجمالي المبيعات"],
     "order_no": ["order_no", "order", "po_number", "po", "order_id", "order_num", "رقم أمر الشراء / الشحنة", "رقم أمر الشراء", "رقم الطلب", "رقم الشحنة", "رقم الأمر"],
     "origin": ["origin", "source", "port_of_origin", "from_location", "مكان الشحن", "ميناء الشحن", "المصدر", "من"],
     "destination": ["destination", "dest", "target_wh", "to_location", "الفرع / المخزن", "المستودع المستلم", "الوجهة", "الموقع", "إلى"],
@@ -768,6 +772,70 @@ BILINGUAL_MAP: Dict[str, List[str]] = {
     "status": ["status", "shipment_status", "حالة الشحنة", "الحالة"],
     "quantity": ["quantity", "qty", "units", "shipped_qty", "qty_in_transit", "الكمية في الطريق", "الكمية", "العدد", "عدد الوحدات"]
 }
+
+def normalize_sales_date(raw_val: Any, granularity: str = "monthly") -> Tuple[str, str]:
+    """
+    Parses any raw date / timestamp / Excel serial into:
+    (daily_date_str 'YYYY-MM-DD', normalized_period_str).
+    If granularity is 'daily', normalized_period_str is 'YYYY-MM-DD'.
+    If granularity is 'weekly', normalized_period_str is 'YYYY-Www'.
+    If granularity is 'monthly' (default), normalized_period_str is 'YYYY-MM'.
+    """
+    if pd.isna(raw_val) or raw_val is None or str(raw_val).strip() == "":
+        today_str = datetime.date.today().isoformat()
+        return today_str, today_str[:7]
+
+    val_str = str(raw_val).strip()
+
+    # Check for direct 'YYYY-MM' format (e.g. 2025-10)
+    if len(val_str) == 7 and val_str[4] in ["-", "/"] and val_str[:4].isdigit() and val_str[5:7].isdigit():
+        norm_m = val_str.replace("/", "-")
+        return f"{norm_m}-01", norm_m
+
+    # Check for weekly 'YYYY-Www'
+    if "-W" in val_str.upper() or "/W" in val_str.upper():
+        clean_w = val_str.upper().replace("/", "-")
+        return f"{clean_w[:4]}-01-01", clean_w
+
+    dt = None
+    # Check if Excel serial integer/float
+    if isinstance(raw_val, (int, float)) and not isinstance(raw_val, bool):
+        try:
+            if 30000 <= float(raw_val) <= 60000:
+                dt = pd.to_datetime(raw_val, unit="D", origin="1899-12-30")
+        except Exception:
+            pass
+
+    if dt is None or pd.isna(dt):
+        try:
+            import warnings
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                dt = pd.to_datetime(val_str, errors="coerce")
+        except Exception:
+            pass
+
+    if dt is None or pd.isna(dt):
+        try:
+            import warnings
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                dt = pd.to_datetime(val_str, errors="coerce", dayfirst=True)
+        except Exception:
+            pass
+
+    if dt is not None and pd.notna(dt):
+        daily_str = dt.strftime("%Y-%m-%d")
+        if granularity == "daily":
+            period_str = daily_str
+        elif granularity == "weekly":
+            period_str = f"{dt.year}-W{dt.isocalendar()[1]:02d}"
+        else:
+            period_str = dt.strftime("%Y-%m")
+        return daily_str, period_str
+
+    fallback = val_str[:10].replace("/", "-") if len(val_str) >= 10 else "2025-01-01"
+    return fallback, fallback[:7]
 
 def _match_column(cols: List[str], mapping: Dict[str, str], field: str) -> Optional[str]:
     """Matches field to DataFrame column using explicit mapping or bilingual heuristics."""
@@ -817,24 +885,26 @@ def download_sales_template(lang: Optional[str] = None):
         ws_data.sheet_view.rightToLeft = True
 
     if is_ar:
-        headers = ["كود الصنف", "الفرع / المخزن", "الفترة / الشهر", "الكمية المباعة", "قيمة المبيعات"]
+        headers = ["كود الصنف", "الفرع / المخزن", "تاريخ البيع", "الكمية المباعة", "قيمة المبيعات"]
         sample_rows = [
-            ("SKU-1001", "المستودع الرئيسي", "2025-10", 145, 7250.0),
-            ("SKU-1001", "المستودع الرئيسي", "2025-11", 160, 8000.0),
-            ("SKU-1001", "المستودع الرئيسي", "2025-12", 210, 10500.0),
-            ("SKU-1002", "فرع الرياض", "2025-10", 80, 12000.0),
-            ("SKU-1002", "فرع الرياض", "2025-11", 85, 12750.0),
-            ("SKU-1002", "فرع الرياض", "2025-12", 110, 16500.0),
+            ("SKU-1001", "المستودع الرئيسي", "2025-10-01", 15, 750.0),
+            ("SKU-1001", "المستودع الرئيسي", "2025-10-01", 25, 1250.0), # حركة مبيعات ثانية لنفس الصنف بنفس اليوم (تُجمع تلقائياً)
+            ("SKU-1001", "المستودع الرئيسي", "2025-10-02", 35, 1750.0),
+            ("SKU-1001", "المستودع الرئيسي", "2025-10-03", 40, 2000.0),
+            ("SKU-1002", "فرع الرياض", "2025-10-01", 8, 1200.0),
+            ("SKU-1002", "فرع الرياض", "2025-10-01", 12, 1800.0), # حركة مبيعات ثانية لنفس الصنف بنفس اليوم (تُجمع تلقائياً)
+            ("SKU-1002", "فرع الرياض", "2025-10-02", 20, 3000.0),
         ]
     else:
-        headers = ["CODE", "LOCA", "PERIOD", "QTY_SOLD", "REVENUE"]
+        headers = ["CODE", "LOCA", "SALE_DATE", "QTY_SOLD", "REVENUE"]
         sample_rows = [
-            ("SKU-1001", "WH-MAIN", "2025-10", 145, 7250.0),
-            ("SKU-1001", "WH-MAIN", "2025-11", 160, 8000.0),
-            ("SKU-1001", "WH-MAIN", "2025-12", 210, 10500.0),
-            ("SKU-1002", "WH-EAST", "2025-10", 80, 12000.0),
-            ("SKU-1002", "WH-EAST", "2025-11", 85, 12750.0),
-            ("SKU-1002", "WH-EAST", "2025-12", 110, 16500.0),
+            ("SKU-1001", "WH-MAIN", "2025-10-01", 15, 750.0),
+            ("SKU-1001", "WH-MAIN", "2025-10-01", 25, 1250.0), # Second transaction same day (automatically summed)
+            ("SKU-1001", "WH-MAIN", "2025-10-02", 35, 1750.0),
+            ("SKU-1001", "WH-MAIN", "2025-10-03", 40, 2000.0),
+            ("SKU-1002", "WH-EAST", "2025-10-01", 8, 1200.0),
+            ("SKU-1002", "WH-EAST", "2025-10-01", 12, 1800.0), # Second transaction same day (automatically summed)
+            ("SKU-1002", "WH-EAST", "2025-10-02", 20, 3000.0),
         ]
 
     header_fill = PatternFill(start_color="343D46", end_color="343D46", fill_type="solid")
@@ -879,14 +949,15 @@ def download_sales_template(lang: Optional[str] = None):
             ["الحقل (العمود)", "نوع البيانات", "الوصف والتعليمات التفصيلية"],
             ["كود الصنف", "نص (Text)", "كود الصنف الفريد المطابق لسجل المخزون الأساسي (مثال: SKU-1001)"],
             ["الفرع / المخزن", "نص (Text)", "كود أو اسم المستودع أو الفرع أو موقع البيع (مثال: المستودع الرئيسي)"],
-            ["الفترة / الشهر", "تاريخ YYYY-MM", "الفترة الشهرية للطلب التاريخي بصيغة YYYY-MM (مثال: 2025-11)"],
-            ["الكمية المباعة", "رقم (>= 0)", "إجمالي الكمية الفعلية المباعة خلال الفترة"],
-            ["قيمة المبيعات", "رقم (>= 0)", "إجمالي الإيرادات أو القيمة النقدية للمبيعات خلال الفترة"],
+            ["تاريخ البيع", "تاريخ يومي / شهري", "تاريخ البيع أو الفاتورة بصيغة يومية (YYYY-MM-DD) أو شهرية (YYYY-MM). يدعم تكرار الصنف في نفس اليوم."],
+            ["الكمية المباعة", "رقم (>= 0)", "إجمالي الكمية الفعلية المباعة في الحركة (تُجمع تلقائياً لنفس الصنف واليوم)"],
+            ["قيمة المبيعات", "رقم (>= 0)", "إجمالي الإيرادات أو القيمة النقدية للمبيعات في الحركة (تُجمع تلقائياً)"],
             [""],
             ["ملاحظات هامة للربط الآلي المباشر:"],
-            ["1. يتعرف نظام NEXO تلقائياً وبنسبة 100% على ترويسات الأعمدة باللغة العربية دون الحاجة لأي تعديل."],
-            ["2. يمكنك تعديل أو حذف الأسطر التجريبية وإضافة بيانات أصنافك ومبيعاتك الفعلية."],
-            ["3. احفظ الملف بصيغة Excel (.xlsx) ثم ارفعه مباشرة في شاشة تغذية البيانات (Data Hub)."]
+            ["1. يتعرف نظام NEXO تلقائياً وبنسبة 100% على ترويسات الأعمدة باللغة العربية والإنجليزية دون الحاجة لأي تعديل."],
+            ["2. يدعم النظام تصدير فواتير نقاط البيع (POS/ERP) اليومية مع تكرار الصنف في نفس اليوم، ويقوم بجمع الكميات والقيم آلياً دون استبدال أي صفوف."],
+            ["3. يمكنك تعديل أو حذف الأسطر التجريبية وإضافة بيانات أصنافك ومبيعاتك الفعلية."],
+            ["4. احفظ الملف بصيغة Excel (.xlsx) ثم ارفعه مباشرة في شاشة تغذية البيانات (Data Hub)."]
         ]
         for row_idx, r in enumerate(info_rows, start=1):
             for col_idx, val in enumerate(r, start=1):
@@ -908,14 +979,15 @@ def download_sales_template(lang: Optional[str] = None):
             ["Field (الحقل)", "Format (الصيغة)", "Description (الوصف EN)", "الوصف والتعليمات (AR)"],
             ["CODE", "Text (نص)", "Item SKU identifier matching inventory master", "كود الصنف الفريد المطابق لسجل المخزون"],
             ["LOCA", "Text (نص)", "Warehouse or branch location code (e.g. WH-MAIN)", "كود المستودع أو الفرع أو موقع البيع"],
-            ["PERIOD", "YYYY-MM (تاريخ)", "Period month in YYYY-MM format (e.g. 2025-11)", "تاريخ الفترة الشهرية بصيغة YYYY-MM (مثال: 2025-11)"],
-            ["QTY_SOLD", "Number >= 0 (رقم)", "Actual units sold during the period", "الكمية الفعلية المباعة خلال الفترة"],
-            ["REVENUE", "Number >= 0 (رقم)", "Total sales revenue during the period", "إجمالي قيمة المبيعات أو الإيراد خلال الفترة"],
+            ["SALE_DATE", "Date (Daily/Monthly)", "Transaction date (YYYY-MM-DD or YYYY-MM). Supports repeated same-day rows which are summed automatically.", "تاريخ العملية اليومية أو الشهرية مع دعم التكرار والجمع التلقائي"],
+            ["QTY_SOLD", "Number >= 0 (رقم)", "Actual units sold in the transaction (automatically summed)", "الكمية الفعلية المباعة في الحركة (تُجمع تلقائياً)"],
+            ["REVENUE", "Number >= 0 (رقم)", "Total sales revenue in the transaction (automatically summed)", "إجمالي قيمة المبيعات أو الإيراد في الحركة (تُجمع تلقائياً)"],
             [""],
             ["Important Notes | ملاحظات هامة:"],
-            ["1. Keep the English header codes (CODE, LOCA, PERIOD, QTY_SOLD, REVENUE) in Row 1 for 100% automated ingestion."],
-            ["2. If you use Arabic column headers, the NEXO Smart Mapper will recognize them automatically."],
-            ["3. Blank lines or sample rows can be deleted or overwritten before importing into NEXO."]
+            ["1. Keep the standard header codes (CODE, LOCA, SALE_DATE, QTY_SOLD, REVENUE) in Row 1 for 100% automated ingestion."],
+            ["2. Raw POS/ERP transaction exports with repeated SKU sales on the same date are supported natively and summed automatically."],
+            ["3. If you use Arabic column headers, the NEXO Smart Mapper will recognize them automatically."],
+            ["4. Blank lines or sample rows can be deleted or overwritten before importing into NEXO."]
         ]
         for row_idx, r in enumerate(info_rows, start=1):
             for col_idx, val in enumerate(r, start=1):
@@ -1311,21 +1383,46 @@ async def import_typed_file(
 
     if import_type == "sales":
         # Process as transactional or periodic sales
+        raw_daily_records = []
+        agg_map: Dict[Tuple[str, str, str], Dict[str, float]] = {}
+
         for _, row in df.iterrows():
             code = str(row.get(c_code, "")).strip()
             if not code or code.lower() in ["nan", "none"]:
                 continue
-            period_val = str(row.get(c_period, "2025-01")).strip() if c_period else "2025-01"
-            # Normalize date to YYYY-MM
-            if len(period_val) >= 7 and period_val[4] in ["-", "/"]:
-                period_val = period_val[:7].replace("/", "-")
+            loc_val = str(row.get(c_loc, "Main Warehouse")).strip() if c_loc and pd.notna(row.get(c_loc)) else "Main Warehouse"
+            raw_date = row.get(c_period)
+            daily_date, norm_period = normalize_sales_date(raw_date, granularity="monthly")
+
             qty = float(row.get(c_qty_sold, 0.0)) if c_qty_sold and pd.notna(row.get(c_qty_sold)) else 0.0
             rev = float(row.get(c_revenue, 0.0)) if c_revenue and pd.notna(row.get(c_revenue)) else 0.0
+
+            raw_daily_records.append({
+                "item_code": code,
+                "location": loc_val,
+                "sale_date": daily_date,
+                "qty_sold": qty,
+                "revenue": rev
+            })
+
+            agg_key = (code, loc_val, norm_period)
+            if agg_key not in agg_map:
+                agg_map[agg_key] = {"actual": 0.0, "revenue": 0.0}
+            agg_map[agg_key]["actual"] += qty
+            agg_map[agg_key]["revenue"] += rev
+
+        # Save individual raw daily transactions into DuckDB daily_sales table
+        if raw_daily_records:
+            record_daily_sales(proj_id, raw_daily_records)
+
+        # Convert aggregated totals into periods_data for supply chain planning
+        for (code, loc, norm_period), totals in agg_map.items():
             periods_data.append({
                 "code": code,
-                "date": period_val,
-                "actual": qty,
-                "revenue": rev
+                "location": loc,
+                "date": norm_period,
+                "actual": round(totals["actual"], 4),
+                "revenue": round(totals["revenue"], 2)
             })
     elif import_type == "inventory":
         # Process as inventory master table
@@ -1453,7 +1550,7 @@ async def import_typed_file(
     res = upsert_items_and_periods(proj_id, items_data, periods_data, merge_mode=merge_mode)
 
     # Ingestion Audit Log
-    rows_count = len(items_data) if import_type != "sales" else len(periods_data)
+    rows_count = len(raw_daily_records) if import_type == "sales" else (len(items_data) if import_type != "sales" else len(periods_data))
     add_ingestion_log(
         project_id=proj_id,
         source_type="excel",
