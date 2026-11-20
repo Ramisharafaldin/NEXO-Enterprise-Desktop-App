@@ -15,11 +15,13 @@ import {
 export interface UpdateBannerProps {
   language: Language;
   onRegisterCheck?: (checkFn: () => Promise<void>) => void;
+  appVersion?: string;
 }
 
 export const UpdateBanner: React.FC<UpdateBannerProps> = ({
   language,
   onRegisterCheck,
+  appVersion,
 }) => {
   const isAr = language === 'ar';
 
@@ -29,6 +31,9 @@ export const UpdateBanner: React.FC<UpdateBannerProps> = ({
   const [isDismissed, setIsDismissed] = useState(false);
   const [applyStatus, setApplyStatus] = useState<string | null>(null);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
+
+  const curVer = updateInfo?.current_version || appVersion || 'v0.1.0';
+  const latVer = updateInfo?.latest_version || (updateInfo?.remote_sha ? `v${updateInfo.remote_sha}` : curVer);
 
   const check = useCallback(async (isManual: boolean = false) => {
     setIsChecking(true);
@@ -103,8 +108,8 @@ export const UpdateBanner: React.FC<UpdateBannerProps> = ({
           <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0" />
           <span className="font-semibold">
             {isAr
-              ? `أنت تستخدم أحدث إصدار من NEXO (${updateInfo?.current_version || 'v0.1.0'}). لا توجد تحديثات جديدة.`
-              : `NEXO is up to date (${updateInfo?.current_version || 'v0.1.0'}). No new updates found.`}
+              ? `أنت تستخدم أحدث إصدار من NEXO (${curVer}). لا توجد تحديثات جديدة.`
+              : `NEXO is up to date (${curVer}). No new updates found.`}
           </span>
         </div>
         <button onClick={() => setApplyStatus(null)} className="text-emerald-300 hover:text-white cursor-pointer">
@@ -155,20 +160,21 @@ export const UpdateBanner: React.FC<UpdateBannerProps> = ({
             <div className="p-1 rounded bg-[#2196F3]/20 text-[#00E5FF] border border-[#2196F3]/40">
               <Rocket className="w-4 h-4 animate-bounce" />
             </div>
-            <div className="flex items-center flex-wrap gap-1.5">
+            <div className="flex items-center flex-wrap gap-2">
               <span className="font-bold text-white text-[12px]">
-                {isAr ? 'يتوفر تحديث جديد لتطبيق NEXO' : 'A new update is available for NEXO'}
-              </span>
-              <span className="text-[10px] px-1.5 py-0.5 rounded bg-blue-900/60 text-blue-200 border border-blue-500/40 font-mono">
-                {isAr ? `الإصدار الحالي: ${updateInfo.current_version || 'v0.1.0'}` : `Current: ${updateInfo.current_version || 'v0.1.0'}`}
+                {isAr
+                  ? `يتوفر تحديث جديد: ${curVer} ← ${latVer}`
+                  : `New update available: ${curVer} -> ${latVer}`}
               </span>
               <span className="text-slate-400 mx-1">—</span>
               <span className="text-[#38BDF8] font-medium font-mono text-[11px]">
-                {updateInfo.commit_message || (isAr ? 'تحسينات جديدة على النظام' : 'New enhancements')}
+                {updateInfo.latest_message || updateInfo.commit_message || (isAr ? 'تحسينات جديدة على النظام' : 'New enhancements')}
               </span>
-              <span className="text-[10px] px-1.5 py-0.2 rounded bg-slate-800 text-slate-300 font-mono border border-slate-700">
-                {updateInfo.remote_sha}
-              </span>
+              {updateInfo.remote_sha && (
+                <span className="text-[10px] px-1.5 py-0.2 rounded bg-slate-800 text-slate-300 font-mono border border-slate-700">
+                  {updateInfo.remote_sha}
+                </span>
+              )}
             </div>
           </div>
 

@@ -18,12 +18,14 @@ interface NavigationRailProps {
   activeTab: MainTabId;
   onTabChange: (tab: MainTabId) => void;
   language: Language;
+  appVersion?: string;
 }
 
 export const NavigationRail: React.FC<NavigationRailProps> = ({
   activeTab,
   onTabChange,
   language,
+  appVersion,
 }) => {
   const t = translations[language];
 
@@ -138,7 +140,7 @@ export const NavigationRail: React.FC<NavigationRailProps> = ({
         {/* Semantic Version Badge */}
         <div className="pt-2 pb-1 text-center select-none border-t border-[#3F4954]/40 mt-1">
           <span className="text-[10px] font-mono text-slate-400 font-semibold tracking-wider px-1.5 py-0.5 rounded bg-[#2D353F]">
-            v0.1.0
+            {appVersion || 'v0.1.0'}
           </span>
         </div>
       </div>

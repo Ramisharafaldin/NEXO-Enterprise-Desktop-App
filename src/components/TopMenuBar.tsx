@@ -38,6 +38,7 @@ interface TopMenuBarProps {
   onCheckUpdate?: () => void;
   activeDataset: string;
   isServerConnected: boolean;
+  appVersion?: string;
 }
 
 export const TopMenuBar: React.FC<TopMenuBarProps> = ({
@@ -58,6 +59,7 @@ export const TopMenuBar: React.FC<TopMenuBarProps> = ({
   onCheckUpdate,
   activeDataset,
   isServerConnected,
+  appVersion,
 }) => {
   const t = translations[language];
   const isAr = language === 'ar';
@@ -248,7 +250,7 @@ export const TopMenuBar: React.FC<TopMenuBarProps> = ({
                     <Info className="w-3.5 h-3.5" />
                     <span>{t.menu.about}</span>
                   </div>
-                  <span className="text-[10px] text-slate-400 font-mono">v0.1.0</span>
+                  <span className="text-[10px] text-slate-400 font-mono">{appVersion || 'v0.1.0'}</span>
                 </button>
                 <div className="border-t border-[#E2E8F0] my-1" />
                 <button
@@ -395,7 +397,7 @@ export const TopMenuBar: React.FC<TopMenuBarProps> = ({
                   <h3 className="text-sm font-bold text-slate-900">
                     {isAr ? 'نيكسو بلاتفورم لتخطيط سلاسل الإمداد' : 'NEXO Enterprise Planning Platform'}
                   </h3>
-                  <span className="text-[10px] text-slate-500 font-mono">Version 0.1.0 (Native Desktop)</span>
+                  <span className="text-[10px] text-slate-500 font-mono">Version {appVersion?.replace(/^v/, '') || '0.1.0'} (Native Desktop)</span>
                 </div>
               </div>
               <button

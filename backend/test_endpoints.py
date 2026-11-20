@@ -9,6 +9,7 @@ if repo_dir not in sys.path:
 import asyncio
 import uuid
 import time
+from pathlib import Path
 import httpx
 from backend.server import app
 from backend.database import init_db, get_connection, close_db
@@ -17,10 +18,25 @@ async def run_tests():
     init_db()
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url='http://test') as client:
-        # 1. Health check
+        # 1. Health check & Dynamic Versioning
         r = await client.get('/api/health')
         assert r.status_code == 200, f'health failed: {r.text}'
-        print('1. Health check PASSED:', r.json()['status'])
+        health_json = r.json()
+        assert health_json['status'] == 'online'
+        assert 'version' in health_json, "Expected 'version' in health payload"
+        assert 'current_version' in health_json, "Expected 'current_version' in health payload"
+        v_file = Path(__file__).resolve().parent.parent / "VERSION"
+        expected_v = v_file.read_text(encoding="utf-8").strip() if v_file.exists() else "0.1.0"
+        assert health_json['current_version'] == f"v{expected_v}", f"Expected v{expected_v}, got {health_json['current_version']}"
+
+        # Test OTA system check-update returns dynamic current & latest versions
+        r_upd = await client.get('/api/system/check-update')
+        assert r_upd.status_code == 200, f"check-update failed: {r_upd.text}"
+        upd_json = r_upd.json()
+        assert 'current_version' in upd_json, "Expected current_version in check-update"
+        assert 'latest_version' in upd_json, "Expected latest_version in check-update"
+        assert upd_json['current_version'] == f"v{expected_v}", f"Expected v{expected_v}, got {upd_json['current_version']}"
+        print(f"1. Health check & Dynamic Versioning PASSED: {health_json['status']} ({health_json['current_version']} -> {upd_json['latest_version']})")
 
         # 2. List projects
         r = await client.get('/api/projects')

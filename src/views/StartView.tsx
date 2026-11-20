@@ -33,6 +33,7 @@ interface StartViewProps {
   onSelectProject: (projectId: string, targetTab?: any) => void;
   onRefreshProjects: () => Promise<any> | void;
   onLoadExample: (exampleKey: 'retail' | 'drp' | 'mrp' | 'multichannel' | 'weekly') => void;
+  appVersion?: string;
 }
 
 export const StartView: React.FC<StartViewProps> = ({
@@ -42,6 +43,7 @@ export const StartView: React.FC<StartViewProps> = ({
   onSelectProject,
   onRefreshProjects,
   onLoadExample,
+  appVersion,
 }) => {
   const t = translations[language];
   const isAr = language === 'ar';
@@ -314,7 +316,7 @@ export const StartView: React.FC<StartViewProps> = ({
                     Enterprise Full-Stack
                   </span>
                   <span className="text-[11px] font-bold font-mono bg-slate-100 text-slate-700 px-2 py-0.5 rounded border border-slate-300 ml-1">
-                    v0.1.0
+                    {appVersion || 'v0.1.0'}
                   </span>
                 </div>
                 <p className="text-slate-500 text-[13px] mt-1 font-medium">

@@ -36,11 +36,13 @@ import { DataHubView } from './views/DataHubView';
 
 import { api, ProjectSummary } from './api/client';
 import * as XLSX from 'xlsx';
+import packageJson from '../package.json';
 
 export const App: React.FC = () => {
   const [language, setLanguage] = useState<Language>('en');
   const [activeTab, setActiveTab] = useState<MainTabId>('start');
   const [settings, setSettings] = useState<AppSettings>(DEFAULT_APP_SETTINGS);
+  const [appVersion, setAppVersion] = useState<string>(packageJson.version ? `v${packageJson.version}` : 'v0.1.0');
 
   // Projects & Active Dataset
   const [projects, setProjects] = useState<ProjectSummary[]>([]);
@@ -149,6 +151,12 @@ export const App: React.FC = () => {
 
   // Initial load
   useEffect(() => {
+    api.checkHealth().then(health => {
+      if (health?.current_version || health?.version) {
+        setAppVersion(health.current_version || health.version!);
+      }
+    }).catch(() => {});
+
     api.getSettings().then(saved => {
       if (saved) {
         setSettings(saved);
@@ -567,6 +575,7 @@ export const App: React.FC = () => {
       <UpdateBanner
         language={language}
         onRegisterCheck={fn => { checkUpdateRef.current = fn; }}
+        appVersion={appVersion}
       />
 
       {/* 1. Top Desktop Menu Strip & Action Toolbar */}
@@ -588,6 +597,7 @@ export const App: React.FC = () => {
         onCheckUpdate={handleTriggerCheckUpdate}
         activeDataset={activeDataset}
         isServerConnected={isServerConnected}
+        appVersion={appVersion}
       />
 
       {/* 2. Main Workspace Body with Slim Navigation Rail */}
@@ -597,6 +607,7 @@ export const App: React.FC = () => {
           activeTab={activeTab}
           onTabChange={setActiveTab}
           language={language}
+          appVersion={appVersion}
         />
 
         {/* Dynamic Canvas Views */}
@@ -614,6 +625,7 @@ export const App: React.FC = () => {
               }}
               onRefreshProjects={refreshProjects}
               onLoadExample={handleLoadExample}
+              appVersion={appVersion}
             />
           )}
 
@@ -715,6 +727,7 @@ export const App: React.FC = () => {
               onCheckUpdate={handleTriggerCheckUpdate}
               language={language}
               onLanguageChange={setLanguage}
+              appVersion={appVersion}
             />
           )}
 

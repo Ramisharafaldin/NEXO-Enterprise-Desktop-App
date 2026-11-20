@@ -49,6 +49,7 @@ import datetime
 import tempfile
 import shutil
 import csv
+from pathlib import Path
 from python_calamine import CalamineWorkbook
 from typing import Dict, List, Any, Optional, Tuple
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Query, Response
@@ -69,12 +70,17 @@ import time
 REPO_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 SUBPROCESS_FLAGS = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
 
-VERSION_FILE = os.path.join(REPO_DIR, "VERSION")
-if os.path.exists(VERSION_FILE):
-    with open(VERSION_FILE, "r", encoding="utf-8") as _vf:
-        APP_VERSION = _vf.read().strip() or "0.1.0"
-else:
-    APP_VERSION = "0.1.0"
+def get_app_version() -> str:
+    """Reads current application version dynamically from VERSION file on disk."""
+    try:
+        vf = Path(__file__).resolve().parent.parent / "VERSION"
+        if vf.exists():
+            return vf.read_text(encoding="utf-8").strip() or "0.1.0"
+    except Exception:
+        pass
+    return "0.1.0"
+
+APP_VERSION = get_app_version()
 
 try:
     from backend.database import (
@@ -194,15 +200,18 @@ def health_check():
     drivers = pyodbc.drivers()
     # Calculate global dormant SKU count across active projects
     try:
-        projs = list_projects()
-        active_pid = next((p["id"] for p in projs if p.get("sku_count", 0) > 0), (projs[0]["id"] if projs else None))
+        active_pid = get_active_project_id()
         dormant_cnt = get_project_dormant_count(active_pid) if active_pid else 0
     except Exception:
         dormant_cnt = 0
 
+    ver = get_app_version()
+
     return {
         "status": "online",
         "app": "NEXO Enterprise Supply Chain Planning",
+        "version": f"v{ver}",
+        "current_version": f"v{ver}",
         "duckdb_version": duckdb.__version__,
         "python_version": sys.version.split()[0],
         "installed_odbc_drivers": drivers,
@@ -2959,14 +2968,30 @@ def _perform_delayed_restart():
 def check_github_update():
     """
     Checks GitHub for new commits on main.
-    1. Runs git fetch origin main safely with a timeout.
-    2. Compares local HEAD SHA with origin/main SHA.
-    3. Falls back to GitHub Public REST API if git remote is unreachable.
+    1. Runs git fetch origin main safely with a timeout and SUBPROCESS_FLAGS.
+    2. Reads remote version from origin/main:VERSION.
+    3. Compares local HEAD SHA with origin/main SHA.
     """
+    local_ver = get_app_version()
+    remote_ver = local_ver
+    commits_behind = 0
     local_sha = ""
+    remote_sha = ""
+    commit_msg = "Current local version"
+    commit_date = ""
+    changed_files = 0
+    is_available = False
+
     # 1. Get local HEAD SHA
     try:
-        res = subprocess.run(["git", "rev-parse", "HEAD"], cwd=REPO_DIR, capture_output=True, text=True, timeout=4)
+        res = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=REPO_DIR,
+            capture_output=True,
+            text=True,
+            timeout=4,
+            creationflags=SUBPROCESS_FLAGS
+        )
         if res.returncode == 0:
             local_sha = res.stdout.strip()
     except Exception:
@@ -2975,7 +3000,14 @@ def check_github_update():
     # 2. Try git fetch origin main
     git_fetch_ok = False
     try:
-        fetch_res = subprocess.run(["git", "fetch", "origin", "main"], cwd=REPO_DIR, capture_output=True, text=True, timeout=8)
+        fetch_res = subprocess.run(
+            ["git", "fetch", "origin", "main"],
+            cwd=REPO_DIR,
+            capture_output=True,
+            text=True,
+            timeout=8,
+            creationflags=SUBPROCESS_FLAGS
+        )
         if fetch_res.returncode == 0:
             git_fetch_ok = True
     except Exception:
@@ -2983,25 +3015,81 @@ def check_github_update():
 
     if git_fetch_ok:
         try:
-            remote_res = subprocess.run(["git", "rev-parse", "origin/main"], cwd=REPO_DIR, capture_output=True, text=True, timeout=4)
+            remote_res = subprocess.run(
+                ["git", "rev-parse", "origin/main"],
+                cwd=REPO_DIR,
+                capture_output=True,
+                text=True,
+                timeout=4,
+                creationflags=SUBPROCESS_FLAGS
+            )
             remote_sha = remote_res.stdout.strip()
 
-            msg_res = subprocess.run(["git", "log", "-1", "--pretty=%s", "origin/main"], cwd=REPO_DIR, capture_output=True, text=True, timeout=4)
+            # Read remote VERSION file directly from git show origin/main:VERSION
+            v_res = subprocess.run(
+                ["git", "show", "origin/main:VERSION"],
+                cwd=REPO_DIR,
+                capture_output=True,
+                text=True,
+                timeout=4,
+                creationflags=SUBPROCESS_FLAGS
+            )
+            if v_res.returncode == 0 and v_res.stdout.strip():
+                remote_ver = v_res.stdout.strip().lstrip("v")
+
+            msg_res = subprocess.run(
+                ["git", "log", "-1", "--pretty=%s", "origin/main"],
+                cwd=REPO_DIR,
+                capture_output=True,
+                text=True,
+                timeout=4,
+                creationflags=SUBPROCESS_FLAGS
+            )
             commit_msg = msg_res.stdout.strip() if msg_res.returncode == 0 else "Latest improvements"
 
-            date_res = subprocess.run(["git", "log", "-1", "--pretty=%cd", "--date=short", "origin/main"], cwd=REPO_DIR, capture_output=True, text=True, timeout=4)
+            date_res = subprocess.run(
+                ["git", "log", "-1", "--pretty=%cd", "--date=short", "origin/main"],
+                cwd=REPO_DIR,
+                capture_output=True,
+                text=True,
+                timeout=4,
+                creationflags=SUBPROCESS_FLAGS
+            )
             commit_date = date_res.stdout.strip() if date_res.returncode == 0 else ""
 
-            diff_res = subprocess.run(["git", "diff", "--name-only", "HEAD", "origin/main"], cwd=REPO_DIR, capture_output=True, text=True, timeout=4)
+            diff_res = subprocess.run(
+                ["git", "diff", "--name-only", "HEAD", "origin/main"],
+                cwd=REPO_DIR,
+                capture_output=True,
+                text=True,
+                timeout=4,
+                creationflags=SUBPROCESS_FLAGS
+            )
             changed_files = len([f for f in diff_res.stdout.splitlines() if f.strip()]) if diff_res.returncode == 0 else 0
+
+            # Count commits behind
+            count_res = subprocess.run(
+                ["git", "rev-list", "--count", "HEAD..origin/main"],
+                cwd=REPO_DIR,
+                capture_output=True,
+                text=True,
+                timeout=4,
+                creationflags=SUBPROCESS_FLAGS
+            )
+            if count_res.returncode == 0 and count_res.stdout.strip().isdigit():
+                commits_behind = int(count_res.stdout.strip())
 
             is_available = bool(local_sha and remote_sha and local_sha != remote_sha)
 
             return {
                 "update_available": is_available,
+                "current_version": f"v{local_ver}",
+                "latest_version": f"v{remote_ver}",
+                "commits_behind": commits_behind,
+                "latest_message": commit_msg,
+                "commit_message": commit_msg,
                 "local_sha": local_sha[:7] if local_sha else "c9ee199",
                 "remote_sha": remote_sha[:7] if remote_sha else "",
-                "commit_message": commit_msg,
                 "commit_date": commit_date,
                 "files_changed": changed_files,
                 "offline": False
@@ -3009,7 +3097,7 @@ def check_github_update():
         except Exception:
             pass
 
-    # Fallback to GitHub REST API
+    # Fallback to GitHub REST API if git remote unreachable
     try:
         api_url = "https://api.github.com/repos/Ramisharafaldin/NEXO-Enterprise-Desktop-App/commits/main"
         req = urllib.request.Request(api_url, headers={"User-Agent": "NEXO-Updater", "Accept": "application/vnd.github.v3+json"})
@@ -3020,11 +3108,26 @@ def check_github_update():
                 commit_msg = data.get("commit", {}).get("message", "").split("\n")[0]
                 commit_date = data.get("commit", {}).get("author", {}).get("date", "")[:10]
                 is_available = bool(local_sha and remote_sha and local_sha[:7] != remote_sha[:7])
+
+                # Fetch raw VERSION file from GitHub if possible
+                try:
+                    raw_v_url = "https://raw.githubusercontent.com/Ramisharafaldin/NEXO-Enterprise-Desktop-App/main/VERSION"
+                    v_req = urllib.request.Request(raw_v_url, headers={"User-Agent": "NEXO-Updater"})
+                    with urllib.request.urlopen(v_req, timeout=3) as v_resp:
+                        if v_resp.status == 200:
+                            remote_ver = v_resp.read().decode("utf-8").strip().lstrip("v")
+                except Exception:
+                    pass
+
                 return {
                     "update_available": is_available,
+                    "current_version": f"v{local_ver}",
+                    "latest_version": f"v{remote_ver}",
+                    "commits_behind": 1 if is_available else 0,
+                    "latest_message": commit_msg,
+                    "commit_message": commit_msg,
                     "local_sha": local_sha[:7] if local_sha else "c9ee199",
                     "remote_sha": remote_sha[:7],
-                    "commit_message": commit_msg,
                     "commit_date": commit_date,
                     "files_changed": 1,
                     "offline": False
@@ -3033,9 +3136,15 @@ def check_github_update():
         pass
 
     # Offline / Local fallback
-    commit_msg = "Current local version"
     try:
-        msg_res = subprocess.run(["git", "log", "-1", "--pretty=%s", "HEAD"], cwd=REPO_DIR, capture_output=True, text=True, timeout=3)
+        msg_res = subprocess.run(
+            ["git", "log", "-1", "--pretty=%s", "HEAD"],
+            cwd=REPO_DIR,
+            capture_output=True,
+            text=True,
+            timeout=3,
+            creationflags=SUBPROCESS_FLAGS
+        )
         if msg_res.returncode == 0 and msg_res.stdout.strip():
             commit_msg = msg_res.stdout.strip()
     except Exception:
@@ -3043,9 +3152,13 @@ def check_github_update():
 
     return {
         "update_available": False,
+        "current_version": f"v{local_ver}",
+        "latest_version": f"v{local_ver}",
+        "commits_behind": 0,
+        "latest_message": commit_msg,
+        "commit_message": commit_msg,
         "local_sha": local_sha[:7] if local_sha else "c9ee199",
         "remote_sha": local_sha[:7] if local_sha else "c9ee199",
-        "commit_message": commit_msg,
         "commit_date": "",
         "files_changed": 0,
         "offline": True

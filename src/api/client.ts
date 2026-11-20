@@ -208,6 +208,9 @@ export interface UpdateInfo {
   offline: boolean;
   version?: string;
   current_version?: string;
+  latest_version?: string;
+  commits_behind?: number;
+  latest_message?: string;
   error?: string;
 }
 
@@ -417,7 +420,17 @@ export const api = {
   /**
    * Diagnostic health check
    */
-  async checkHealth(): Promise<{ status: string; app: string; duckdb_version: string; sql_server_driver_available: boolean; installed_odbc_drivers: string[] }> {
+  async checkHealth(): Promise<{
+    status: string;
+    app: string;
+    version?: string;
+    current_version?: string;
+    duckdb_version: string;
+    sql_server_driver_available: boolean;
+    installed_odbc_drivers: string[];
+    excluded_dormant_count?: number;
+    active_rule?: string;
+  }> {
     const res = await fetch(`${API_BASE}/health`);
     if (!res.ok) throw new Error(`Health check failed: ${res.statusText}`);
     return res.json();
