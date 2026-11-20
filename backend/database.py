@@ -10,6 +10,7 @@ import json
 import uuid
 import datetime
 import math
+import re
 import threading
 from typing import Dict, List, Any, Optional, Tuple
 import duckdb
@@ -41,6 +42,31 @@ BASE_DIR = Path(__file__).resolve().parent
 DB_PATH = str(BASE_DIR / "nexo_workspace.duckdb")
 _LOCK = threading.RLock()
 
+class DuckDBResilientConnection:
+    """
+    Wrapper around DuckDBPyConnection that safely normalizes query parameters,
+    such as removing unsupported pseudo-parameters like strict_mode=false
+    so read_csv_auto calls execute cleanly in DuckDB without binder errors.
+    """
+    def __init__(self, raw_con):
+        self._con = raw_con
+
+    def execute(self, query, *args, **kwargs):
+        if isinstance(query, str) and "strict_mode" in query:
+            query = re.sub(r'\s*strict_mode\s*=\s*(?:false|true)\s*,?', '', query, flags=re.IGNORECASE)
+            query = re.sub(r',\s*\)', ')', query)
+        return self._con.execute(query, *args, **kwargs)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if hasattr(self._con, "__exit__"):
+            return self._con.__exit__(exc_type, exc_val, exc_tb)
+
+    def __getattr__(self, name):
+        return getattr(self._con, name)
+
 def get_connection():
     """Returns a DuckDB connection to the local database file with memory cap and performance pragmas."""
     con = duckdb.connect(DB_PATH)
@@ -49,7 +75,7 @@ def get_connection():
         con.execute("SET preserve_insertion_order=false;")
     except Exception:
         pass
-    return con
+    return DuckDBResilientConnection(con)
 
 def flush_db():
     """Forces DuckDB WAL changes to be flushed immediately to disk via CHECKPOINT."""

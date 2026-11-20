@@ -550,7 +550,54 @@ async def run_tests():
 
         print(f'22. 30,000-SKU Pagination & Pre-Aggregated Dashboard Stress Test PASSED (Inv: {t_inv_duration*1000:.1f}ms, Dem: {t_dem_duration*1000:.1f}ms, Dash: {t_dash_duration*1000:.1f}ms, Payload: {len(r_dash.content):,} bytes)')
 
-        print('\n=== ALL 22 BACKEND & DATA HUB ENDPOINTS TESTED AND VERIFIED 100% OPERATIONAL! ===')
+        # 23. Resilient CSV Parser (Unescaped Quotes, Ragged Cells, CP1256 Arabic) & Direct XLSX Ingestion
+        cp1256_csv = """كود الصنف,اسم الصنف,المخزن,الكمية,سعر الشراء
+SKU_INCH_1,شاشة سامسونج 32" بوصة,المخزن الرئيسي,15.0,2500.0
+SKU_INCH_2,لابتوب ديل 15.6" انش,مخزن الجيزة,10.0,18000.0
+SKU_RAGGED_3,طابعة ليزر "HP",مخزن الإسكندرية
+""".encode('cp1256')
+
+        r_cp1256 = await client.post(
+            '/api/files/import-typed',
+            files={'file': ('arabic_cp1256_quotes.csv', cp1256_csv, 'text/csv')},
+            data={'import_type': 'inventory', 'project_id': pid, 'merge_mode': 'merge'}
+        )
+        assert r_cp1256.status_code == 200, f"CP1256 CSV ingestion failed: {r_cp1256.text}"
+        cp1256_json = r_cp1256.json()
+        assert cp1256_json['success'] is True
+        assert cp1256_json['rows_processed'] >= 3
+
+        # Verify inspection endpoint on cp1256 file with unescaped quotes
+        r_inspect_cp1256 = await client.post(
+            '/api/files/inspect',
+            files={'file': ('arabic_inspect.csv', cp1256_csv, 'text/csv')}
+        )
+        assert r_inspect_cp1256.status_code == 200, f"CP1256 CSV inspection failed: {r_inspect_cp1256.text}"
+        inspect_data = r_inspect_cp1256.json()
+        assert len(inspect_data['columns']) >= 3
+
+        # Verify Direct XLSX ingestion without temp CSV conversion
+        xlsx_buffer = io.BytesIO()
+        df_excel_test = pd.DataFrame([
+            {"CODE": "SKU_XLSX_1", "DESC": "Direct Excel Item 1", "ONHA": 25.0, "COST": 120.0},
+            {"CODE": "SKU_XLSX_2", "DESC": "Direct Excel Item 2", "ONHA": 50.0, "COST": 300.0}
+        ])
+        with pd.ExcelWriter(xlsx_buffer, engine="openpyxl") as writer:
+            df_excel_test.to_excel(writer, index=False, sheet_name="Inventory")
+        xlsx_bytes = xlsx_buffer.getvalue()
+
+        r_xlsx = await client.post(
+            '/api/files/import-typed',
+            files={'file': ('direct_calamine.xlsx', xlsx_bytes, 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')},
+            data={'import_type': 'inventory', 'project_id': pid, 'merge_mode': 'merge'}
+        )
+        assert r_xlsx.status_code == 200, f"Direct XLSX ingestion failed: {r_xlsx.text}"
+        assert r_xlsx.json()['success'] is True
+        assert r_xlsx.json()['rows_processed'] == 2
+
+        print(f'23. Resilient CSV Parser (Unescaped Quotes, Ragged Cells, CP1256 Arabic) & Direct XLSX Ingestion PASSED')
+
+        print('\n=== ALL 23 BACKEND & DATA HUB ENDPOINTS TESTED AND VERIFIED 100% OPERATIONAL! ===')
 
 if __name__ == '__main__':
     asyncio.run(run_tests())

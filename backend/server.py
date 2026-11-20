@@ -1111,24 +1111,63 @@ def stream_upload_to_file(upload_file: UploadFile) -> Tuple[str, str]:
         tmp_path = tmp.name
     return tmp_path, filename
 
+def normalize_csv_encoding(file_path: str) -> Tuple[str, bool]:
+    """
+    Detects encoding of CSV file (UTF-8, UTF-8-SIG, CP1256 / Windows-1256, ISO-8859-6, Latin-1).
+    If file is already valid UTF-8/UTF-8-SIG, returns (file_path, False).
+    If file is encoded in CP1256 or other legacy Windows encodings, cleanly transcodes to
+    a UTF-8 encoded temporary file and returns (normalized_path, True).
+    """
+    with open(file_path, "rb") as f:
+        raw_bytes = f.read()
+
+    try:
+        raw_bytes.decode("utf-8-sig")
+        return file_path, False
+    except UnicodeDecodeError:
+        pass
+
+    for enc in ["cp1256", "windows-1256", "iso-8859-6", "cp1252", "latin1"]:
+        try:
+            decoded_text = raw_bytes.decode(enc)
+            break
+        except UnicodeDecodeError:
+            continue
+    else:
+        decoded_text = raw_bytes.decode("cp1256", errors="replace")
+
+    norm_path = file_path + ".utf8.csv"
+    with open(norm_path, "w", encoding="utf-8", newline="") as out:
+        out.write(decoded_text)
+    return norm_path, True
+
 def load_file_into_staging(con: duckdb.DuckDBPyConnection, file_path: str, ext: str) -> Tuple[List[str], int]:
     """
     Loads uploaded CSV or Excel file directly into DuckDB `staging_raw` temp table.
     Returns (columns_list, total_row_count).
-    Uses DuckDB's C++ read_csv_auto for CSV, and python-calamine streaming for XLSX/XLS.
+    Uses DuckDB's C++ read_csv_auto for CSV with encoding normalization, and direct
+    python-calamine in-memory streaming for XLSX/XLS without temp CSV conversion.
     """
     ext = ext.lower()
     if ext == ".csv":
-        escaped_path = file_path.replace("\\", "/")
-        con.execute(f"""
-            CREATE OR REPLACE TEMP TABLE staging_raw AS
-            SELECT * FROM read_csv_auto('{escaped_path}', all_varchar=true, ignore_errors=true);
-        """)
-        cols = [desc[0] for desc in con.execute("DESCRIBE staging_raw").fetchall()]
-        count = con.execute("SELECT COUNT(*) FROM staging_raw").fetchone()[0]
-        return cols, count
+        norm_path, was_transcoded = normalize_csv_encoding(file_path)
+        try:
+            escaped_path = norm_path.replace("\\", "/")
+            con.execute(f"""
+                CREATE OR REPLACE TEMP TABLE staging_raw AS
+                SELECT * FROM read_csv_auto('{escaped_path}', all_varchar=true, strict_mode=false, null_padding=true, ignore_errors=true, sample_size=-1);
+            """)
+            cols = [desc[0] for desc in con.execute("DESCRIBE staging_raw").fetchall()]
+            count = con.execute("SELECT COUNT(*) FROM staging_raw").fetchone()[0]
+            return cols, count
+        finally:
+            if was_transcoded and os.path.exists(norm_path):
+                try:
+                    os.remove(norm_path)
+                except Exception:
+                    pass
     else:
-        # Excel (.xlsx / .xls) via python-calamine
+        # Excel (.xlsx / .xls) via python-calamine direct in-memory ingestion (NO temp CSV conversion)
         from python_calamine import CalamineWorkbook
         wb = CalamineWorkbook.from_path(file_path)
         sheet_names = wb.sheet_names
@@ -1140,25 +1179,36 @@ def load_file_into_staging(con: duckdb.DuckDBPyConnection, file_path: str, ext: 
         if not rows or len(rows) <= 1:
             con.execute("CREATE OR REPLACE TEMP TABLE staging_raw (dummy VARCHAR);")
             return [], 0
-        with tempfile.NamedTemporaryFile(mode="w", newline="", encoding="utf-8-sig", delete=False, suffix=".csv") as tmp_csv:
-            writer = csv.writer(tmp_csv)
-            writer.writerows(rows)
-            tmp_csv_path = tmp_csv.name
-        try:
-            escaped_csv_path = tmp_csv_path.replace("\\", "/")
-            con.execute(f"""
-                CREATE OR REPLACE TEMP TABLE staging_raw AS
-                SELECT * FROM read_csv_auto('{escaped_csv_path}', all_varchar=true, ignore_errors=true);
-            """)
-            cols = [desc[0] for desc in con.execute("DESCRIBE staging_raw").fetchall()]
-            count = con.execute("SELECT COUNT(*) FROM staging_raw").fetchone()[0]
-            return cols, count
-        finally:
-            if os.path.exists(tmp_csv_path):
-                try:
-                    os.remove(tmp_csv_path)
-                except Exception:
-                    pass
+
+        raw_headers = rows[0]
+        col_names = []
+        seen: Dict[str, int] = {}
+        for i, h in enumerate(raw_headers):
+            name = str(h).strip() if h is not None else f"col_{i}"
+            if not name:
+                name = f"col_{i}"
+            if name in seen:
+                seen[name] += 1
+                col_names.append(f"{name}_{seen[name]}")
+            else:
+                seen[name] = 0
+                col_names.append(name)
+
+        num_cols = len(col_names)
+        clean_rows = []
+        for r in rows[1:]:
+            row_len = len(r)
+            clean_row = [str(r[i]) if i < row_len and r[i] is not None else None for i in range(num_cols)]
+            clean_rows.append(clean_row)
+
+        df = pd.DataFrame(clean_rows, columns=col_names)
+        con.register("staging_excel_df", df)
+        con.execute("CREATE OR REPLACE TEMP TABLE staging_raw AS SELECT * FROM staging_excel_df;")
+        con.unregister("staging_excel_df")
+
+        cols = [desc[0] for desc in con.execute("DESCRIBE staging_raw").fetchall()]
+        count = con.execute("SELECT COUNT(*) FROM staging_raw").fetchone()[0]
+        return cols, count
 
 def _resolve_lang(lang: Optional[str]) -> str:
     if lang and lang.strip().lower() in ["ar", "en"]:
@@ -2658,15 +2708,23 @@ async def inspect_file_endpoint(
     try:
         if ext == ".csv":
             sheets = ["Sheet1"]
-            escaped = tmp_path.replace("\\", "/")
-            with _LOCK:
-                con = get_connection()
-                con.execute(f"CREATE OR REPLACE TEMP TABLE staging_inspect AS SELECT * FROM read_csv_auto('{escaped}', all_varchar=true, ignore_errors=true);")
-                cols = [d[0] for d in con.execute("DESCRIBE staging_inspect").fetchall()]
-                row_count = con.execute("SELECT COUNT(*) FROM staging_inspect").fetchone()[0]
-                preview_data = con.execute("SELECT * FROM staging_inspect LIMIT 5").fetchall()
-                preview_rows = [dict(zip(cols, [val if val is not None else "" for val in row])) for row in preview_data]
-                con.execute("DROP TABLE IF EXISTS staging_inspect;")
+            norm_path, was_transcoded = normalize_csv_encoding(tmp_path)
+            try:
+                escaped = norm_path.replace("\\", "/")
+                with _LOCK:
+                    con = get_connection()
+                    con.execute(f"CREATE OR REPLACE TEMP TABLE staging_inspect AS SELECT * FROM read_csv_auto('{escaped}', all_varchar=true, strict_mode=false, null_padding=true, ignore_errors=true, sample_size=-1);")
+                    cols = [d[0] for d in con.execute("DESCRIBE staging_inspect").fetchall()]
+                    row_count = con.execute("SELECT COUNT(*) FROM staging_inspect").fetchone()[0]
+                    preview_data = con.execute("SELECT * FROM staging_inspect LIMIT 5").fetchall()
+                    preview_rows = [dict(zip(cols, [val if val is not None else "" for val in row])) for row in preview_data]
+                    con.execute("DROP TABLE IF EXISTS staging_inspect;")
+            finally:
+                if was_transcoded and os.path.exists(norm_path):
+                    try:
+                        os.remove(norm_path)
+                    except Exception:
+                        pass
         else:
             from python_calamine import CalamineWorkbook
             wb = CalamineWorkbook.from_path(tmp_path)
@@ -3063,3 +3121,4 @@ async def serve_spa_frontend(full_path: str):
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("server:app", host="127.0.0.1", port=8000, reload=False)
+
