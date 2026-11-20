@@ -315,9 +315,11 @@ export const StartView: React.FC<StartViewProps> = ({
                   <span className="text-[11px] font-bold uppercase tracking-wider bg-blue-50 text-[#2196F3] px-2.5 py-0.5 rounded-full border border-blue-200 ml-2">
                     Enterprise Full-Stack
                   </span>
-                  <span className="text-[11px] font-bold font-mono bg-slate-100 text-slate-700 px-2 py-0.5 rounded border border-slate-300 ml-1">
-                    {appVersion || 'v0.1.0'}
-                  </span>
+                  {appVersion && (
+                    <span className="text-[11px] font-bold font-mono bg-slate-100 text-slate-700 px-2 py-0.5 rounded border border-slate-300 ml-1">
+                      {appVersion.startsWith('v') ? appVersion : `v${appVersion}`}
+                    </span>
+                  )}
                 </div>
                 <p className="text-slate-500 text-[13px] mt-1 font-medium">
                   {t.start.subtitle}

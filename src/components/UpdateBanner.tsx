@@ -32,7 +32,7 @@ export const UpdateBanner: React.FC<UpdateBannerProps> = ({
   const [applyStatus, setApplyStatus] = useState<string | null>(null);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
 
-  const curVer = updateInfo?.current_version || appVersion || 'v0.1.0';
+  const curVer = updateInfo?.current_version || appVersion || '';
   const latVer = updateInfo?.latest_version || (updateInfo?.remote_sha ? `v${updateInfo.remote_sha}` : curVer);
 
   const check = useCallback(async (isManual: boolean = false) => {

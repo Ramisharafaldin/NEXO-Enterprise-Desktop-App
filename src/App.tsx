@@ -36,13 +36,12 @@ import { DataHubView } from './views/DataHubView';
 
 import { api, ProjectSummary } from './api/client';
 import * as XLSX from 'xlsx';
-import packageJson from '../package.json';
 
 export const App: React.FC = () => {
   const [language, setLanguage] = useState<Language>('en');
   const [activeTab, setActiveTab] = useState<MainTabId>('start');
   const [settings, setSettings] = useState<AppSettings>(DEFAULT_APP_SETTINGS);
-  const [appVersion, setAppVersion] = useState<string>(packageJson.version ? `v${packageJson.version}` : 'v0.1.0');
+  const [appVersion, setAppVersion] = useState<string>('');
 
   // Projects & Active Dataset
   const [projects, setProjects] = useState<ProjectSummary[]>([]);
@@ -151,11 +150,23 @@ export const App: React.FC = () => {
 
   // Initial load
   useEffect(() => {
-    api.checkHealth().then(health => {
-      if (health?.current_version || health?.version) {
-        setAppVersion(health.current_version || health.version!);
-      }
-    }).catch(() => {});
+    const fetchLiveVersion = (retries = 3) => {
+      api.checkHealth()
+        .then(health => {
+          const v = health?.current_version || health?.version;
+          if (v) {
+            setAppVersion(v.startsWith('v') ? v : `v${v}`);
+          }
+        })
+        .catch(err => {
+          if (retries > 0) {
+            setTimeout(() => fetchLiveVersion(retries - 1), 600);
+          } else {
+            console.warn('Could not load live version from /api/health:', err);
+          }
+        });
+    };
+    fetchLiveVersion();
 
     api.getSettings().then(saved => {
       if (saved) {

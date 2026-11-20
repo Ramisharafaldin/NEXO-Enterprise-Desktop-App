@@ -71,14 +71,22 @@ REPO_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 SUBPROCESS_FLAGS = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
 
 def get_app_version() -> str:
-    """Reads current application version dynamically from VERSION file on disk."""
-    try:
-        vf = Path(__file__).resolve().parent.parent / "VERSION"
-        if vf.exists():
-            return vf.read_text(encoding="utf-8").strip() or "0.1.0"
-    except Exception:
-        pass
-    return "0.1.0"
+    """Reads current application version dynamically from VERSION file on disk on every call."""
+    candidates = [
+        Path(REPO_DIR) / "VERSION",
+        Path(__file__).resolve().parent.parent / "VERSION",
+        Path.cwd() / "VERSION",
+        Path("VERSION").resolve()
+    ]
+    for vf in candidates:
+        try:
+            if vf.exists():
+                val = vf.read_text(encoding="utf-8").strip()
+                if val:
+                    return val.lstrip("v")
+        except Exception:
+            pass
+    return "0.1.2"
 
 APP_VERSION = get_app_version()
 
@@ -195,6 +203,7 @@ def on_startup():
 # Health & Environment Diagnostic Endpoints
 # ==============================================================================
 
+@app.get("/health")
 @app.get("/api/health")
 def health_check():
     drivers = pyodbc.drivers()
