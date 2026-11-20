@@ -16,7 +16,8 @@ import {
   Network,
   X,
   Plus,
-  Check
+  Check,
+  Upload
 } from 'lucide-react';
 import * as XLSX from 'xlsx';
 
@@ -24,12 +25,14 @@ interface ReportsViewProps {
   items: InventoryItem[];
   settings?: AppSettings;
   language: Language;
+  onNavigateToDataHub?: () => void;
 }
 
 export const ReportsView: React.FC<ReportsViewProps> = ({
   items,
   settings,
   language,
+  onNavigateToDataHub,
 }) => {
   const t = translations[language];
   const isAr = language === 'ar';
@@ -216,6 +219,37 @@ export const ReportsView: React.FC<ReportsViewProps> = ({
     XLSX.utils.book_append_sheet(wb, ws, 'Report');
     XLSX.writeFile(wb, `NEXO_${reportType}_${periodHorizon}_Report.xlsx`);
   };
+
+  if (activeItems.length === 0) {
+    return (
+      <div className="flex-1 flex flex-col items-center justify-center p-8 bg-[#F8F9FA] text-[#1E293B]">
+        <div className="p-4 rounded-full bg-blue-50 text-[#2196F3] mb-4 shadow-xs">
+          <FileSpreadsheet className="w-10 h-10 stroke-[1.5]" />
+        </div>
+        <h3 className="text-base font-bold text-slate-800 mb-2 text-center">
+          {isAr
+            ? 'المشروع فارغ حالياً — لا توجد بيانات مرفوعة بعد'
+            : 'This project is currently empty — no data uploaded yet'}
+        </h3>
+        <p className="text-xs text-slate-500 mb-6 text-center max-w-md leading-relaxed">
+          {isAr
+            ? 'لا توجد أصناف نشطة لإنشاء التقارير. يرجى رفع بيانات الأصناف وحركات المخزون للبدء.'
+            : 'There are no active SKUs to generate reports. Please upload item data and inventory records to begin.'}
+        </p>
+        {onNavigateToDataHub && (
+          <button
+            onClick={onNavigateToDataHub}
+            className="flex items-center gap-2 px-5 py-2.5 bg-[#2196F3] hover:bg-blue-600 text-white text-xs font-bold rounded-lg transition shadow-sm cursor-pointer"
+          >
+            <Upload className="w-4 h-4" />
+            <span>
+              {isAr ? 'الذهاب إلى تغذية البيانات' : 'Go to Data Hub'}
+            </span>
+          </button>
+        )}
+      </div>
+    );
+  }
 
   return (
     <div className="flex-1 flex flex-col overflow-hidden bg-[#F8F9FA] select-none text-[#1E293B] text-[12px]">

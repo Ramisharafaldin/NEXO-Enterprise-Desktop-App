@@ -597,7 +597,74 @@ SKU_RAGGED_3,طابعة ليزر "HP",مخزن الإسكندرية
 
         print(f'23. Resilient CSV Parser (Unescaped Quotes, Ragged Cells, CP1256 Arabic) & Direct XLSX Ingestion PASSED')
 
-        print('\n=== ALL 23 BACKEND & DATA HUB ENDPOINTS TESTED AND VERIFIED 100% OPERATIONAL! ===')
+        # 24. Strict Project Isolation & Zero Demo-Data Contamination Test
+        # Step a: Verify a previous project with data exists
+        r_prev = await client.get(f'/api/inventory?project_id={pid}')
+        assert r_prev.status_code == 200
+        prev_data = r_prev.json()
+        assert prev_data['total_count'] > 0, "Previous project should have items before isolation test"
+        prev_count = prev_data['total_count']
+
+        # Step b: Create a brand-new project via POST /api/projects
+        r_new_proj = await client.post('/api/projects', json={
+            'name': 'Strict Isolation Blank Project',
+            'description': 'A completely blank project with 0 initial data',
+            'dataset_name': 'Empty Test Sheet.xlsx'
+        })
+        assert r_new_proj.status_code == 200, f"Create project failed: {r_new_proj.text}"
+        new_proj = r_new_proj.json()
+        new_pid = new_proj['id']
+
+        # Step c: Assert /api/inventory, /api/demand, /api/dashboard, and /api/in-transit all return 0 items and contain zero demo SKUs
+        r_iso_inv = await client.get(f'/api/inventory?project_id={new_pid}')
+        assert r_iso_inv.status_code == 200
+        iso_inv = r_iso_inv.json()
+        assert iso_inv['total_count'] == 0, f"Expected 0 items in new project, got {iso_inv['total_count']}"
+        assert len(iso_inv['items']) == 0, f"Expected empty items list, got {len(iso_inv['items'])}"
+
+        r_iso_dem = await client.get(f'/api/demand?project_id={new_pid}')
+        assert r_iso_dem.status_code == 200
+        iso_dem = r_iso_dem.json()
+        assert iso_dem['total_count'] == 0, f"Expected 0 items in demand, got {iso_dem['total_count']}"
+        assert len(iso_dem['series']) == 0, f"Expected 0 series, got {len(iso_dem['series'])}"
+
+        r_iso_dash = await client.get(f'/api/dashboard?project_id={new_pid}')
+        assert r_iso_dash.status_code == 200
+        iso_dash = r_iso_dash.json()
+        assert iso_dash['active_skus'] == 0, f"Expected 0 active skus in dashboard, got {iso_dash['active_skus']}"
+        assert iso_dash['kpis']['totalInventoryValue'] == 0.0
+
+        r_iso_trans = await client.get(f'/api/in-transit?project_id={new_pid}')
+        assert r_iso_trans.status_code == 200
+        iso_trans = r_iso_trans.json()
+        assert iso_trans['count'] == 0, f"Expected 0 in-transit shipments, got {iso_trans['count']}"
+
+        # Check default queries without project_id query param resolve to active project (which is new_pid)
+        r_def_inv = await client.get('/api/inventory')
+        assert r_def_inv.status_code == 200
+        assert r_def_inv.json()['total_count'] == 0, "Default inventory query should resolve to new blank active project"
+
+        # Step d: Close and reopen nexo_workspace.duckdb; verify the new project is STILL completely empty (no auto-reseed)
+        close_db()
+        init_db()
+
+        r_reopen_inv = await client.get(f'/api/inventory?project_id={new_pid}')
+        assert r_reopen_inv.status_code == 200
+        reopen_inv = r_reopen_inv.json()
+        assert reopen_inv['total_count'] == 0, f"New project auto-reseeded after DB restart! Count: {reopen_inv['total_count']}"
+        assert len(reopen_inv['items']) == 0
+
+        # Step e: Switch back to the previous project via /activate and assert its data is intact and unmixed
+        r_act_prev = await client.post(f'/api/projects/{pid}/activate')
+        assert r_act_prev.status_code == 200
+        r_prev_restored = await client.get(f'/api/inventory?project_id={pid}')
+        assert r_prev_restored.status_code == 200
+        restored_data = r_prev_restored.json()
+        assert restored_data['total_count'] == prev_count, f"Expected {prev_count} restored items in {pid}, got {restored_data['total_count']}"
+
+        print(f'24. Strict Project Isolation & Zero Demo-Data Contamination Test PASSED')
+
+        print('\n=== ALL 24 BACKEND & DATA HUB ENDPOINTS TESTED AND VERIFIED 100% OPERATIONAL! ===')
 
 if __name__ == '__main__':
     asyncio.run(run_tests())

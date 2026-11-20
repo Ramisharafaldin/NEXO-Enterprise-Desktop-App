@@ -33,6 +33,7 @@ interface InventoryViewProps {
   onOpenContainersModal: () => void;
   onOpenDrpModal: () => void;
   onRefreshProject?: () => void;
+  onNavigateToDataHub?: () => void;
   settings?: AppSettings;
   language: Language;
 }
@@ -65,6 +66,7 @@ export const InventoryView: React.FC<InventoryViewProps> = ({
   onOpenContainersModal,
   onOpenDrpModal,
   onRefreshProject,
+  onNavigateToDataHub,
   settings,
   language,
 }) => {
@@ -93,6 +95,15 @@ export const InventoryView: React.FC<InventoryViewProps> = ({
   }>({ all: 0, to_buy: 0, stockout_risk: 0, overstock: 0, in_transit: 0 });
   const [paginatedItems, setPaginatedItems] = useState<InventoryItem[]>([]);
   const [isLoadingPage, setIsLoadingPage] = useState(false);
+
+  // Reset pagination and search on project switch
+  useEffect(() => {
+    setPage(1);
+    setSearchTerm('');
+    setDebouncedSearch('');
+    setPaginatedItems([]);
+    setTotalCount(0);
+  }, [projectId]);
 
   // Debounce search input (300ms)
   useEffect(() => {
@@ -374,6 +385,37 @@ export const InventoryView: React.FC<InventoryViewProps> = ({
   const stockoutCount = activeItems.filter(i => i.isStockout).length;
   const overstockCount = activeItems.filter(i => i.isOverstock).length;
   const transitionCount = activeItems.filter(i => (i.onOrder || 0) > 0).length;
+
+  if (totalCount === 0 && !debouncedSearch && !isLoadingPage && (!items || items.length === 0)) {
+    return (
+      <div className="flex-1 flex flex-col items-center justify-center p-8 bg-[#F8F9FA] text-[#1E293B]">
+        <div className="p-4 rounded-full bg-blue-50 text-[#2196F3] mb-4 shadow-xs">
+          <Box className="w-10 h-10 stroke-[1.5]" />
+        </div>
+        <h3 className="text-base font-bold text-slate-800 mb-2 text-center">
+          {isAr
+            ? 'المشروع فارغ حالياً — لا توجد بيانات مرفوعة بعد'
+            : 'This project is currently empty — no data uploaded yet'}
+        </h3>
+        <p className="text-xs text-slate-500 mb-6 text-center max-w-md leading-relaxed">
+          {isAr
+            ? 'قم برفع ملف الأصناف والمخزون في تغذية البيانات لعرض جدول المخزون ومؤشرات التغطية والطلبات المقترحة.'
+            : 'Upload SKU inventory data in Data Hub to view stock levels, days of supply, and replenishment proposals.'}
+        </p>
+        {onNavigateToDataHub && (
+          <button
+            onClick={onNavigateToDataHub}
+            className="flex items-center gap-2 px-5 py-2.5 bg-[#2196F3] hover:bg-blue-600 text-white text-xs font-bold rounded-lg transition shadow-sm cursor-pointer"
+          >
+            <Upload className="w-4 h-4" />
+            <span>
+              {isAr ? 'الذهاب إلى تغذية البيانات' : 'Go to Data Hub'}
+            </span>
+          </button>
+        )}
+      </div>
+    );
+  }
 
   return (
     <div className="flex-1 flex flex-col overflow-hidden bg-[#F8F9FA] select-none text-[#1E293B] text-[12px]">

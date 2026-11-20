@@ -29,18 +29,20 @@ import {
   HelpCircle,
   TrendingUp,
   RotateCcw,
-  X
+  X,
+  Upload
 } from 'lucide-react';
 
 interface DemandViewProps {
   items: InventoryItem[];
-  selectedItem: InventoryItem;
+  selectedItem?: InventoryItem;
   onSelectItem: (item: InventoryItem) => void;
   onModelChange: (itemId: string, newModel: ModelType) => void;
   onOverrideChange: (itemId: string, periodDate: string, val: number | undefined) => void;
   onExplainCalculation: (item: InventoryItem) => void;
   onParameterChange?: (itemId: string, updates: Partial<InventoryItem>) => void;
   onOpenSettings?: () => void;
+  onNavigateToDataHub?: () => void;
   settings?: AppSettings;
   language: Language;
   projectId?: string;
@@ -55,6 +57,7 @@ export const DemandView: React.FC<DemandViewProps> = ({
   onExplainCalculation,
   onParameterChange,
   onOpenSettings,
+  onNavigateToDataHub,
   settings,
   language,
   projectId = 'proj_default_retail',
@@ -116,6 +119,15 @@ export const DemandView: React.FC<DemandViewProps> = ({
   const [paginatedItems, setPaginatedItems] = useState<InventoryItem[]>([]);
   const [debouncedSearch, setDebouncedSearch] = useState('');
   const [isLoadingList, setIsLoadingList] = useState(false);
+
+  // Reset on project switch
+  useEffect(() => {
+    setPage(1);
+    setTreeSearch('');
+    setDebouncedSearch('');
+    setPaginatedItems([]);
+    setTotalCount(0);
+  }, [projectId]);
 
   // Debounce tree search input (300ms)
   useEffect(() => {
@@ -225,13 +237,33 @@ export const DemandView: React.FC<DemandViewProps> = ({
     ? 'sticky right-0 bg-inherit border-l border-[#CBD5E1] text-right' 
     : 'sticky left-0 bg-inherit border-r border-[#CBD5E1] text-left';
 
-  if (!selectedItem) {
+  if (!items || items.length === 0 || !selectedItem) {
     return (
-      <div className="flex-1 flex flex-col items-center justify-center p-8 bg-[#F8F9FA] text-slate-500">
-        <TrendingUp className="w-8 h-8 text-slate-400 mb-2" />
-        <span className="text-xs font-semibold">
-          {isAr ? 'الرجاء اختيار صنف لعرض بيانات التنبؤ والطلب' : 'Please select an item to view demand and forecast data'}
-        </span>
+      <div className="flex-1 flex flex-col items-center justify-center p-8 bg-[#F8F9FA] text-[#1E293B]">
+        <div className="p-4 rounded-full bg-blue-50 text-[#2196F3] mb-4 shadow-xs">
+          <TrendingUp className="w-10 h-10 stroke-[1.5]" />
+        </div>
+        <h3 className="text-base font-bold text-slate-800 mb-2 text-center">
+          {isAr
+            ? 'المشروع فارغ حالياً — لا توجد بيانات مرفوعة بعد'
+            : 'This project is currently empty — no data uploaded yet'}
+        </h3>
+        <p className="text-xs text-slate-500 mb-6 text-center max-w-md leading-relaxed">
+          {isAr
+            ? 'يرجى الانتقال إلى تغذية البيانات لرفع مبيعات الأصناف وتوليد نماذج التنبؤ.'
+            : 'Please navigate to Data Hub to upload SKU sales records and generate demand forecast models.'}
+        </p>
+        {onNavigateToDataHub && (
+          <button
+            onClick={onNavigateToDataHub}
+            className="flex items-center gap-2 px-5 py-2.5 bg-[#2196F3] hover:bg-blue-600 text-white text-xs font-bold rounded-lg transition shadow-sm cursor-pointer"
+          >
+            <Upload className="w-4 h-4" />
+            <span>
+              {isAr ? 'الذهاب إلى تغذية البيانات' : 'Go to Data Hub'}
+            </span>
+          </button>
+        )}
       </div>
     );
   }

@@ -689,6 +689,14 @@ def create_new_project(name: str, description: str = "", dataset_name: str = "")
     project_id = f"proj_{uuid.uuid4().hex[:10]}"
     now_str = datetime.datetime.utcnow().isoformat()
     with _LOCK:
+        # Snapshot previous active project if exists
+        prev_active = get_active_project_id()
+        if prev_active and prev_active != project_id:
+            try:
+                save_project_workspace(prev_active)
+            except Exception:
+                pass
+
         con = get_connection()
         try:
             con.execute("""
@@ -700,9 +708,11 @@ def create_new_project(name: str, description: str = "", dataset_name: str = "")
             con.execute("DELETE FROM periods WHERE project_id = ?", (project_id,))
             con.execute("DELETE FROM items WHERE project_id = ?", (project_id,))
             con.execute("DELETE FROM in_transition WHERE project_id = ?", (project_id,))
+            con.execute("DELETE FROM daily_sales WHERE project_id = ?", (project_id,))
             con.execute("DELETE FROM project_items WHERE project_id = ?", (project_id,))
             con.execute("DELETE FROM project_periods WHERE project_id = ?", (project_id,))
             con.execute("DELETE FROM project_in_transit WHERE project_id = ?", (project_id,))
+            con.execute("DELETE FROM saved_filters WHERE project_id = ?", (project_id,))
 
             # Set active_project_id in app_settings
             con.execute("UPDATE app_settings SET active_project_id = ? WHERE id = 'global_settings'", (project_id,))
@@ -818,6 +828,14 @@ def activate_project(project_id: str) -> Dict[str, Any]:
     """
     now_str = datetime.datetime.utcnow().isoformat()
     with _LOCK:
+        # Snapshot previous active project first
+        prev_active = get_active_project_id()
+        if prev_active and prev_active != project_id:
+            try:
+                save_project_workspace(prev_active)
+            except Exception:
+                pass
+
         con = get_connection()
         try:
             # Check if project exists

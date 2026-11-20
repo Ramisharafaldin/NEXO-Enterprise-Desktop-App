@@ -27,7 +27,8 @@ import {
   Layers,
   SlidersHorizontal,
   ChevronDown,
-  Check
+  Check,
+  Upload
 } from 'lucide-react';
 
 interface DashboardViewProps {
@@ -36,6 +37,7 @@ interface DashboardViewProps {
   language: Language;
   projectId?: string;
   onRefresh?: () => void;
+  onNavigateToDataHub?: () => void;
 }
 
 export const DashboardView: React.FC<DashboardViewProps> = ({
@@ -44,6 +46,7 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
   language,
   projectId,
   onRefresh,
+  onNavigateToDataHub,
 }) => {
   const t = translations[language];
   const isAr = language === 'ar';
@@ -112,6 +115,8 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
   };
 
   useEffect(() => {
+    setDashboardSummary(null);
+    setDbKpis(null);
     fetchKpis();
   }, [projectId]);
 
@@ -213,6 +218,37 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
     categoryChart: isAr ? 'رسم أوامر الشراء حسب المجموعة' : 'Category Orders Chart',
     abcChart: t.dashboard.cards.abcDistribution,
   };
+
+  if (totalActiveSkus === 0 && !isRefreshing) {
+    return (
+      <div className="flex-1 flex flex-col items-center justify-center p-8 bg-[#F8F9FA] text-[#1E293B]">
+        <div className="p-4 rounded-full bg-blue-50 text-[#2196F3] mb-4 shadow-xs">
+          <Package className="w-10 h-10 stroke-[1.5]" />
+        </div>
+        <h3 className="text-base font-bold text-slate-800 mb-2 text-center">
+          {isAr
+            ? 'المشروع فارغ حالياً — لا توجد بيانات مرفوعة بعد'
+            : 'This project is currently empty — no data uploaded yet'}
+        </h3>
+        <p className="text-xs text-slate-500 mb-6 text-center max-w-md leading-relaxed">
+          {isAr
+            ? 'ابدأ برفع ملف إكسل أو ربط قاعدة بيانات SQL لتوليد التنبؤات والتحليلات وحساب نقاط إعادة الطلب تلقائياً.'
+            : 'Start by uploading an Excel file or connecting your database to generate forecasts, analytics, and replenishment recommendations.'}
+        </p>
+        {onNavigateToDataHub && (
+          <button
+            onClick={onNavigateToDataHub}
+            className="flex items-center gap-2 px-5 py-2.5 bg-[#2196F3] hover:bg-blue-600 text-white text-xs font-bold rounded-lg transition shadow-sm cursor-pointer"
+          >
+            <Upload className="w-4 h-4" />
+            <span>
+              {isAr ? 'الذهاب إلى تغذية البيانات' : 'Go to Data Hub'}
+            </span>
+          </button>
+        )}
+      </div>
+    );
+  }
 
   return (
     <div className="flex-1 flex flex-col overflow-hidden bg-[#F8F9FA] select-none text-[#1E293B] text-[12px]">

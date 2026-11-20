@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useCallback, useMemo, useRef } from 'react';
-import { TrendingUp, CheckCircle2 } from 'lucide-react';
+import { TrendingUp, CheckCircle2, Upload } from 'lucide-react';
 import { InventoryItem, ModelType, ReplenishmentStrategy, AppSettings, isAnalyzableItem } from './engine/types';
 import { getInitialInventoryItems } from './engine/sampleData';
 import {
@@ -47,11 +47,10 @@ export const App: React.FC = () => {
   const [activeProjectId, setActiveProjectId] = useState<string>('proj_default_retail');
   const [activeDataset, setActiveDataset] = useState('Retail Inventory Planning Example monthly.xlsx');
 
-  // Core Items State - Initialized immediately with standard benchmark data to prevent blank/null state
-  const initialItems = useMemo(() => getInitialInventoryItems().filter(isAnalyzableItem), []);
-  const [items, setItems] = useState<InventoryItem[]>(initialItems);
+  // Core Items State - Starts blank, loaded from active project in DuckDB
+  const [items, setItems] = useState<InventoryItem[]>([]);
   const [dormantCount, setDormantCount] = useState<number>(0);
-  const [selectedItemId, setSelectedItemId] = useState<string>(initialItems[0]?.id || '');
+  const [selectedItemId, setSelectedItemId] = useState<string>('');
   const [explainingItem, setExplainingItem] = useState<InventoryItem | null>(null);
   const [isServerConnected, setIsServerConnected] = useState(false);
   const [isSyncing, setIsSyncing] = useState(false);
@@ -79,10 +78,18 @@ export const App: React.FC = () => {
     document.documentElement.lang = language;
   }, [language]);
 
-  // Load project items from DuckDB backend or fallback to initial sample data
+  // Load project items from DuckDB backend
   const loadProject = useCallback(async (projectId: string) => {
     setIsSyncing(true);
+    setItems([]);
+    setSelectedItemId('');
+    setDormantCount(0);
     try {
+      try {
+        await api.activateProject(projectId);
+      } catch (actErr) {
+        console.warn('activateProject notification:', actErr);
+      }
       const ws = await api.getWorkspace(projectId);
       if (ws && ws.items && ws.items.length > 0) {
         const analyzable = ws.items.filter(isAnalyzableItem);
@@ -94,26 +101,22 @@ export const App: React.FC = () => {
           setActiveDataset(ws.project.dataset_name || ws.project.name);
         }
         setIsServerConnected(true);
-      } else if (ws && ws.project) {
+      } else {
         setActiveProjectId(projectId);
-        setActiveDataset(ws.project.dataset_name || ws.project.name);
+        if (ws?.project) {
+          setActiveDataset(ws.project.dataset_name || ws.project.name);
+        }
         setItems([]);
         setSelectedItemId('');
         setDormantCount(0);
         setIsServerConnected(true);
-      } else {
-        // Fallback to sample data if project has 0 items
-        const initial = getInitialInventoryItems().filter(isAnalyzableItem);
-        setItems(initial);
-        setDormantCount(0);
-        if (initial.length > 0) setSelectedItemId(initial[0].id);
       }
     } catch (err) {
-      console.warn('Backend unavailable, loading local memory cache:', err);
-      const initial = getInitialInventoryItems().filter(isAnalyzableItem);
-      setItems(initial);
+      console.warn('Backend unavailable, project workspace empty:', err);
+      setActiveProjectId(projectId);
+      setItems([]);
+      setSelectedItemId('');
       setDormantCount(0);
-      if (initial.length > 0) setSelectedItemId(initial[0].id);
       setIsServerConnected(false);
     } finally {
       setIsSyncing(false);
@@ -638,31 +641,33 @@ export const App: React.FC = () => {
                 onOverrideChange={handleOverrideChange}
                 onExplainCalculation={i => setExplainingItem(i)}
                 onParameterChange={handleItemParameterChange}
+                onNavigateToDataHub={() => setActiveTab('data-hub')}
                 settings={settings}
                 language={language}
               />
             ) : (
               <div className="flex-1 flex flex-col items-center justify-center p-8 bg-[#F8F9FA] text-[#1E293B]">
-                <div className="p-4 rounded-full bg-blue-50 text-[#2196F3] mb-4">
-                  <TrendingUp className="w-10 h-10 animate-pulse" />
+                <div className="p-4 rounded-full bg-blue-50 text-[#2196F3] mb-4 shadow-xs">
+                  <TrendingUp className="w-10 h-10 stroke-[1.5]" />
                 </div>
-                <h3 className="text-base font-bold text-slate-800 mb-1">
-                  {language === 'ar' ? 'جاري تحميل بيانات التنبؤ والطلب...' : 'Loading Demand Forecast Data...'}
-                </h3>
-                <p className="text-xs text-slate-500 mb-4 text-center max-w-md">
+                <h3 className="text-base font-bold text-slate-800 mb-2 text-center">
                   {language === 'ar'
-                    ? 'يتم استرداد مصفوفة الأصناف وحركات المبيعات من قاعدة بيانات DuckDB...'
-                    : 'Retrieving SKU inventory time series and forecasts from DuckDB...'}
+                    ? 'المشروع فارغ حالياً — لا توجد بيانات مرفوعة بعد'
+                    : 'This project is currently empty — no data uploaded yet'}
+                </h3>
+                <p className="text-xs text-slate-500 mb-6 text-center max-w-md leading-relaxed">
+                  {language === 'ar'
+                    ? 'يرجى الانتقال إلى تغذية البيانات لرفع مبيعات الأصناف وتوليد نماذج التنبؤ.'
+                    : 'Please navigate to Data Hub to upload SKU sales records and generate demand forecast models.'}
                 </p>
                 <button
-                  onClick={() => {
-                    const initial = getInitialInventoryItems();
-                    setItems(initial);
-                    if (initial.length > 0) setSelectedItemId(initial[0].id);
-                  }}
-                  className="px-4 py-2 bg-[#2196F3] hover:bg-blue-600 text-white text-xs font-semibold rounded transition shadow-xs cursor-pointer"
+                  onClick={() => setActiveTab('data-hub')}
+                  className="flex items-center gap-2 px-5 py-2.5 bg-[#2196F3] hover:bg-blue-600 text-white text-xs font-bold rounded-lg transition shadow-sm cursor-pointer"
                 >
-                  {language === 'ar' ? 'تحميل بيانات النموذج الافتراضي' : 'Load Default Benchmark Data'}
+                  <Upload className="w-4 h-4" />
+                  <span>
+                    {language === 'ar' ? 'الذهاب إلى تغذية البيانات' : 'Go to Data Hub'}
+                  </span>
                 </button>
               </div>
             )
@@ -677,6 +682,7 @@ export const App: React.FC = () => {
               onOpenPlannedOrdersModal={() => setIsPlannedOrdersModalOpen(true)}
               onOpenContainersModal={() => setIsContainersModalOpen(true)}
               onOpenDrpModal={() => setIsDrpModalOpen(true)}
+              onNavigateToDataHub={() => setActiveTab('data-hub')}
               settings={settings}
               language={language}
             />
@@ -687,6 +693,7 @@ export const App: React.FC = () => {
               items={items}
               settings={settings}
               language={language}
+              onNavigateToDataHub={() => setActiveTab('data-hub')}
             />
           )}
 
@@ -696,6 +703,7 @@ export const App: React.FC = () => {
               projectId={activeProjectId}
               settings={settings}
               language={language}
+              onNavigateToDataHub={() => setActiveTab('data-hub')}
             />
           )}
 

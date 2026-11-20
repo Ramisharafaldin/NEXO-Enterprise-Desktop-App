@@ -317,10 +317,12 @@ def _resolve_project_id(project_id: Optional[str] = None) -> str:
     """Helper to resolve target project_id or pick active project."""
     if project_id and project_id.strip():
         return project_id.strip()
+    active_id = get_active_project_id()
+    if active_id:
+        return active_id
     projs = list_projects()
     if projs:
-        active = next((p["id"] for p in projs if p.get("sku_count", 0) > 0), projs[0]["id"])
-        return active
+        return projs[0]["id"]
     raise HTTPException(status_code=404, detail="No projects found")
 
 @app.get("/api/projects/{project_id}/items")
@@ -565,6 +567,20 @@ def delete_filter_endpoint(project_id: str, filter_id: str):
 @app.get("/api/projects/{project_id}/transitions")
 def get_transitions_endpoint(project_id: str):
     return get_in_transition_for_project(project_id)
+
+@app.get("/api/in-transit")
+def get_in_transit_alias_endpoint(project_id: Optional[str] = Query(None)):
+    pid = _resolve_project_id(project_id)
+    shipments = get_in_transition_for_project(pid)
+    return {
+        "project_id": pid,
+        "count": len(shipments),
+        "shipments": shipments,
+        "summary": {
+            "total_records": len(shipments),
+            "total_quantity": sum(float(s.get("quantity", 0) or 0) for s in shipments)
+        }
+    }
 
 class AddTransitionRequest(BaseModel):
     item_code: str
