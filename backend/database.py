@@ -1124,6 +1124,24 @@ def delete_project_by_id(project_id: str):
         finally:
             con.close()
 
+def get_project_locations(project_id: str) -> List[Dict[str, Any]]:
+    """Returns sorted distinct non-empty locations for a project with SKU counts."""
+    with _LOCK:
+        con = get_connection()
+        try:
+            rows = con.execute("""
+                SELECT 
+                    COALESCE(NULLIF(TRIM(location), ''), 'Default WH') as loc,
+                    COUNT(*) as sku_count
+                FROM items
+                WHERE project_id = ?
+                GROUP BY 1
+                ORDER BY 1 ASC
+            """, (project_id,)).fetchall()
+            return [{"location": str(r[0]), "sku_count": int(r[1])} for r in rows if r[0]]
+        finally:
+            con.close()
+
 def is_analyzable_sku(on_hand: Any, total_sales: Any) -> bool:
     """Core supply chain analytical filter: SKU is active/analyzable if on_hand > 0 OR total_sales > 0."""
     try:
@@ -1136,12 +1154,17 @@ def is_analyzable_sku(on_hand: Any, total_sales: Any) -> bool:
         ts = 0.0
     return (oh > 0.0) or (ts > 0.0)
 
-def get_project_dormant_count(project_id: str) -> int:
-    """Returns the count of dormant SKUs (on_hand <= 0 AND total sales <= 0) in DuckDB."""
+def get_project_dormant_count(project_id: str, location: Optional[str] = None) -> int:
+    """Returns the count of dormant SKUs (on_hand <= 0 AND total sales <= 0) in DuckDB, optionally filtered by branch."""
     with _LOCK:
         con = get_connection()
         try:
-            row = con.execute("""
+            where_clause = "i.project_id = ? AND COALESCE(i.on_hand, 0) <= 0 AND COALESCE(p.total_sales, 0) <= 0"
+            params = [project_id, project_id]
+            if location and location.strip() and location.strip().upper() != "ALL":
+                where_clause += " AND LOWER(TRIM(i.location)) = LOWER(TRIM(?))"
+                params.append(location.strip())
+            row = con.execute(f"""
                 SELECT COUNT(*)
                 FROM items i
                 LEFT JOIN (
@@ -1150,20 +1173,24 @@ def get_project_dormant_count(project_id: str) -> int:
                     WHERE project_id = ?
                     GROUP BY item_id
                 ) p ON i.id = p.item_id
-                WHERE i.project_id = ?
-                  AND COALESCE(i.on_hand, 0) <= 0
-                  AND COALESCE(p.total_sales, 0) <= 0
-            """, (project_id, project_id)).fetchone()
+                WHERE {where_clause}
+            """, params).fetchone()
             return int(row[0]) if row and row[0] is not None else 0
         finally:
             con.close()
 
-def get_project_items(project_id: str, include_dormant: bool = False) -> List[Dict[str, Any]]:
-    """Returns all analyzable items for a project, excluding dormant SKUs (0 stock & 0 sales) unless include_dormant=True."""
+def get_project_items(project_id: str, include_dormant: bool = False, location: Optional[str] = None) -> List[Dict[str, Any]]:
+    """Returns all analyzable items for a project, excluding dormant SKUs (0 stock & 0 sales) unless include_dormant=True, with optional branch filter."""
     with _LOCK:
         con = get_connection()
         try:
-            items_df = con.execute("SELECT * FROM items WHERE project_id = ? ORDER BY code ASC", (project_id,)).fetchdf()
+            where_sql = "project_id = ?"
+            params = [project_id]
+            if location and location.strip() and location.strip().upper() != "ALL":
+                where_sql += " AND LOWER(TRIM(location)) = LOWER(TRIM(?))"
+                params.append(location.strip())
+
+            items_df = con.execute(f"SELECT * FROM items WHERE {where_sql} ORDER BY code ASC", params).fetchdf()
             if items_df.empty:
                 return []
 
@@ -1294,7 +1321,16 @@ def get_project_items_paginated(
             if not include_dormant:
                 base_where += " AND (COALESCE(i.on_hand, 0) > 0 OR COALESCE(p.total_sales, 0) > 0)"
 
-            # 2. Compute summary_counts across all analyzable items in project via fast SQL
+            is_loc_filter = bool(location and location.strip() and location.strip().upper() != "ALL")
+            loc_val = location.strip() if is_loc_filter else None
+
+            summary_where = base_where
+            summary_params: List[Any] = [project_id] + list(base_params)
+            if is_loc_filter:
+                summary_where += " AND LOWER(TRIM(i.location)) = LOWER(TRIM(?))"
+                summary_params.append(loc_val)
+
+            # 2. Compute summary_counts across all analyzable items in project (and branch) via fast SQL
             summary_query = f"""
                 SELECT
                     COUNT(*) as count_all,
@@ -1309,9 +1345,9 @@ def get_project_items_paginated(
                     WHERE project_id = ?
                     GROUP BY item_id
                 ) p ON i.id = p.item_id
-                WHERE {base_where}
+                WHERE {summary_where}
             """
-            summary_row = con.execute(summary_query, [project_id] + base_params).fetchone()
+            summary_row = con.execute(summary_query, summary_params).fetchone()
             summary_counts = {
                 "all": int(summary_row[0] or 0) if summary_row else 0,
                 "to_buy": int(summary_row[1] or 0) if summary_row else 0,
@@ -1329,9 +1365,9 @@ def get_project_items_paginated(
                 filter_clauses.append("(LOWER(i.code) LIKE ? OR LOWER(COALESCE(i.description, '')) LIKE ? OR LOWER(COALESCE(i.category, '')) LIKE ? OR LOWER(COALESCE(i.location, '')) LIKE ?)")
                 filter_params.extend([s, s, s, s])
 
-            if location and location.strip():
+            if is_loc_filter:
                 filter_clauses.append("LOWER(TRIM(i.location)) = LOWER(TRIM(?))")
-                filter_params.append(location.strip())
+                filter_params.append(loc_val)
 
             if category and category.strip():
                 filter_clauses.append("LOWER(TRIM(i.category)) = LOWER(TRIM(?))")
@@ -1487,18 +1523,28 @@ def get_project_items_paginated(
         finally:
             con.close()
 
-def get_project_dashboard_summary(project_id: str) -> Dict[str, Any]:
+def get_project_dashboard_summary(project_id: str, location: Optional[str] = None) -> Dict[str, Any]:
     """
     Returns slim pre-aggregated dashboard KPI cards, ABC distribution, category breakdown,
-    and top risk items directly computed via DuckDB SQL without dumping tens of thousands of SKUs.
+    and top risk items directly computed via DuckDB SQL without dumping tens of thousands of SKUs,
+    optionally filtered strictly by branch location.
     """
     with _LOCK:
         con = get_connection()
         try:
-            kpis = compute_project_kpis(project_id)
-            dormant_count = get_project_dormant_count(project_id)
+            kpis = compute_project_kpis(project_id, location=location)
+            dormant_count = get_project_dormant_count(project_id, location=location)
 
-            agg_row = con.execute("""
+            is_loc_filter = bool(location and location.strip() and location.strip().upper() != "ALL")
+            loc_val = location.strip() if is_loc_filter else None
+
+            base_where = "i.project_id = ? AND (COALESCE(i.on_hand, 0) > 0 OR COALESCE(p.total_sales, 0) > 0)"
+            base_params = [project_id, project_id]
+            if is_loc_filter:
+                base_where += " AND LOWER(TRIM(i.location)) = LOWER(TRIM(?))"
+                base_params.append(loc_val)
+
+            agg_row = con.execute(f"""
                 SELECT
                     COUNT(CASE WHEN i.is_stockout = TRUE OR COALESCE(i.on_hand, 0) <= 0 THEN 1 END) as stockout_count,
                     COUNT(CASE WHEN i.is_overstock = TRUE THEN 1 END) as overstock_count,
@@ -1513,9 +1559,8 @@ def get_project_dashboard_summary(project_id: str) -> Dict[str, Any]:
                     WHERE project_id = ?
                     GROUP BY item_id
                 ) p ON i.id = p.item_id
-                WHERE i.project_id = ?
-                  AND (COALESCE(i.on_hand, 0) > 0 OR COALESCE(p.total_sales, 0) > 0)
-            """, (project_id, project_id)).fetchone()
+                WHERE {base_where}
+            """, base_params).fetchone()
 
             stockout_count = int(agg_row[0] or 0) if agg_row else 0
             overstock_count = int(agg_row[1] or 0) if agg_row else 0
@@ -1525,7 +1570,7 @@ def get_project_dashboard_summary(project_id: str) -> Dict[str, Any]:
             total_write_off_val = round(float(agg_row[5] or 0.0), 2) if agg_row else 0.0
 
             # ABC Distribution
-            abc_rows = con.execute("""
+            abc_rows = con.execute(f"""
                 SELECT
                     UPPER(COALESCE(NULLIF(TRIM(i.abc_class), ''), 'C')) as abc,
                     COUNT(*) as sku_count,
@@ -1537,10 +1582,9 @@ def get_project_dashboard_summary(project_id: str) -> Dict[str, Any]:
                     WHERE project_id = ?
                     GROUP BY item_id
                 ) p ON i.id = p.item_id
-                WHERE i.project_id = ?
-                  AND (COALESCE(i.on_hand, 0) > 0 OR COALESCE(p.total_sales, 0) > 0)
+                WHERE {base_where}
                 GROUP BY UPPER(COALESCE(NULLIF(TRIM(i.abc_class), ''), 'C'))
-            """, (project_id, project_id)).fetchall()
+            """, base_params).fetchall()
 
             abc_map = {r[0]: (r[1], float(r[2])) for r in abc_rows}
             abc_sum = sum(v[1] for v in abc_map.values())
@@ -1560,7 +1604,7 @@ def get_project_dashboard_summary(project_id: str) -> Dict[str, Any]:
                 })
 
             # Category Orders Breakdown (Top 10)
-            cat_rows = con.execute("""
+            cat_rows = con.execute(f"""
                 SELECT
                     COALESCE(NULLIF(TRIM(i.category), ''), 'General') as cat,
                     COALESCE(SUM(COALESCE(i.order_now_value, i.order_now * i.sales_price, 0.0)), 0.0) as cat_val
@@ -1571,18 +1615,17 @@ def get_project_dashboard_summary(project_id: str) -> Dict[str, Any]:
                     WHERE project_id = ?
                     GROUP BY item_id
                 ) p ON i.id = p.item_id
-                WHERE i.project_id = ?
-                  AND (COALESCE(i.on_hand, 0) > 0 OR COALESCE(p.total_sales, 0) > 0)
+                WHERE {base_where}
                   AND (COALESCE(i.order_now, 0) > 0 OR COALESCE(i.order_now_value, 0) > 0)
                 GROUP BY COALESCE(NULLIF(TRIM(i.category), ''), 'General')
                 ORDER BY cat_val DESC
                 LIMIT 10
-            """, (project_id, project_id)).fetchall()
+            """, base_params).fetchall()
 
             category_orders = [{"name": r[0], "value": round(float(r[1]), 2)} for r in cat_rows]
 
             # Top 15 Stockout Risk Items
-            top_risk_rows = con.execute("""
+            top_risk_rows = con.execute(f"""
                 SELECT i.id, i.code, i.description, i.category, i.location, i.on_hand, i.reorder_point,
                        i.order_now, COALESCE(i.order_now_value, i.order_now * i.sales_price, 0.0) as order_val,
                        i.days_of_supply
@@ -1593,12 +1636,11 @@ def get_project_dashboard_summary(project_id: str) -> Dict[str, Any]:
                     WHERE project_id = ?
                     GROUP BY item_id
                 ) p ON i.id = p.item_id
-                WHERE i.project_id = ?
-                  AND (COALESCE(i.on_hand, 0) > 0 OR COALESCE(p.total_sales, 0) > 0)
+                WHERE {base_where}
                   AND (i.is_stockout = TRUE OR COALESCE(i.on_hand, 0) <= 0)
                 ORDER BY order_val DESC
                 LIMIT 15
-            """, (project_id, project_id)).fetchall()
+            """, base_params).fetchall()
             top_risk_items = [{
                 "id": str(r[0]), "code": str(r[1]), "description": str(r[2] or ""),
                 "category": str(r[3] or ""), "location": str(r[4] or ""),
@@ -1608,7 +1650,7 @@ def get_project_dashboard_summary(project_id: str) -> Dict[str, Any]:
             } for r in top_risk_rows]
 
             # Top 15 Overstock Items
-            top_overstock_rows = con.execute("""
+            top_overstock_rows = con.execute(f"""
                 SELECT i.id, i.code, i.description, i.category, i.location, i.on_hand,
                        COALESCE(i.overstock_value, 0.0) as over_val, i.days_of_supply
                 FROM items i
@@ -1618,12 +1660,11 @@ def get_project_dashboard_summary(project_id: str) -> Dict[str, Any]:
                     WHERE project_id = ?
                     GROUP BY item_id
                 ) p ON i.id = p.item_id
-                WHERE i.project_id = ?
-                  AND (COALESCE(i.on_hand, 0) > 0 OR COALESCE(p.total_sales, 0) > 0)
+                WHERE {base_where}
                   AND i.is_overstock = TRUE
                 ORDER BY over_val DESC
                 LIMIT 15
-            """, (project_id, project_id)).fetchall()
+            """, base_params).fetchall()
             top_overstock_items = [{
                 "id": str(r[0]), "code": str(r[1]), "description": str(r[2] or ""),
                 "category": str(r[3] or ""), "location": str(r[4] or ""),
@@ -1636,6 +1677,7 @@ def get_project_dashboard_summary(project_id: str) -> Dict[str, Any]:
                 "active_skus": kpis.get("totalSkus", 0),
                 "dormant_count": dormant_count,
                 "excluded_dormant_count": dormant_count,
+                "location": location or "ALL",
                 "kpis": kpis,
                 "stockout_count": stockout_count,
                 "overstock_count": overstock_count,
@@ -1651,20 +1693,21 @@ def get_project_dashboard_summary(project_id: str) -> Dict[str, Any]:
         finally:
             con.close()
 
-def get_workspace(project_id: str, include_dormant: bool = False, page: int = 1, page_size: int = 100) -> Dict[str, Any]:
+def get_workspace(project_id: str, include_dormant: bool = False, page: int = 1, page_size: int = 100, location: Optional[str] = None) -> Dict[str, Any]:
     """Loads slim paginated items, overrides, settings, and filters for project, preventing RAM exhaustion."""
     project = get_project_by_id(project_id)
     paginated = get_project_items_paginated(
         project_id,
         page=page,
         page_size=page_size if page_size > 0 else 100,
+        location=location or "",
         include_dormant=include_dormant,
         include_periods=True
     )
     filters = get_saved_filters_for_project(project_id)
     transitions = get_in_transition_for_project(project_id)
-    kpis = compute_project_kpis(project_id)
-    dormant_count = get_project_dormant_count(project_id)
+    kpis = compute_project_kpis(project_id, location=location)
+    dormant_count = get_project_dormant_count(project_id, location=location)
     return {
         "project": project,
         "items": paginated["items"],
@@ -1676,7 +1719,8 @@ def get_workspace(project_id: str, include_dormant: bool = False, page: int = 1,
         "transitions": transitions,
         "kpis": kpis,
         "dormant_count": dormant_count,
-        "excluded_dormant_count": dormant_count
+        "excluded_dormant_count": dormant_count,
+        "location": location or "ALL"
     }
 
 def save_period_override(project_id: str, item_id: str, date: str, override_val: Optional[float]):
@@ -1927,14 +1971,23 @@ def bulk_upsert_in_transit(project_id: str, records: List[Dict[str, Any]], merge
         finally:
             con.close()
 
-def compute_project_kpis(project_id: str) -> Dict[str, Any]:
-    """Computes real aggregate supply chain KPIs dynamically from DuckDB, excluding dormant SKUs (0 stock & 0 sales)."""
+def compute_project_kpis(project_id: str, location: Optional[str] = None) -> Dict[str, Any]:
+    """Computes real aggregate supply chain KPIs dynamically from DuckDB, excluding dormant SKUs (0 stock & 0 sales), optionally filtered by branch."""
     with _LOCK:
         con = get_connection()
         try:
-            dormant_count = get_project_dormant_count(project_id)
+            dormant_count = get_project_dormant_count(project_id, location=location)
+            is_loc_filter = bool(location and location.strip() and location.strip().upper() != "ALL")
+            loc_val = location.strip() if is_loc_filter else None
+
+            where_clause = "i.project_id = ? AND (COALESCE(i.on_hand, 0) > 0 OR COALESCE(p.total_sales, 0) > 0)"
+            params = [project_id, project_id]
+            if is_loc_filter:
+                where_clause += " AND LOWER(TRIM(i.location)) = LOWER(TRIM(?))"
+                params.append(loc_val)
+
             # Query aggregates only from active, analyzable items
-            row = con.execute("""
+            row = con.execute(f"""
                 SELECT 
                     COUNT(*) as total_skus,
                     COALESCE(SUM(i.on_hand * COALESCE(NULLIF(i.purchase_price, 0.0), i.sales_price, 0.0)), 0.0) as total_inventory_value,
@@ -1953,9 +2006,8 @@ def compute_project_kpis(project_id: str) -> Dict[str, Any]:
                     WHERE project_id = ?
                     GROUP BY item_id
                 ) p ON i.id = p.item_id
-                WHERE i.project_id = ?
-                  AND (COALESCE(i.on_hand, 0) > 0 OR COALESCE(p.total_sales, 0) > 0)
-            """, (project_id, project_id)).fetchone()
+                WHERE {where_clause}
+            """, params).fetchone()
 
             total_skus = row[0] or 0
             inv_val = float(row[1] or 0)
@@ -1971,7 +2023,7 @@ def compute_project_kpis(project_id: str) -> Dict[str, Any]:
             margin_pct = ((revenue - cogs) / revenue * 100.0) if revenue > 0 else 0.0
             turns = (cogs / inv_val) if inv_val > 0 else 0.0
 
-            active_orders_row = con.execute("""
+            active_orders_row = con.execute(f"""
                 SELECT COUNT(*)
                 FROM items i
                 LEFT JOIN (
@@ -1980,10 +2032,9 @@ def compute_project_kpis(project_id: str) -> Dict[str, Any]:
                     WHERE project_id = ?
                     GROUP BY item_id
                 ) p ON i.id = p.item_id
-                WHERE i.project_id = ?
-                  AND (COALESCE(i.on_hand, 0) > 0 OR COALESCE(p.total_sales, 0) > 0)
+                WHERE {where_clause}
                   AND i.order_now > 0
-            """, (project_id, project_id)).fetchone()
+            """, params).fetchone()
             active_orders_count = active_orders_row[0] if active_orders_row else 0
 
             return {
@@ -2007,6 +2058,29 @@ def compute_project_kpis(project_id: str) -> Dict[str, Any]:
         finally:
             con.close()
 
+def normalize_horizon(val: Any) -> str:
+    """Normalizes any horizon representation (integers or strings) to standardized keys."""
+    if val is None or str(val).strip() == "":
+        return "12m"
+    s = str(val).strip().lower()
+    if s in ("1w", "2w", "3w", "1m", "3m", "6m", "12m", "18m", "24m"):
+        return s
+    num_map = {
+        "1": "1m",
+        "3": "3m",
+        "6": "6m",
+        "9": "3m",
+        "12": "12m",
+        "18": "18m",
+        "24": "24m",
+        "36": "24m"
+    }
+    if s in num_map:
+        return num_map[s]
+    if s.endswith("w") or s.endswith("m"):
+        return s
+    return "12m"
+
 def _ensure_settings_table(con):
     con.execute("""
         CREATE TABLE IF NOT EXISTS app_settings (
@@ -2018,7 +2092,7 @@ def _ensure_settings_table(con):
             decimal_places INTEGER DEFAULT 2,
             exchange_rate DOUBLE DEFAULT 1.0,
             analysis_lookback_periods INTEGER DEFAULT 12,
-            forecast_horizon_periods INTEGER DEFAULT 12,
+            forecast_horizon_periods VARCHAR DEFAULT '12m',
             period_granularity VARCHAR DEFAULT 'monthly',
             default_forecast_model VARCHAR DEFAULT 'auto',
             default_service_level DOUBLE DEFAULT 0.95,
@@ -2036,7 +2110,17 @@ def _ensure_settings_table(con):
             updated_at VARCHAR
         )
     """)
-    cols = [c[1].lower() for c in con.execute("PRAGMA table_info('app_settings')").fetchall()]
+    cols_info = con.execute("PRAGMA table_info('app_settings')").fetchall()
+    cols = [c[1].lower() for c in cols_info]
+    # Check if forecast_horizon_periods column type is INTEGER/BIGINT and migrate to VARCHAR
+    for c in cols_info:
+        if c[1].lower() == 'forecast_horizon_periods':
+            col_type = str(c[2]).upper()
+            if 'INT' in col_type:
+                try:
+                    con.execute("ALTER TABLE app_settings ALTER COLUMN forecast_horizon_periods TYPE VARCHAR;")
+                except Exception:
+                    pass
     if "active_project_id" not in cols:
         try:
             con.execute("ALTER TABLE app_settings ADD COLUMN active_project_id VARCHAR DEFAULT 'proj_default_retail'")
@@ -2047,6 +2131,26 @@ def _ensure_settings_table(con):
             con.execute("ALTER TABLE app_settings ADD COLUMN initial_seed_done VARCHAR DEFAULT 'false'")
         except Exception:
             pass
+
+    # Normalize any legacy pure numeric horizon values in app_settings
+    try:
+        con.execute("""
+            UPDATE app_settings
+            SET forecast_horizon_periods = CASE
+                WHEN forecast_horizon_periods = '1' THEN '1m'
+                WHEN forecast_horizon_periods = '3' THEN '3m'
+                WHEN forecast_horizon_periods = '6' THEN '6m'
+                WHEN forecast_horizon_periods = '9' THEN '3m'
+                WHEN forecast_horizon_periods = '12' THEN '12m'
+                WHEN forecast_horizon_periods = '18' THEN '18m'
+                WHEN forecast_horizon_periods = '24' THEN '24m'
+                WHEN forecast_horizon_periods = '36' THEN '24m'
+                ELSE forecast_horizon_periods
+            END
+            WHERE forecast_horizon_periods IN ('1', '3', '6', '9', '12', '18', '24', '36');
+        """)
+    except Exception:
+        pass
 
 def get_app_settings() -> Dict[str, Any]:
     """Retrieves persistent application settings from DuckDB."""
@@ -2076,7 +2180,7 @@ def get_app_settings() -> Dict[str, Any]:
                         abc_a_cutoff, abc_b_cutoff, xyz_x_cv, xyz_y_cv, active_project_id, initial_seed_done, updated_at
                     ) VALUES (
                         'global_settings', 'en', 'EGP', 'ج.م', 'after',
-                        2, 1.0, 12, 12,
+                        2, 1.0, 12, '12m',
                         'monthly', 'auto', 0.95, 'periodic',
                         30.0, 7.0, 90.0, 60.0,
                         80.0, 95.0, 0.5, 1.0, 'proj_default_retail', 'false', ?
@@ -2090,7 +2194,7 @@ def get_app_settings() -> Dict[str, Any]:
                     "decimal_places": 2,
                     "exchange_rate": 1.0,
                     "analysis_lookback_periods": 12,
-                    "forecast_horizon_periods": 12,
+                    "forecast_horizon_periods": "12m",
                     "period_granularity": "monthly",
                     "default_forecast_model": "auto",
                     "default_service_level": 0.95,
@@ -2116,7 +2220,7 @@ def get_app_settings() -> Dict[str, Any]:
                 "decimal_places": int(row[4] if row[4] is not None else 2),
                 "exchange_rate": clean_float(row[5], 1.0),
                 "analysis_lookback_periods": int(row[6] if row[6] is not None else 12),
-                "forecast_horizon_periods": int(row[7] if row[7] is not None else 12),
+                "forecast_horizon_periods": normalize_horizon(row[7]),
                 "period_granularity": row[8] or "monthly",
                 "default_forecast_model": row[9] or "auto",
                 "default_service_level": clean_float(row[10], 0.95),
@@ -2155,7 +2259,7 @@ def save_app_settings(updates: Dict[str, Any]) -> Dict[str, Any]:
                         abc_a_cutoff, abc_b_cutoff, xyz_x_cv, xyz_y_cv, active_project_id, initial_seed_done, updated_at
                     ) VALUES (
                         'global_settings', 'en', 'EGP', 'ج.م', 'after',
-                        2, 1.0, 12, 12,
+                        2, 1.0, 12, '12m',
                         'monthly', 'auto', 0.95, 'periodic',
                         30.0, 7.0, 90.0, 60.0,
                         80.0, 95.0, 0.5, 1.0, 'proj_default_retail', 'false', ?
@@ -2169,9 +2273,19 @@ def save_app_settings(updates: Dict[str, Any]) -> Dict[str, Any]:
                 "default_order_cycle_days", "default_lead_time_days", "overstock_threshold_days", "dead_stock_days",
                 "abc_a_cutoff", "abc_b_cutoff", "xyz_x_cv", "xyz_y_cv", "active_project_id", "initial_seed_done"
             }
+
+            clean_updates = dict(updates)
+            if "forecast_horizon_periods" in clean_updates and clean_updates["forecast_horizon_periods"] is not None:
+                clean_updates["forecast_horizon_periods"] = normalize_horizon(clean_updates["forecast_horizon_periods"])
+            if "analysis_lookback_periods" in clean_updates and clean_updates["analysis_lookback_periods"] is not None:
+                try:
+                    clean_updates["analysis_lookback_periods"] = int(clean_updates["analysis_lookback_periods"])
+                except Exception:
+                    pass
+
             set_clauses = ["updated_at = ?"]
             params = [now_str]
-            for k, v in updates.items():
+            for k, v in clean_updates.items():
                 if k in allowed and v is not None:
                     set_clauses.append(f"{k} = ?")
                     params.append(v)

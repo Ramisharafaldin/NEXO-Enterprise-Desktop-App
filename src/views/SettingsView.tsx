@@ -1,5 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import { AppSettings } from '../engine/types';
+import { normalizeHorizonKey } from '../engine/math';
 import { translations, Language } from '../i18n/translations';
 import { 
   SUPPORTED_CURRENCIES, 
@@ -25,7 +26,8 @@ import {
   Percent,
   Rocket,
   DownloadCloud,
-  RefreshCw
+  RefreshCw,
+  Building2
 } from 'lucide-react';
 import { api, UpdateInfo } from '../api/client';
 
@@ -37,6 +39,10 @@ interface SettingsViewProps {
   onLanguageChange: (lang: Language) => void;
   onCheckUpdate?: () => void;
   appVersion?: string;
+  selectedLocation?: string;
+  availableLocations?: { location: string; sku_count: number }[];
+  onLocationChange?: (location: string) => void;
+  totalSkus?: number;
 }
 
 export const SettingsView: React.FC<SettingsViewProps> = ({
@@ -47,6 +53,10 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
   onLanguageChange,
   onCheckUpdate,
   appVersion,
+  selectedLocation,
+  availableLocations,
+  onLocationChange,
+  totalSkus,
 }) => {
   const t = translations[language];
   const isAr = language === 'ar';
@@ -382,6 +392,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                   onChange={e => handleChange('analysis_lookback_periods', Number(e.target.value))}
                   className="w-full px-3 py-2 border border-[#CBD5E1] rounded text-slate-800 font-semibold bg-white focus:outline-none focus:border-[#2196F3] cursor-pointer font-mono"
                 >
+                  <option value={3}>3 {isAr ? 'أشهر' : 'Months'}</option>
                   <option value={6}>6 {isAr ? 'أشهر' : 'Months (Half Year)'}</option>
                   <option value={12}>12 {isAr ? 'شهراً (سنة كاملة)' : 'Months (1 Full Year)'}</option>
                   <option value={18}>18 {isAr ? 'شهراً' : 'Months (1.5 Years)'}</option>
@@ -399,15 +410,19 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                   {t.settings.horizonLabel}
                 </label>
                 <select
-                  value={formData.forecast_horizon_periods}
-                  onChange={e => handleChange('forecast_horizon_periods', Number(e.target.value))}
+                  value={normalizeHorizonKey(formData.forecast_horizon_periods)}
+                  onChange={e => handleChange('forecast_horizon_periods', e.target.value)}
                   className="w-full px-3 py-2 border border-[#CBD5E1] rounded text-slate-800 font-bold bg-white focus:outline-none focus:border-[#2196F3] cursor-pointer font-mono text-[#2196F3]"
                 >
-                  <option value={3}>+3 {isAr ? 'فترات مقبلة (ربع سنوي)' : 'Periods (Quarterly)'}</option>
-                  <option value={6}>+6 {isAr ? 'فترات مقبلة (نصف سنوي)' : 'Periods (Bi-Annual)'}</option>
-                  <option value={12}>+12 {isAr ? 'فترة مقبلة (سنة كاملة)' : 'Periods (Annual)'}</option>
-                  <option value={18}>+18 {isAr ? 'فترة مقبلة' : 'Periods (18 Months)'}</option>
-                  <option value={24}>+24 {isAr ? 'فترة مقبلة (سنتان)' : 'Periods (24 Months)'}</option>
+                  <option value="1w">{isAr ? 'أسبوع واحد (7 أيام)' : '1 Week (7 Days)'}</option>
+                  <option value="2w">{isAr ? 'أسبوعان (14 يوم)' : '2 Weeks (14 Days)'}</option>
+                  <option value="3w">{isAr ? '3 أسابيع (21 يوم)' : '3 Weeks (21 Days)'}</option>
+                  <option value="1m">{isAr ? 'شهر واحد' : '1 Month'}</option>
+                  <option value="3m">{isAr ? '+3 فترات مقبلة (ربع سنوي)' : '+3 Periods (Quarterly)'}</option>
+                  <option value="6m">{isAr ? '+6 فترات مقبلة (نصف سنوي)' : '+6 Periods (Bi-Annual)'}</option>
+                  <option value="12m">{isAr ? '+12 فترة مقبلة (سنة كاملة)' : '+12 Periods (Annual)'}</option>
+                  <option value="18m">{isAr ? '+18 فترة مقبلة' : '+18 Periods (18 Months)'}</option>
+                  <option value="24m">{isAr ? '+24 فترة مقبلة (سنتان)' : '+24 Periods (24 Months)'}</option>
                 </select>
                 <span className="text-[10px] text-slate-400 mt-1 block">
                   {t.settings.horizonHelp}
@@ -446,6 +461,39 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                   <option value="linear">{t.settings.modelLinear}</option>
                   <option value="constant">{t.settings.modelConstant}</option>
                 </select>
+              </div>
+
+              {/* Global Branch / Location Analysis Scope */}
+              <div className="col-span-1 md:col-span-2 lg:col-span-4 pt-3.5 border-t border-slate-100 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+                <div>
+                  <div className="flex items-center gap-1.5 mb-0.5">
+                    <Building2 className="w-3.5 h-3.5 text-[#2196F3]" />
+                    <label className="text-[11px] font-bold text-slate-800 uppercase tracking-wide">
+                      {isAr ? 'نطاق تحليل الفروع / المخازن (Branch Analysis Scope)' : 'Branch / Location Scope'}
+                    </label>
+                  </div>
+                  <span className="text-[10px] text-slate-500">
+                    {isAr
+                      ? 'تحليل أداء وتوقعات فرع مستقل بذاته أو جميع فروع ومخازن المشروع معاً'
+                      : 'Analyze forecast, stock, and replenishment for an isolated branch or all branches combined'}
+                  </span>
+                </div>
+                <div className="flex items-center gap-2">
+                  <select
+                    value={selectedLocation || 'ALL'}
+                    onChange={e => onLocationChange && onLocationChange(e.target.value)}
+                    className="px-3 py-1.5 border border-[#CBD5E1] rounded text-slate-800 font-bold bg-white focus:outline-none focus:border-[#2196F3] cursor-pointer text-xs shadow-2xs"
+                  >
+                    <option value="ALL">
+                      {isAr ? 'جميع الفروع (الكل)' : 'All Branches (Combined)'} ({totalSkus || availableLocations?.reduce((acc, l) => acc + l.sku_count, 0) || 0} SKU)
+                    </option>
+                    {availableLocations?.map(loc => (
+                      <option key={loc.location} value={loc.location}>
+                        {loc.location} ({loc.sku_count} SKU)
+                      </option>
+                    ))}
+                  </select>
+                </div>
               </div>
             </div>
           </section>

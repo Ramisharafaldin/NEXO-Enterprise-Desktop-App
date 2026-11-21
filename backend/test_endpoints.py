@@ -23,6 +23,7 @@ os.environ["NEXO_BOOTSTRAP_NONCE"] = TEST_BOOTSTRAP_NONCE
 import asyncio
 import uuid
 import time
+import urllib.parse
 from pathlib import Path
 import httpx
 from backend.server import app
@@ -1112,7 +1113,112 @@ SKU_RAGGED_3,طابعة ليزر "HP",مخزن الإسكندرية
 
         print(f"27. Real UTF-8-BOM (utf-8-sig) Arabic CSV Preview & Streaming Ingestion Persistence PASSED")
 
-        print('\n=== ALL 27 BACKEND & DATA HUB ENDPOINTS TESTED AND VERIFIED 100% OPERATIONAL! ===')
+        # ----------------------------------------------------------------------
+        # Test 28: Global Branch/Location Analysis Selector & Location Filtering
+        # ----------------------------------------------------------------------
+        branch_pid = "proj_test_branch_scope"
+        r_create = await client.post("/api/projects", json={"id": branch_pid, "name": "Branch Scope Test Project"})
+        assert r_create.status_code == 200, f"Failed to create project: {r_create.text}"
+
+        # Insert items across two distinct branches: 'السلام' and 'مدينة نصر'
+        con_branch = get_connection()
+        try:
+            con_branch.execute(f"""
+                INSERT INTO items (
+                    id, project_id, code, description, category, location, supplier,
+                    on_hand, on_order, lead_time_days, safety_stock, reorder_point,
+                    order_now, order_now_value, days_of_supply, sales_price, purchase_price,
+                    abc_class, xyz_class, service_level, model_type, updated_at
+                ) VALUES 
+                ('it_br_1', '{branch_pid}', 'SKU-BR-1', 'Branch SKU 1', 'Beverages', 'السلام', 'Sup1',
+                 50.0, 0.0, 14.0, 20.0, 30.0, 10.0, 250.0, 25.0, 35.0, 25.0, 'A', 'X', 0.95, 'auto', CURRENT_TIMESTAMP),
+                ('it_br_2', '{branch_pid}', 'SKU-BR-2', 'Branch SKU 2', 'Snacks', 'السلام', 'Sup1',
+                 80.0, 0.0, 14.0, 15.0, 25.0, 0.0, 0.0, 45.0, 20.0, 15.0, 'B', 'Y', 0.95, 'auto', CURRENT_TIMESTAMP),
+                ('it_br_3', '{branch_pid}', 'SKU-BR-3', 'Branch SKU 3', 'Beverages', 'مدينة نصر', 'Sup2',
+                 30.0, 0.0, 10.0, 10.0, 20.0, 20.0, 600.0, 15.0, 40.0, 30.0, 'A', 'X', 0.95, 'auto', CURRENT_TIMESTAMP);
+            """)
+            con_branch.execute(f"""
+                INSERT INTO periods (id, project_id, item_id, date, actual, forecast) VALUES
+                ('per_br_1', '{branch_pid}', 'it_br_1', '2026-03', 100.0, 110.0),
+                ('per_br_2', '{branch_pid}', 'it_br_2', '2026-03', 60.0, 65.0),
+                ('per_br_3', '{branch_pid}', 'it_br_3', '2026-03', 80.0, 85.0);
+            """)
+            con_branch.execute("CHECKPOINT")
+        finally:
+            con_branch.close()
+
+        # Step A: Test GET /api/projects/{pid}/locations
+        r_locs = await client.get(f"/api/projects/{branch_pid}/locations")
+        assert r_locs.status_code == 200, f"Locations endpoint failed: {r_locs.text}"
+        locs_data = r_locs.json()
+        assert locs_data["total_locations"] == 2, f"Expected 2 locations, got {locs_data['total_locations']}"
+        loc_names = [l["location"] for l in locs_data["locations"]]
+        assert "السلام" in loc_names and "مدينة نصر" in loc_names
+        salam_loc = next(l for l in locs_data["locations"] if l["location"] == "السلام")
+        assert salam_loc["sku_count"] == 2
+
+        # Step B: Test location filtering on /api/inventory
+        r_inv_all = await client.get(f"/api/inventory?project_id={branch_pid}&location=ALL")
+        assert r_inv_all.status_code == 200
+        assert r_inv_all.json()["total_count"] == 3
+
+        r_inv_salam = await client.get(f"/api/inventory?project_id={branch_pid}&location=السلام")
+        assert r_inv_salam.status_code == 200
+        inv_salam = r_inv_salam.json()
+        assert inv_salam["total_count"] == 2
+        assert all(it["location"] == "السلام" for it in inv_salam["items"])
+
+        # Step C: Test location filtering on /api/demand
+        r_dem_salam = await client.get(f"/api/demand?project_id={branch_pid}&location=السلام")
+        assert r_dem_salam.status_code == 200
+        dem_salam = r_dem_salam.json()
+        assert dem_salam["total_count"] == 2
+        assert all(it["location"] == "السلام" for it in dem_salam["series"])
+
+        # Step D: Test location filtering on /api/dashboard and /api/projects/{pid}/kpis
+        r_dash_salam = await client.get(f"/api/dashboard?project_id={branch_pid}&location=السلام")
+        assert r_dash_salam.status_code == 200
+        assert r_dash_salam.json()["active_skus"] == 2
+        assert r_dash_salam.json()["location"] == "السلام"
+
+        r_kpis_salam = await client.get(f"/api/projects/{branch_pid}/kpis?location=السلام")
+        assert r_kpis_salam.status_code == 200
+        assert r_kpis_salam.json()["totalSkus"] == 2
+
+        # Step E: Test Excel export with branch name in filename and zero currency symbols in headers
+        r_exp_orders = await client.get(f"/api/files/export?project_id={branch_pid}&export_type=orders&location=السلام")
+        assert r_exp_orders.status_code == 200
+        cd_hdr = r_exp_orders.headers.get("content-disposition", "")
+        assert "PO_" in cd_hdr
+        assert urllib.parse.quote("السلام") in cd_hdr or "السلام" in cd_hdr
+
+        # Verify Excel content has zero currency symbols
+        import openpyxl
+        wb_exp = openpyxl.load_workbook(io.BytesIO(r_exp_orders.content))
+        ws_orders = wb_exp["Planned Orders"]
+        headers = [cell.value for cell in ws_orders[1]]
+        for h in headers:
+            if h:
+                assert "($)" not in str(h), f"Header '{h}' contains currency symbol '($)'"
+        assert "Unit Cost" in headers
+        assert "Total Value" in headers
+
+        # Verify inventory export headers as well
+        r_exp_inv = await client.get(f"/api/files/export?project_id={branch_pid}&export_type=replenishment&location=السلام")
+        assert r_exp_inv.status_code == 200
+        wb_inv = openpyxl.load_workbook(io.BytesIO(r_exp_inv.content))
+        ws_inv = wb_inv["Inventory Replenishment"]
+        inv_headers = [cell.value for cell in ws_inv[1]]
+        for h in inv_headers:
+            if h:
+                assert "($)" not in str(h), f"Header '{h}' contains currency symbol '($)'"
+        assert "Sales Price" in inv_headers
+        assert "Purchase Price" in inv_headers
+        assert "Order Value" in inv_headers
+
+        print("28. Global Branch / Location Analysis Selector & Location Filtering PASSED")
+
+        print('\n=== ALL 28 BACKEND & DATA HUB ENDPOINTS TESTED AND VERIFIED 100% OPERATIONAL! ===')
 
 if __name__ == '__main__':
     try:

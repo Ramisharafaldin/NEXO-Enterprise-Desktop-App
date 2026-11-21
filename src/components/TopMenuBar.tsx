@@ -7,6 +7,7 @@ import {
   Download, 
   Server, 
   Database,
+  Building2,
   Sliders,
   ChevronDown,
   ShoppingCart,
@@ -40,6 +41,10 @@ interface TopMenuBarProps {
   isServerConnected: boolean;
   appVersion?: string;
   pythonVersion?: string;
+  selectedLocation?: string;
+  availableLocations?: { location: string; sku_count: number }[];
+  onLocationChange?: (location: string) => void;
+  totalSkus?: number;
 }
 
 export const TopMenuBar: React.FC<TopMenuBarProps> = ({
@@ -62,6 +67,10 @@ export const TopMenuBar: React.FC<TopMenuBarProps> = ({
   isServerConnected,
   appVersion,
   pythonVersion,
+  selectedLocation,
+  availableLocations,
+  onLocationChange,
+  totalSkus,
 }) => {
   const t = translations[language];
   const isAr = language === 'ar';
@@ -373,8 +382,31 @@ export const TopMenuBar: React.FC<TopMenuBarProps> = ({
           </button>
         </div>
 
-        {/* Right-aligned: Connect to Server / DB status button */}
+        {/* Right-aligned: Branch Selector & Connect to Server / DB status button */}
         <div className="flex items-center gap-2">
+          {/* Global Branch / Location Scope Dropdown */}
+          <div className="flex items-center gap-1.5 px-2.5 py-1 bg-white border border-[#CBD5E1] rounded shadow-2xs hover:border-[#2196F3] transition text-[11px]">
+            <Building2 className="w-3.5 h-3.5 text-[#2196F3] shrink-0" />
+            <span className="text-[10px] font-bold text-slate-500 uppercase tracking-wider hidden sm:inline">
+              {isAr ? 'الفرع:' : 'Branch:'}
+            </span>
+            <select
+              value={selectedLocation || 'ALL'}
+              onChange={e => onLocationChange && onLocationChange(e.target.value)}
+              className="bg-transparent font-bold text-slate-800 text-[11px] focus:outline-none cursor-pointer py-0.5"
+              title={isAr ? 'اختر نطاق تحليل الفرع أو جميع الفروع معاً' : 'Select branch scope or all branches combined'}
+            >
+              <option value="ALL">
+                {isAr ? 'جميع الفروع (الكل)' : 'All Branches (Combined)'} ({totalSkus || availableLocations?.reduce((acc, l) => acc + l.sku_count, 0) || 0})
+              </option>
+              {availableLocations?.map(loc => (
+                <option key={loc.location} value={loc.location}>
+                  {loc.location} ({loc.sku_count})
+                </option>
+              ))}
+            </select>
+          </div>
+
           <button
             onClick={onOpenSqlServerModal}
             className={`flex items-center gap-2 px-3 py-1 rounded border text-[11px] font-semibold transition ${

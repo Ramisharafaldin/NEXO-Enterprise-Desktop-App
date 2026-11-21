@@ -22,6 +22,7 @@ interface PlannedOrdersModalProps {
   onApproveOrder: (itemId: string) => void;
   settings?: AppSettings;
   language: Language;
+  selectedLocation?: string;
 }
 
 interface SupplierPOGroup {
@@ -43,6 +44,7 @@ export const PlannedOrdersModal: React.FC<PlannedOrdersModalProps> = ({
   onApproveOrder,
   settings,
   language,
+  selectedLocation,
 }) => {
   if (!isOpen) return null;
 
@@ -54,8 +56,12 @@ export const PlannedOrdersModal: React.FC<PlannedOrdersModalProps> = ({
 
   // 1. Filter all replenishment items that have active orders
   const orderItems = useMemo(() => {
-    return items.filter(isAnalyzableItem).filter(i => (i.orderNow || 0) > 0);
-  }, [items]);
+    return items.filter(isAnalyzableItem).filter(i => {
+      if ((i.orderNow || 0) <= 0) return false;
+      if (!selectedLocation || selectedLocation === 'ALL') return true;
+      return (i.location || '').toLowerCase().trim() === selectedLocation.toLowerCase().trim();
+    });
+  }, [items, selectedLocation]);
 
   const totalSkus = orderItems.length;
   const totalUnits = useMemo(() => orderItems.reduce((sum, i) => sum + (i.orderNow || 0), 0), [orderItems]);
@@ -168,7 +174,9 @@ export const PlannedOrdersModal: React.FC<PlannedOrdersModalProps> = ({
       [isAr ? 'حالة الاعتماد' : 'Approval Status']: i.approvalState || 'pending',
     }));
     const safeSupplier = group.supplierName.replace(/[\\/*?:\[\]]/g, '_').slice(0, 30);
-    const filename = `NEXO_${group.poNumber}_${safeSupplier}.xlsx`;
+    const hasLoc = Boolean(selectedLocation && selectedLocation !== 'ALL');
+    const locTag = hasLoc ? `_${selectedLocation!.trim()}` : '';
+    const filename = `PO${locTag}_${group.poNumber}_${safeSupplier}.xlsx`;
     await exportSheetsToExcel([{ name: group.poNumber, rows }], filename);
   };
 
@@ -203,10 +211,12 @@ export const PlannedOrdersModal: React.FC<PlannedOrdersModalProps> = ({
       }
     }
 
+    const hasLoc = Boolean(selectedLocation && selectedLocation !== 'ALL');
+    const locTag = hasLoc ? `_${selectedLocation!.trim()}` : '';
     await exportSheetsToExcel([
       { name: isAr ? 'ملخص أوامر الشراء' : 'PO Summary', rows: summaryRows },
       { name: isAr ? 'تفاصيل الأصناف' : 'PO Line Items', rows: lineItemRows }
-    ], 'NEXO_Planned_Purchase_Orders.xlsx');
+    ], `PO${locTag}_Planned_Purchase_Orders.xlsx`);
   };
 
   return (

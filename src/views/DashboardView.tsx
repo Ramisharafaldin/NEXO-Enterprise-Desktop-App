@@ -38,6 +38,7 @@ interface DashboardViewProps {
   projectId?: string;
   onRefresh?: () => void;
   onNavigateToDataHub?: () => void;
+  selectedLocation?: string;
 }
 
 export const DashboardView: React.FC<DashboardViewProps> = ({
@@ -47,6 +48,7 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
   projectId,
   onRefresh,
   onNavigateToDataHub,
+  selectedLocation,
 }) => {
   const t = translations[language];
   const isAr = language === 'ar';
@@ -98,7 +100,7 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
     if (!projectId) return;
     setIsRefreshing(true);
     try {
-      const summary = await api.getDashboard(projectId);
+      const summary = await api.getDashboard(projectId, selectedLocation);
       setDashboardSummary(summary);
       if (summary.kpis) {
         setDbKpis(summary.kpis);
@@ -106,7 +108,7 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
     } catch (e) {
       console.warn('Dashboard: Failed to load backend summary, falling back to local calculation', e);
       try {
-        const res = await api.getKpis(projectId);
+        const res = await api.getKpis(projectId, selectedLocation);
         setDbKpis(res);
       } catch (err) {}
     } finally {
@@ -118,7 +120,7 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
     setDashboardSummary(null);
     setDbKpis(null);
     fetchKpis();
-  }, [projectId]);
+  }, [projectId, selectedLocation]);
 
   const handleRefreshClick = async () => {
     await fetchKpis();
@@ -126,7 +128,11 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
   };
 
   // Strict Defensive Exclusion: Filter out any dormant SKUs (onHand <= 0 && totalSales <= 0)
-  const activeItems = useMemo(() => (items || []).filter(isAnalyzableItem), [items]);
+  const activeItems = useMemo(() => {
+    const list = (items || []).filter(isAnalyzableItem);
+    if (!selectedLocation || selectedLocation === 'ALL') return list;
+    return list.filter(i => (i.location || '').toLowerCase().trim() === selectedLocation.toLowerCase().trim());
+  }, [items, selectedLocation]);
 
   // Aggregated KPIs (DuckDB backend prioritised, fallback to local item computations)
   const totalInventoryValue = dashboardSummary?.kpis?.totalInventoryValue ?? dbKpis?.totalInventoryValue ?? activeItems.reduce((sum, i) => sum + (i.inventoryValue || (i.onHand * i.salesPrice) || 0), 0);

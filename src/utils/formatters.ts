@@ -81,7 +81,7 @@ export const DEFAULT_APP_SETTINGS: AppSettings = {
   decimal_places: 2,
   exchange_rate: 1.0,
   analysis_lookback_periods: 12,
-  forecast_horizon_periods: 12,
+  forecast_horizon_periods: '12m',
   period_granularity: 'monthly',
   default_forecast_model: 'auto',
   default_service_level: 0.95,

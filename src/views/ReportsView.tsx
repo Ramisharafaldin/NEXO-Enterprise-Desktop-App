@@ -26,6 +26,7 @@ interface ReportsViewProps {
   settings?: AppSettings;
   language: Language;
   onNavigateToDataHub?: () => void;
+  selectedLocation?: string;
 }
 
 export const ReportsView: React.FC<ReportsViewProps> = ({
@@ -33,6 +34,7 @@ export const ReportsView: React.FC<ReportsViewProps> = ({
   settings,
   language,
   onNavigateToDataHub,
+  selectedLocation,
 }) => {
   const t = translations[language];
   const isAr = language === 'ar';
@@ -51,7 +53,11 @@ export const ReportsView: React.FC<ReportsViewProps> = ({
   const [filterStockStatus, setFilterStockStatus] = useState<'all' | 'stockout' | 'overstock' | 'reorder'>('all');
 
   // Strict Defensive Exclusion: Filter out any dormant SKUs (onHand <= 0 && totalSales <= 0)
-  const activeItems = useMemo(() => (items || []).filter(isAnalyzableItem), [items]);
+  const activeItems = useMemo(() => {
+    const list = (items || []).filter(isAnalyzableItem);
+    if (!selectedLocation || selectedLocation === 'ALL') return list;
+    return list.filter(i => (i.location || '').toLowerCase().trim() === selectedLocation.toLowerCase().trim());
+  }, [items, selectedLocation]);
 
   const uniqueCategories = useMemo(() => Array.from(new Set(activeItems.map(i => i.category || 'General'))), [activeItems]);
   const uniqueLocations = useMemo(() => Array.from(new Set(activeItems.map(i => i.location || 'Central'))), [activeItems]);
@@ -152,8 +158,8 @@ export const ReportsView: React.FC<ReportsViewProps> = ({
         'Safety Stock': i.safetyStock,
         'ROP': i.reorderPoint,
         'Order Now': i.orderNow || 0,
-        [`Unit Cost (${currSym})`]: i.purchasePrice,
-        [`Total Order Value (${currSym})`]: i.orderNowValue || 0,
+        'Unit Cost': i.purchasePrice,
+        'Total Order Value': i.orderNowValue || 0,
         'Approval': i.approvalState,
       }));
     } else if (reportType === 'projectedStock') {
@@ -187,9 +193,9 @@ export const ReportsView: React.FC<ReportsViewProps> = ({
         'Description': i.description,
         'ABC Class': i.abcClass,
         'XYZ Class': i.xyzClass,
-        [`Sales Price (${currSym})`]: i.salesPrice,
+        'Sales Price': i.salesPrice,
         'Turnover Ratio': i.turnoverRatio,
-        [`Inventory Value (${currSym})`]: i.inventoryValue,
+        'Inventory Value': i.inventoryValue,
       }));
     } else if (reportType === 'drp') {
       exportData = filteredItems.map(i => ({
@@ -214,7 +220,9 @@ export const ReportsView: React.FC<ReportsViewProps> = ({
       }));
     }
 
-    await exportSheetsToExcel([{ name: 'Report', rows: exportData }], `NEXO_${reportType}_${periodHorizon}_Report.xlsx`);
+    const hasLoc = Boolean(selectedLocation && selectedLocation !== 'ALL');
+    const locTag = hasLoc ? `_${selectedLocation!.trim()}` : '';
+    await exportSheetsToExcel([{ name: 'Report', rows: exportData }], `NEXO_${reportType}_${periodHorizon}${locTag}_Report.xlsx`);
   };
 
   if (activeItems.length === 0) {

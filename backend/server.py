@@ -63,7 +63,10 @@ import shutil
 import csv
 import codecs
 from pathlib import Path
-from python_calamine import CalamineWorkbook
+try:
+    from python_calamine import CalamineWorkbook
+except Exception:
+    CalamineWorkbook = None
 from typing import Dict, List, Any, Optional, Tuple, Union
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Query, Response, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -137,6 +140,7 @@ try:
         get_active_project_id,
         is_analyzable_sku,
         get_project_dormant_count,
+        get_project_locations,
         get_project_items,
         get_project_items_paginated,
         get_project_dashboard_summary,
@@ -179,6 +183,7 @@ except (ImportError, ModuleNotFoundError):
         get_active_project_id,
         is_analyzable_sku,
         get_project_dormant_count,
+        get_project_locations,
         get_project_items,
         get_project_items_paginated,
         get_project_dashboard_summary,
@@ -417,12 +422,24 @@ def get_project_workspace_endpoint(
     project_id: str,
     include_dormant: bool = Query(False),
     page: int = Query(1, ge=1),
-    page_size: int = Query(100, ge=1)
+    page_size: int = Query(100, ge=1),
+    location: Optional[str] = Query(None)
 ):
-    ws = get_workspace(project_id, include_dormant=include_dormant, page=page, page_size=page_size)
+    ws = get_workspace(project_id, include_dormant=include_dormant, page=page, page_size=page_size, location=location)
     if not ws["project"]:
         raise HTTPException(status_code=404, detail="Project not found")
     return ws
+
+@app.get("/api/projects/{project_id}/locations")
+def get_project_locations_endpoint(project_id: str):
+    """Returns sorted list of distinct non-empty branch/location names with SKU counts."""
+    pid = _resolve_project_id(project_id)
+    locs = get_project_locations(pid)
+    return {
+        "project_id": pid,
+        "total_locations": len(locs),
+        "locations": locs
+    }
 
 # ==============================================================================
 # Global Application Settings Endpoints
@@ -435,8 +452,8 @@ class SettingsUpdateRequest(BaseModel):
     currency_position: Optional[str] = None
     decimal_places: Optional[int] = None
     exchange_rate: Optional[float] = None
-    analysis_lookback_periods: Optional[int] = None
-    forecast_horizon_periods: Optional[int] = None
+    analysis_lookback_periods: Optional[int] = Field(None, ge=1)
+    forecast_horizon_periods: Optional[Union[str, int]] = None
     period_granularity: Optional[str] = None
     default_forecast_model: Optional[str] = None
     default_service_level: Optional[float] = None
@@ -478,16 +495,30 @@ def _resolve_project_id(project_id: Optional[str] = None) -> str:
     raise HTTPException(status_code=404, detail="No projects found")
 
 @app.get("/api/projects/{project_id}/items")
-def get_items_endpoint(project_id: str, include_dormant: bool = Query(False)):
-    items = get_project_items(project_id, include_dormant=include_dormant)
-    dormant_count = get_project_dormant_count(project_id)
+def get_items_endpoint(
+    project_id: str,
+    include_dormant: bool = Query(False),
+    location: Optional[str] = Query(None)
+):
+    items = get_project_items(project_id, include_dormant=include_dormant, location=location)
+    dormant_count = get_project_dormant_count(project_id, location=location)
     return {
         "project_id": project_id,
         "count": len(items),
         "dormant_count": dormant_count,
         "excluded_dormant_count": dormant_count,
+        "location": location or "ALL",
         "items": items
     }
+
+@app.get("/api/items")
+def get_global_items_endpoint(
+    project_id: Optional[str] = Query(None),
+    include_dormant: bool = Query(False),
+    location: Optional[str] = Query(None)
+):
+    pid = _resolve_project_id(project_id)
+    return get_items_endpoint(pid, include_dormant=include_dormant, location=location)
 
 # ==============================================================================
 # Supply Chain Analytical Endpoints (Strict Server-Side Pagination & Slim SQL Aggregations)
@@ -514,8 +545,8 @@ def get_inventory_endpoint(
         include_dormant=include_dormant,
         include_periods=False
     )
-    dormant_count = get_project_dormant_count(pid)
-    kpis = compute_project_kpis(pid)
+    dormant_count = get_project_dormant_count(pid, location=location)
+    kpis = compute_project_kpis(pid, location=location)
     return {
         "project_id": pid,
         "page": paginated["page"],
@@ -526,6 +557,7 @@ def get_inventory_endpoint(
         "count": len(paginated["items"]),
         "dormant_count": dormant_count,
         "excluded_dormant_count": dormant_count,
+        "location": location or "ALL",
         "items": paginated["items"],
         "kpis": kpis
     }
@@ -537,6 +569,7 @@ def get_demand_endpoint(
     page_size: int = Query(50, ge=1, le=100),
     search: str = Query(""),
     category: str = Query(""),
+    location: Optional[str] = Query(None),
     include_dormant: bool = Query(False)
 ):
     pid = _resolve_project_id(project_id)
@@ -546,10 +579,11 @@ def get_demand_endpoint(
         page_size=page_size,
         search=search,
         category=category,
+        location=location or "",
         include_dormant=include_dormant,
         include_periods=True
     )
-    dormant_count = get_project_dormant_count(pid)
+    dormant_count = get_project_dormant_count(pid, location=location)
     categories = get_project_categories(pid)
     return {
         "project_id": pid,
@@ -560,27 +594,35 @@ def get_demand_endpoint(
         "count": len(paginated["items"]),
         "dormant_count": dormant_count,
         "excluded_dormant_count": dormant_count,
+        "location": location or "ALL",
         "categories": categories,
         "series": paginated["items"],
         "items": paginated["items"]
     }
 
 @app.get("/api/dashboard")
-def get_dashboard_endpoint(project_id: Optional[str] = Query(None)):
+def get_dashboard_endpoint(
+    project_id: Optional[str] = Query(None),
+    location: Optional[str] = Query(None)
+):
     pid = _resolve_project_id(project_id)
-    return get_project_dashboard_summary(pid)
+    return get_project_dashboard_summary(pid, location=location)
 
 @app.get("/api/reports")
-def get_reports_endpoint(project_id: Optional[str] = Query(None)):
+def get_reports_endpoint(
+    project_id: Optional[str] = Query(None),
+    location: Optional[str] = Query(None)
+):
     pid = _resolve_project_id(project_id)
-    items = get_project_items(pid, include_dormant=False)
-    kpis = compute_project_kpis(pid)
-    dormant_count = get_project_dormant_count(pid)
+    items = get_project_items(pid, include_dormant=False, location=location)
+    kpis = compute_project_kpis(pid, location=location)
+    dormant_count = get_project_dormant_count(pid, location=location)
     return {
         "project_id": pid,
         "active_skus": len(items),
         "dormant_count": dormant_count,
         "excluded_dormant_count": dormant_count,
+        "location": location or "ALL",
         "items": items,
         "kpis": kpis
     }
@@ -753,8 +795,11 @@ def add_transition_endpoint(project_id: str, req: AddTransitionRequest):
 # ==============================================================================
 
 @app.get("/api/projects/{project_id}/kpis")
-def get_kpis_endpoint(project_id: str):
-    return compute_project_kpis(project_id)
+def get_kpis_endpoint(
+    project_id: str,
+    location: Optional[str] = Query(None)
+):
+    return compute_project_kpis(project_id, location=location)
 
 # ==============================================================================
 # Microsoft SQL Server ERP Integration (Real pyodbc + Diagnostic Engine)
@@ -1501,15 +1546,23 @@ def load_file_into_staging(con: duckdb.DuckDBPyConnection, file_path: str, ext: 
                 except Exception:
                     pass
     else:
-        # Excel (.xlsx / .xls) via python-calamine direct in-memory ingestion (NO temp CSV conversion)
-        from python_calamine import CalamineWorkbook
-        wb = CalamineWorkbook.from_path(file_path)
-        sheet_names = wb.sheet_names
-        if not sheet_names:
-            con.execute("CREATE OR REPLACE TEMP TABLE staging_raw (dummy VARCHAR);")
-            return [], 0
-        sheet = wb.get_sheet_by_name(sheet_names[0])
-        rows = sheet.to_python()
+        # Excel (.xlsx / .xls) via python-calamine direct in-memory ingestion with openpyxl fallback
+        rows = None
+        if CalamineWorkbook is not None:
+            try:
+                wb = CalamineWorkbook.from_path(file_path)
+                sheet_names = wb.sheet_names
+                if sheet_names:
+                    sheet = wb.get_sheet_by_name(sheet_names[0])
+                    rows = sheet.to_python()
+            except Exception:
+                rows = None
+        if rows is None:
+            import openpyxl
+            wb_op = openpyxl.load_workbook(file_path, read_only=True, data_only=True)
+            ws_op = wb_op.active
+            rows = [[cell for cell in row] for row in ws_op.iter_rows(values_only=True)]
+
         if not rows or len(rows) <= 1:
             con.execute("CREATE OR REPLACE TEMP TABLE staging_raw (dummy VARCHAR);")
             return [], 0
@@ -3622,13 +3675,24 @@ async def inspect_file_endpoint(
                     except Exception:
                         pass
         else:
-            from python_calamine import CalamineWorkbook
-            wb = CalamineWorkbook.from_path(tmp_path)
-            sheets = wb.sheet_names
-            if not sheets:
-                raise HTTPException(status_code=400, detail="The Excel workbook contains no sheets.")
-            sheet = wb.get_sheet_by_name(sheets[0])
-            rows = sheet.to_python()
+            sheets = []
+            rows = None
+            if CalamineWorkbook is not None:
+                try:
+                    wb = CalamineWorkbook.from_path(tmp_path)
+                    sheets = list(wb.sheet_names)
+                    if sheets:
+                        sheet = wb.get_sheet_by_name(sheets[0])
+                        rows = sheet.to_python()
+                except Exception:
+                    rows = None
+            if rows is None:
+                import openpyxl
+                wb_op = openpyxl.load_workbook(tmp_path, read_only=True, data_only=True)
+                sheets = list(wb_op.sheetnames)
+                ws_op = wb_op.active
+                rows = [[cell for cell in row] for row in ws_op.iter_rows(values_only=True)]
+
             if rows:
                 cols = [_clean_header_name(c) if c is not None else f"col_{i}" for i, c in enumerate(rows[0])]
                 row_count = max(0, len(rows) - 1)
@@ -3773,16 +3837,18 @@ def export_custom_excel(req: ExcelExportRequest):
     if not filename.endswith(".xlsx"):
         filename += ".xlsx"
     filename = re.sub(r'[\r\n"]', '_', filename)
+    ascii_filename = re.sub(r'[^\x20-\x7E]', '_', filename)
+    encoded_filename = urllib.parse.quote(filename)
 
     return StreamingResponse(
         output,
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        headers={"Content-Disposition": f'attachment; filename="{filename}"'}
+        headers={"Content-Disposition": f'attachment; filename="{ascii_filename}"; filename*=UTF-8\'\'{encoded_filename}'}
     )
 
-def _generate_excel_export(project_id: str, export_type: str = "all") -> StreamingResponse:
-    """Generates real .xlsx exports from DuckDB tables with formula sanitization."""
-    items = get_project_items(project_id)
+def _generate_excel_export(project_id: str, export_type: str = "all", location: Optional[str] = None) -> StreamingResponse:
+    """Generates real .xlsx exports from DuckDB tables with formula sanitization and optional location filtering."""
+    items = get_project_items(project_id, location=location)
     if not items:
         raise HTTPException(status_code=404, detail="No items found for this project")
 
@@ -3794,15 +3860,15 @@ def _generate_excel_export(project_id: str, export_type: str = "all") -> Streami
             "Category": sanitize_excel_cell(it["category"]),
             "Location": sanitize_excel_cell(it["location"]),
             "Supplier": sanitize_excel_cell(it["supplier"]),
-            "Sales Price ($)": it["salesPrice"],
-            "Purchase Price ($)": it["purchasePrice"],
+            "Sales Price": it["salesPrice"],
+            "Purchase Price": it["purchasePrice"],
             "On Hand": it["onHand"],
             "On Order": it["onOrder"],
             "Lead Time (Days)": it["leadTimeDays"],
             "Safety Stock": it["safetyStock"],
             "Reorder Point": it["reorderPoint"],
             "Order Now": it["orderNow"],
-            "Order Value ($)": it["orderNowValue"],
+            "Order Value": it["orderNowValue"],
             "Days of Supply": it["daysOfSupply"],
             "ABC Class": sanitize_excel_cell(it["abcClass"]),
             "XYZ Class": sanitize_excel_cell(it["xyzClass"]),
@@ -3835,8 +3901,8 @@ def _generate_excel_export(project_id: str, export_type: str = "all") -> Streami
                 "Supplier": sanitize_excel_cell(it["supplier"]),
                 "Destination": sanitize_excel_cell(it["location"]),
                 "Order Qty": it["orderNow"],
-                "Unit Cost ($)": it["purchasePrice"],
-                "Total Value ($)": it["orderNowValue"],
+                "Unit Cost": it["purchasePrice"],
+                "Total Value": it["orderNowValue"],
                 "Reorder Point": it["reorderPoint"],
                 "Current On Hand": it["onHand"],
                 "Status": "Planned Draft"
@@ -3852,32 +3918,40 @@ def _generate_excel_export(project_id: str, export_type: str = "all") -> Streami
             pd.DataFrame(orders_data).to_excel(writer, sheet_name="Planned Orders", index=False)
 
     output.seek(0)
+    has_loc = bool(location and location.strip() and location.strip().upper() != "ALL")
+    loc_clean = re.sub(r'[\r\n"\\/*?:]', '_', location.strip()) if has_loc else ""
+
     if export_type == "orders":
-        filename = f"NEXO_Purchase_Orders_{project_id}.xlsx"
+        filename = f"PO_{loc_clean}_{project_id}.xlsx" if has_loc else f"NEXO_Purchase_Orders_{project_id}.xlsx"
     elif export_type == "replenishment":
-        filename = f"NEXO_Inventory_Replenishment_{project_id}.xlsx"
+        filename = f"NEXO_Inventory_Replenishment_{loc_clean}_{project_id}.xlsx" if has_loc else f"NEXO_Inventory_Replenishment_{project_id}.xlsx"
     else:
-        filename = f"NEXO_Report_{project_id}.xlsx"
+        filename = f"NEXO_Report_{loc_clean}_{project_id}.xlsx" if has_loc else f"NEXO_Report_{project_id}.xlsx"
+
+    ascii_filename = re.sub(r'[^\x20-\x7E]', '_', filename)
+    encoded_filename = urllib.parse.quote(filename)
 
     return StreamingResponse(
         output,
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        headers={"Content-Disposition": f"attachment; filename={filename}"}
+        headers={"Content-Disposition": f'attachment; filename="{ascii_filename}"; filename*=UTF-8\'\'{encoded_filename}'}
     )
 
 @app.get("/api/files/export")
 def export_file_query(
     project_id: str = Query(..., description="Project ID to export"),
-    export_type: Optional[str] = Query("all", description="Export type: all, replenishment, orders, forecast")
+    export_type: Optional[str] = Query("all", description="Export type: all, replenishment, orders, forecast"),
+    location: Optional[str] = Query(None, description="Optional branch/location filter")
 ):
-    return _generate_excel_export(project_id, export_type or "all")
+    return _generate_excel_export(project_id, export_type or "all", location=location)
 
 @app.get("/api/files/export/{project_id}")
 def export_project_to_excel(
     project_id: str,
-    export_type: Optional[str] = Query("all")
+    export_type: Optional[str] = Query("all"),
+    location: Optional[str] = Query(None)
 ):
-    return _generate_excel_export(project_id, export_type or "all")
+    return _generate_excel_export(project_id, export_type or "all", location=location)
 
 # ===============================================================================
 # GitHub Auto-Updater & System Management Endpoints

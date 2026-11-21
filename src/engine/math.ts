@@ -666,3 +666,200 @@ export function classifyAbcXyz(
     };
   });
 }
+
+/**
+ * Configuration and resolution interface for time-horizon planning.
+ */
+export interface HorizonConfig {
+  key: string;               // Normalized key, e.g. '1w', '2w', '3w', '1m', '3m', '6m', '12m', '18m', '24m'
+  forecastPeriods: number;   // Number of discrete periods to project
+  totalDays: number;         // Total horizon duration in calendar days
+  periodDays: number;        // Effective days per period for dailyDemand calculation
+  isSubMonthly: boolean;     // True if sub-monthly horizon in monthly mode (1w, 2w, 3w)
+  prorationFactor: number;   // Multiplier applied to monthly statistical forecast (e.g. 7/30)
+  subLabelAr: string;        // Localized suffix label for Arabic display
+  subLabelEn: string;        // Localized suffix label for English display
+}
+
+/**
+ * Normalizes any horizon input (including legacy integers 3, 6, 12, etc.) to a standardized key.
+ */
+export function normalizeHorizonKey(raw: string | number | undefined | null): string {
+  if (raw === undefined || raw === null || raw === '') return '12m';
+  const s = String(raw).trim().toLowerCase();
+  if (['1w', '2w', '3w', '1m', '3m', '6m', '12m', '18m', '24m'].includes(s)) {
+    return s;
+  }
+  const numMap: Record<string, string> = {
+    '1': '1m',
+    '3': '3m',
+    '6': '6m',
+    '9': '3m',
+    '12': '12m',
+    '18': '18m',
+    '24': '24m',
+    '36': '24m',
+  };
+  if (numMap[s]) return numMap[s];
+  if (s.endsWith('w') || s.endsWith('m')) return s;
+  return '12m';
+}
+
+/**
+ * Resolves forecast horizon based on selected period granularity ('daily' | 'weekly' | 'monthly').
+ */
+export function resolveHorizon(
+  raw: string | number | undefined | null,
+  granularity: 'daily' | 'weekly' | 'monthly' = 'monthly'
+): HorizonConfig {
+  const key = normalizeHorizonKey(raw);
+
+  if (granularity === 'daily') {
+    const dailyMap: Record<string, number> = {
+      '1w': 7,
+      '2w': 14,
+      '3w': 21,
+      '1m': 30,
+      '3m': 90,
+      '6m': 180,
+      '12m': 365,
+      '18m': 540,
+      '24m': 720,
+    };
+    const days = dailyMap[key] || 365;
+    return {
+      key,
+      forecastPeriods: days,
+      totalDays: days,
+      periodDays: 1,
+      isSubMonthly: false,
+      prorationFactor: 1.0,
+      subLabelAr: '',
+      subLabelEn: '',
+    };
+  }
+
+  if (granularity === 'weekly') {
+    const weeklyMap: Record<string, { periods: number; days: number }> = {
+      '1w': { periods: 1, days: 7 },
+      '2w': { periods: 2, days: 14 },
+      '3w': { periods: 3, days: 21 },
+      '1m': { periods: 4, days: 28 },
+      '3m': { periods: 13, days: 91 },
+      '6m': { periods: 26, days: 182 },
+      '12m': { periods: 52, days: 364 },
+      '18m': { periods: 78, days: 546 },
+      '24m': { periods: 104, days: 728 },
+    };
+    const conf = weeklyMap[key] || { periods: 52, days: 364 };
+    return {
+      key,
+      forecastPeriods: conf.periods,
+      totalDays: conf.days,
+      periodDays: 7,
+      isSubMonthly: false,
+      prorationFactor: 1.0,
+      subLabelAr: '',
+      subLabelEn: '',
+    };
+  }
+
+  // Monthly mode
+  if (key === '1w') {
+    return {
+      key,
+      forecastPeriods: 1,
+      totalDays: 7,
+      periodDays: 7,
+      isSubMonthly: true,
+      prorationFactor: 7 / 30,
+      subLabelAr: ' (أسبوع واحد)',
+      subLabelEn: ' (1w)',
+    };
+  }
+  if (key === '2w') {
+    return {
+      key,
+      forecastPeriods: 1,
+      totalDays: 14,
+      periodDays: 14,
+      isSubMonthly: true,
+      prorationFactor: 14 / 30,
+      subLabelAr: ' (أسبوعان)',
+      subLabelEn: ' (2w)',
+    };
+  }
+  if (key === '3w') {
+    return {
+      key,
+      forecastPeriods: 1,
+      totalDays: 21,
+      periodDays: 21,
+      isSubMonthly: true,
+      prorationFactor: 21 / 30,
+      subLabelAr: ' (3 أسابيع)',
+      subLabelEn: ' (3w)',
+    };
+  }
+
+  const monthlyMap: Record<string, { periods: number; days: number }> = {
+    '1m': { periods: 1, days: 30 },
+    '3m': { periods: 3, days: 90 },
+    '6m': { periods: 6, days: 180 },
+    '12m': { periods: 12, days: 365 },
+    '18m': { periods: 18, days: 540 },
+    '24m': { periods: 24, days: 720 },
+  };
+  const conf = monthlyMap[key] || { periods: 12, days: 365 };
+  return {
+    key,
+    forecastPeriods: conf.periods,
+    totalDays: conf.days,
+    periodDays: 30,
+    isSubMonthly: false,
+    prorationFactor: 1.0,
+    subLabelAr: '',
+    subLabelEn: '',
+  };
+}
+
+/**
+ * Computes sequential date string for future planning periods.
+ */
+export function getNextPeriodDate(
+  lastDate: string,
+  step: number,
+  granularity: 'daily' | 'weekly' | 'monthly' = 'monthly'
+): string {
+  // If YYYY-MM
+  if (/^\d{4}-\d{2}$/.test(lastDate)) {
+    const [yearStr, monthStr] = lastDate.split('-');
+    let y = parseInt(yearStr, 10);
+    let m = parseInt(monthStr, 10) + step;
+    while (m > 12) {
+      m -= 12;
+      y += 1;
+    }
+    while (m < 1) {
+      m += 12;
+      y -= 1;
+    }
+    return `${y}-${String(m).padStart(2, '0')}`;
+  }
+
+  // If YYYY-MM-DD
+  if (/^\d{4}-\d{2}-\d{2}$/.test(lastDate)) {
+    const d = new Date(lastDate);
+    if (granularity === 'daily') {
+      d.setDate(d.getDate() + step);
+    } else if (granularity === 'weekly') {
+      d.setDate(d.getDate() + step * 7);
+    } else {
+      d.setMonth(d.getMonth() + step);
+    }
+    return d.toISOString().split('T')[0];
+  }
+
+  return `${lastDate}+${step}`;
+}
+

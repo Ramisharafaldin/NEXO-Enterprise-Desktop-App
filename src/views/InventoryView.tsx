@@ -36,6 +36,7 @@ interface InventoryViewProps {
   onNavigateToDataHub?: () => void;
   settings?: AppSettings;
   language: Language;
+  selectedLocation?: string;
 }
 
 const DEFAULT_VISIBLE_COLS = {
@@ -69,12 +70,17 @@ export const InventoryView: React.FC<InventoryViewProps> = ({
   onNavigateToDataHub,
   settings,
   language,
+  selectedLocation,
 }) => {
   const t = translations[language];
   const isAr = language === 'ar';
 
   // Strict Defensive Exclusion: Filter out any dormant SKUs (onHand <= 0 && totalSales <= 0)
-  const activeItems = useMemo(() => (items || []).filter(isAnalyzableItem), [items]);
+  const activeItems = useMemo(() => {
+    const list = (items || []).filter(isAnalyzableItem);
+    if (!selectedLocation || selectedLocation === 'ALL') return list;
+    return list.filter(i => (i.location || '').toLowerCase().trim() === selectedLocation.toLowerCase().trim());
+  }, [items, selectedLocation]);
 
   const [activeFilterTab, setActiveFilterTab] = useState<'all' | 'toOrder' | 'stockout' | 'overstock' | 'transition' | string>('all');
   const [searchTerm, setSearchTerm] = useState('');
@@ -119,6 +125,11 @@ export const InventoryView: React.FC<InventoryViewProps> = ({
     setPage(1);
   };
 
+  // Reset page when branch/location changes
+  useEffect(() => {
+    setPage(1);
+  }, [selectedLocation]);
+
   // Fetch paginated inventory slice directly from DuckDB
   const fetchInventoryPage = useCallback(async () => {
     setIsLoadingPage(true);
@@ -129,6 +140,7 @@ export const InventoryView: React.FC<InventoryViewProps> = ({
         pageSize,
         search: debouncedSearch,
         filterTab: activeFilterTab,
+        location: selectedLocation,
         includeDormant: false
       });
       setPaginatedItems(res.items || []);
@@ -139,7 +151,10 @@ export const InventoryView: React.FC<InventoryViewProps> = ({
       }
     } catch (err) {
       console.warn('Failed to load server-side paginated inventory, using local slice:', err);
-      const fallbackList = (items || []).filter(isAnalyzableItem);
+      const fallbackList = (items || []).filter(isAnalyzableItem).filter(i => {
+        if (!selectedLocation || selectedLocation === 'ALL') return true;
+        return (i.location || '').toLowerCase().trim() === selectedLocation.toLowerCase().trim();
+      });
       const filtered = fallbackList.filter(item => {
         const matches = !debouncedSearch ||
           item.code.toLowerCase().includes(debouncedSearch.toLowerCase()) ||
@@ -157,7 +172,7 @@ export const InventoryView: React.FC<InventoryViewProps> = ({
     } finally {
       setIsLoadingPage(false);
     }
-  }, [projectId, page, pageSize, debouncedSearch, activeFilterTab, items]);
+  }, [projectId, page, pageSize, debouncedSearch, activeFilterTab, items, selectedLocation]);
 
   useEffect(() => {
     fetchInventoryPage();
@@ -371,11 +386,13 @@ export const InventoryView: React.FC<InventoryViewProps> = ({
       'Reorder Point': i.reorderPoint,
       'Days of Supply': i.daysOfSupply,
       'Order Now': i.orderNow,
-      [`Order Value (${getCurrencySymbol(settings?.currency_code || 'EGP', language)})`]: i.orderNowValue,
+      'Order Value': i.orderNowValue,
       'Transfer Suggestion': i.transferQty ? `${i.transferQty} units from ${i.transferSource}` : 'None',
       'Approval': i.approvalState,
     }));
-    await exportSheetsToExcel([{ name: 'Inventory Replenishment', rows: data }], `NEXO_Inventory_Replenishment_${projectId}.xlsx`);
+    const hasLoc = Boolean(selectedLocation && selectedLocation !== 'ALL');
+    const locTag = hasLoc ? `_${selectedLocation!.trim()}` : '';
+    await exportSheetsToExcel([{ name: 'Inventory Replenishment', rows: data }], `NEXO_Inventory_Replenishment${locTag}_${projectId}.xlsx`);
   };
 
   const toOrderCount = activeItems.filter(i => (i.orderNow || 0) > 0).length;

@@ -241,6 +241,17 @@ export interface ProjectsResponse {
   active_project_id?: string;
 }
 
+export interface BranchLocationInfo {
+  location: string;
+  sku_count: number;
+}
+
+export interface LocationsResponse {
+  project_id: string;
+  total_locations: number;
+  locations: BranchLocationInfo[];
+}
+
 export interface PaginatedInventoryResponse {
   project_id: string;
   page: number;
@@ -483,7 +494,7 @@ export const api = {
   /**
    * Complete project workspace load (items, filters, transitions, kpis)
    */
-  async getWorkspace(projectId: string): Promise<{
+  async getWorkspace(projectId: string, location?: string): Promise<{
     project: ProjectSummary;
     items: InventoryItem[];
     filters: SavedFilter[];
@@ -492,16 +503,29 @@ export const api = {
     dormant_count?: number;
     excluded_dormant_count?: number;
   }> {
-    const res = await fetch(`${API_BASE}/projects/${projectId}/workspace`);
+    const locQuery = location && location !== 'ALL' ? `?location=${encodeURIComponent(location)}` : '';
+    const res = await fetch(`${API_BASE}/projects/${projectId}/workspace${locQuery}`);
     if (!res.ok) throw new Error(`Failed to load workspace: ${res.statusText}`);
+    return res.json();
+  },
+
+  /**
+   * Project locations / branches
+   */
+  async getLocations(projectId: string): Promise<LocationsResponse> {
+    const res = await fetch(`${API_BASE}/projects/${projectId}/locations`);
+    if (!res.ok) throw new Error(`Failed to load locations: ${res.statusText}`);
     return res.json();
   },
 
   /**
    * Items & time-series periods
    */
-  async getProjectItems(projectId: string, includeDormant: boolean = false): Promise<{ project_id: string; count: number; items: InventoryItem[]; dormant_count?: number; excluded_dormant_count?: number; }> {
-    const res = await fetch(`${API_BASE}/projects/${projectId}/items?include_dormant=${includeDormant}`);
+  async getProjectItems(projectId: string, includeDormant: boolean = false, location?: string): Promise<{ project_id: string; count: number; items: InventoryItem[]; dormant_count?: number; excluded_dormant_count?: number; }> {
+    const q = new URLSearchParams();
+    q.append('include_dormant', String(includeDormant));
+    if (location && location !== 'ALL') q.append('location', location);
+    const res = await fetch(`${API_BASE}/projects/${projectId}/items?${q.toString()}`);
     if (!res.ok) throw new Error(`Failed to load items: ${res.statusText}`);
     return res.json();
   },
@@ -524,7 +548,7 @@ export const api = {
     if (params?.pageSize) q.append('page_size', String(params.pageSize));
     if (params?.search) q.append('search', params.search);
     if (params?.filterTab) q.append('filter_tab', params.filterTab);
-    if (params?.location) q.append('location', params.location);
+    if (params?.location && params.location !== 'ALL') q.append('location', params.location);
     if (params?.includeDormant != null) q.append('include_dormant', String(params.includeDormant));
 
     const res = await fetch(`${API_BASE}/inventory?${q.toString()}`);
@@ -538,6 +562,7 @@ export const api = {
     pageSize?: number;
     search?: string;
     category?: string;
+    location?: string;
     includeDormant?: boolean;
   }): Promise<PaginatedDemandResponse> {
     const q = new URLSearchParams();
@@ -546,6 +571,7 @@ export const api = {
     if (params?.pageSize) q.append('page_size', String(params.pageSize));
     if (params?.search) q.append('search', params.search);
     if (params?.category) q.append('category', params.category);
+    if (params?.location && params.location !== 'ALL') q.append('location', params.location);
     if (params?.includeDormant != null) q.append('include_dormant', String(params.includeDormant));
 
     const res = await fetch(`${API_BASE}/demand?${q.toString()}`);
@@ -553,8 +579,12 @@ export const api = {
     return res.json();
   },
 
-  async getDashboard(projectId?: string): Promise<DashboardSummaryResponse> {
-    const url = projectId ? `${API_BASE}/dashboard?project_id=${encodeURIComponent(projectId)}` : `${API_BASE}/dashboard`;
+  async getDashboard(projectId?: string, location?: string): Promise<DashboardSummaryResponse> {
+    const q = new URLSearchParams();
+    if (projectId) q.append('project_id', projectId);
+    if (location && location !== 'ALL') q.append('location', location);
+    const qs = q.toString();
+    const url = qs ? `${API_BASE}/dashboard?${qs}` : `${API_BASE}/dashboard`;
     const res = await fetch(url);
     if (!res.ok) throw new Error(`Failed to load dashboard: ${res.statusText}`);
     return res.json();
@@ -646,8 +676,9 @@ export const api = {
   /**
    * Real aggregate KPIs from DuckDB
    */
-  async getKpis(projectId: string): Promise<DashboardKpis> {
-    const res = await fetch(`${API_BASE}/projects/${projectId}/kpis`);
+  async getKpis(projectId: string, location?: string): Promise<DashboardKpis> {
+    const locQuery = location && location !== 'ALL' ? `?location=${encodeURIComponent(location)}` : '';
+    const res = await fetch(`${API_BASE}/projects/${projectId}/kpis${locQuery}`);
     if (!res.ok) throw new Error('Failed to compute KPIs');
     return res.json();
   },
@@ -704,8 +735,9 @@ export const api = {
     );
   },
 
-  getExportUrl(projectId: string, exportType: string = 'all'): string {
-    return `${API_BASE}/files/export/${projectId}?export_type=${exportType}`;
+  getExportUrl(projectId: string, exportType: string = 'all', location?: string): string {
+    const locQuery = location && location !== 'ALL' ? `&location=${encodeURIComponent(location)}` : '';
+    return `${API_BASE}/files/export/${projectId}?export_type=${exportType}${locQuery}`;
   },
 
   /**
@@ -716,10 +748,18 @@ export const api = {
   async downloadExcelExport(
     projectId: string,
     exportType: string = 'all',
-    defaultFilename?: string
+    defaultFilename?: string,
+    location?: string
   ): Promise<boolean> {
-    const filename = defaultFilename || `NEXO_${exportType}_${projectId}.xlsx`;
-    const exportUrl = `${API_BASE}/files/export/${projectId}?export_type=${exportType}`;
+    const hasLoc = Boolean(location && location !== 'ALL');
+    const locTag = hasLoc ? `_${location!.trim()}` : '';
+    const filename = defaultFilename || (
+      exportType === 'orders' ? `PO${locTag}_${projectId}.xlsx` :
+      exportType === 'replenishment' ? `NEXO_Inventory_Replenishment${locTag}_${projectId}.xlsx` :
+      `NEXO_Report${locTag}_${projectId}.xlsx`
+    );
+    const locQuery = hasLoc ? `&location=${encodeURIComponent(location!)}` : '';
+    const exportUrl = `${API_BASE}/files/export/${projectId}?export_type=${exportType}${locQuery}`;
 
     // 1. Check if running inside native pywebview desktop window
     const pyApi = (window as any).pywebview?.api;

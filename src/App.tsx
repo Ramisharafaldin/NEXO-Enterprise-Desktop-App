@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useCallback, useMemo, useRef } from 'react';
 import { TrendingUp, CheckCircle2, Upload } from 'lucide-react';
-import { InventoryItem, ModelType, ReplenishmentStrategy, AppSettings, isAnalyzableItem } from './engine/types';
+import { InventoryItem, ModelType, ReplenishmentStrategy, AppSettings, TimeSeriesPeriod, isAnalyzableItem } from './engine/types';
 import { getInitialInventoryItems } from './engine/sampleData';
 import {
   autoSelectModel,
@@ -10,6 +10,8 @@ import {
   fitIntermittentModel,
   calculateItemReplenishment,
   classifyAbcXyz,
+  resolveHorizon,
+  getNextPeriodDate,
   mean
 } from './engine/math';
 import { Language, translations } from './i18n/translations';
@@ -49,6 +51,10 @@ export const App: React.FC = () => {
   const [activeProjectId, setActiveProjectId] = useState<string>('proj_default_retail');
   const [activeDataset, setActiveDataset] = useState('Retail Inventory Planning Example monthly.xlsx');
 
+  // Global Branch / Location Scope State ('ALL' or distinct branch name)
+  const [selectedLocation, setSelectedLocation] = useState<string>('ALL');
+  const [availableLocations, setAvailableLocations] = useState<{ location: string; sku_count: number }[]>([]);
+
   // Core Items State - Starts blank, loaded from active project in DuckDB
   const [items, setItems] = useState<InventoryItem[]>([]);
   const [dormantCount, setDormantCount] = useState<number>(0);
@@ -81,18 +87,32 @@ export const App: React.FC = () => {
   }, [language]);
 
   // Load project items from DuckDB backend
-  const loadProject = useCallback(async (projectId: string) => {
+  const loadProject = useCallback(async (projectId: string, location?: string) => {
     setIsSyncing(true);
     setItems([]);
     setSelectedItemId('');
     setDormantCount(0);
+    const effectiveLoc = location !== undefined ? location : 'ALL';
+    if (location !== undefined) {
+      setSelectedLocation(effectiveLoc);
+    }
     try {
       try {
         await api.activateProject(projectId);
       } catch (actErr) {
         console.warn('activateProject notification:', actErr);
       }
-      const ws = await api.getWorkspace(projectId);
+
+      // Load locations for this project
+      try {
+        const locRes = await api.getLocations(projectId);
+        setAvailableLocations(locRes.locations || []);
+      } catch (locErr) {
+        console.warn('getLocations error:', locErr);
+        setAvailableLocations([]);
+      }
+
+      const ws = await api.getWorkspace(projectId, effectiveLoc);
       if (ws && ws.items && ws.items.length > 0) {
         const analyzable = ws.items.filter(isAnalyzableItem);
         setItems(analyzable.length > 0 ? analyzable : ws.items);
@@ -124,6 +144,11 @@ export const App: React.FC = () => {
       setIsSyncing(false);
     }
   }, []);
+
+  const handleLocationChange = useCallback((newLoc: string) => {
+    setSelectedLocation(newLoc);
+    loadProject(activeProjectId, newLoc);
+  }, [activeProjectId, loadProject]);
 
   // Fetch list of projects from DuckDB
   const refreshProjects = useCallback(async (): Promise<string | undefined> => {
@@ -197,7 +222,15 @@ export const App: React.FC = () => {
     const strategyToUse = newStrategy || item.replenishmentStrategy;
 
     const actuals = item.periods.filter(p => p.actual > 0).map(p => p.actual);
-    const horizon = settings?.forecast_horizon_periods || 6;
+
+    // Resolve planning horizon based on item notes (if per-item approvalHorizon set) or global settings
+    let activeHorizonRaw: string | number = settings?.forecast_horizon_periods || '12m';
+    const horizonMatch = item.notes?.match(/approvalHorizon:([0-9a-zA-Z]+)/);
+    if (horizonMatch && horizonMatch[1]) {
+      activeHorizonRaw = horizonMatch[1];
+    }
+    const horizonCfg = resolveHorizon(activeHorizonRaw, settings?.period_granularity || 'monthly');
+    const horizon = horizonCfg.forecastPeriods;
 
     let res;
     if (modelToUse === 'constant') res = fitConstantModel(actuals, horizon);
@@ -216,23 +249,58 @@ export const App: React.FC = () => {
     };
     else res = autoSelectModel(actuals, horizon);
 
-    // Update periods with new forecast and preserve user overrides
-    const updatedPeriods = item.periods.map((p, i) => {
-      if (p.actual > 0) {
-        return { ...p, model: res.fitted[i] !== undefined ? Math.round(res.fitted[i]) : p.actual };
+    // Separate historical periods and existing future periods
+    const historicalPeriods: TimeSeriesPeriod[] = [];
+    const existingFuturePeriods: TimeSeriesPeriod[] = [];
+    item.periods.forEach(p => {
+      if ((p.actual || 0) > 0) {
+        historicalPeriods.push(p);
       } else {
-        const futureIdx = i - actuals.length;
-        const baseForecast = Math.round(res.forecast[futureIdx] || 0);
-        return {
-          ...p,
-          forecast: p.override !== undefined ? p.override : baseForecast,
-          confUpper: Math.round(res.confUpper[futureIdx] || baseForecast * 1.2),
-          confLower: Math.round(res.confLower[futureIdx] || baseForecast * 0.8),
-        };
+        existingFuturePeriods.push(p);
       }
     });
 
-    const forecastVals = updatedPeriods.filter(p => p.forecast !== undefined).map(p => p.forecast!);
+    // Update fitted values for historical periods
+    const updatedHistorical = historicalPeriods.map((p, i) => ({
+      ...p,
+      model: res.fitted[i] !== undefined ? Math.round(res.fitted[i]) : p.actual
+    }));
+
+    // Build updated future periods matching horizon
+    const lastDate = historicalPeriods.length > 0 ? historicalPeriods[historicalPeriods.length - 1].date : '2026-09';
+    const updatedFuture: TimeSeriesPeriod[] = [];
+
+    for (let h = 0; h < horizon; h++) {
+      const existing = existingFuturePeriods[h];
+      const futureDate = existing ? existing.date : getNextPeriodDate(lastDate, h + 1, settings?.period_granularity || 'monthly');
+      
+      let baseForecast = Math.round(res.forecast[h] || 0);
+      let upper = Math.round(res.confUpper[h] || baseForecast * 1.2);
+      let lower = Math.round(res.confLower[h] || baseForecast * 0.8);
+      let label: string | undefined = undefined;
+
+      if (horizonCfg.isSubMonthly) {
+        baseForecast = Math.round(baseForecast * horizonCfg.prorationFactor);
+        upper = Math.round(upper * horizonCfg.prorationFactor);
+        lower = Math.round(lower * horizonCfg.prorationFactor);
+        label = `${futureDate}${language === 'ar' ? horizonCfg.subLabelAr : horizonCfg.subLabelEn}`;
+      }
+
+      const overrideVal = existing?.override;
+      updatedFuture.push({
+        date: futureDate,
+        actual: 0,
+        forecast: overrideVal !== undefined ? overrideVal : baseForecast,
+        confUpper: upper,
+        confLower: lower,
+        override: overrideVal,
+        promotion: existing?.promotion || 0,
+        label
+      });
+    }
+
+    const updatedPeriods = [...updatedHistorical, ...updatedFuture];
+    const forecastVals = updatedFuture.map(p => p.forecast !== undefined ? p.forecast : 0);
     const meanDaily = actuals.length > 0 ? (mean(actuals) / 30) : 1;
 
     const updatedBase: InventoryItem = {
@@ -247,7 +315,7 @@ export const App: React.FC = () => {
       accuracy: res.accuracy,
     };
 
-    const metrics = calculateItemReplenishment(updatedBase, forecastVals, 30);
+    const metrics = calculateItemReplenishment(updatedBase, forecastVals, horizonCfg.periodDays);
 
     return {
       ...updatedBase,
@@ -300,7 +368,13 @@ export const App: React.FC = () => {
         p.date === periodDate ? { ...p, override: val, forecast: val !== undefined ? val : p.forecast } : p
       );
       const forecastVals = updatedPeriods.filter(p => p.forecast !== undefined).map(p => p.forecast!);
-      const metrics = calculateItemReplenishment({ ...item, periods: updatedPeriods }, forecastVals, 30);
+      let activeHorizonRaw: string | number = settings?.forecast_horizon_periods || '12m';
+      const horizonMatch = item.notes?.match(/approvalHorizon:([0-9a-zA-Z]+)/);
+      if (horizonMatch && horizonMatch[1]) {
+        activeHorizonRaw = horizonMatch[1];
+      }
+      const horizonCfg = resolveHorizon(activeHorizonRaw, settings?.period_granularity || 'monthly');
+      const metrics = calculateItemReplenishment({ ...item, periods: updatedPeriods }, forecastVals, horizonCfg.periodDays);
 
       const updatedItem = {
         ...item,
@@ -345,8 +419,14 @@ export const App: React.FC = () => {
     setItems(prev => prev.map(item => {
       if (item.id === itemId) {
         const mergedItem: InventoryItem = { ...item, ...updates };
+        let activeHorizonRaw: string | number = settings?.forecast_horizon_periods || '12m';
+        const horizonMatch = mergedItem.notes?.match(/approvalHorizon:([0-9a-zA-Z]+)/);
+        if (horizonMatch && horizonMatch[1]) {
+          activeHorizonRaw = horizonMatch[1];
+        }
+        const horizonCfg = resolveHorizon(activeHorizonRaw, settings?.period_granularity || 'monthly');
         const forecastVals = mergedItem.periods.filter(p => p.forecast !== undefined).map(p => p.forecast!);
-        const metrics = calculateItemReplenishment(mergedItem, forecastVals, 30);
+        const metrics = calculateItemReplenishment(mergedItem, forecastVals, horizonCfg.periodDays);
         const fullyUpdated: InventoryItem = {
           ...mergedItem,
           ...metrics,
@@ -376,8 +456,11 @@ export const App: React.FC = () => {
 
   // Export Project to Real Excel (Native Windows Save As in Desktop Mode)
   const handleExportExcel = async () => {
+    const hasLoc = Boolean(selectedLocation && selectedLocation !== 'ALL');
+    const locTag = hasLoc ? `_${selectedLocation.trim()}` : '';
+    const filename = `${activeDataset.replace('.xlsx', '')}${locTag}_Export.xlsx`;
     try {
-      await api.downloadExcelExport(activeProjectId, 'all', `${activeDataset.replace('.xlsx', '')}_Export.xlsx`);
+      await api.downloadExcelExport(activeProjectId, 'all', filename, selectedLocation);
     } catch {
       // Fallback client-side XLSX generation
       const invData = items.map(i => ({
@@ -392,13 +475,13 @@ export const App: React.FC = () => {
         'Safety Stock': i.safetyStock,
         'Reorder Point': i.reorderPoint,
         'Order Now': i.orderNow,
-        [`Order Value (${getCurrencySymbol(settings.currency_code, language)})`]: i.orderNowValue,
+        'Order Value': i.orderNowValue,
         'Purchase Price': i.purchasePrice,
         'Sales Price': i.salesPrice,
         'Days of Supply': i.daysOfSupply,
         'Forecast Accuracy (%)': i.accuracy?.toFixed(1),
       }));
-      await exportSheetsToExcel([{ name: 'Inventory Planning', rows: invData }], `${activeDataset.replace('.xlsx', '')}_Export.xlsx`);
+      await exportSheetsToExcel([{ name: 'Inventory Planning', rows: invData }], filename);
     }
   };
 
@@ -611,6 +694,10 @@ export const App: React.FC = () => {
         isServerConnected={isServerConnected}
         appVersion={appVersion}
         pythonVersion={pythonVersion}
+        selectedLocation={selectedLocation}
+        availableLocations={availableLocations}
+        onLocationChange={handleLocationChange}
+        totalSkus={items.length}
       />
 
       {/* 2. Main Workspace Body with Slim Navigation Rail */}
@@ -669,6 +756,7 @@ export const App: React.FC = () => {
                 onNavigateToDataHub={() => setActiveTab('data-hub')}
                 settings={settings}
                 language={language}
+                selectedLocation={selectedLocation}
               />
             ) : (
               <div className="flex-1 flex flex-col items-center justify-center p-8 bg-[#F8F9FA] text-[#1E293B]">
@@ -710,6 +798,7 @@ export const App: React.FC = () => {
               onNavigateToDataHub={() => setActiveTab('data-hub')}
               settings={settings}
               language={language}
+              selectedLocation={selectedLocation}
             />
           )}
 
@@ -719,6 +808,7 @@ export const App: React.FC = () => {
               settings={settings}
               language={language}
               onNavigateToDataHub={() => setActiveTab('data-hub')}
+              selectedLocation={selectedLocation}
             />
           )}
 
@@ -729,6 +819,7 @@ export const App: React.FC = () => {
               settings={settings}
               language={language}
               onNavigateToDataHub={() => setActiveTab('data-hub')}
+              selectedLocation={selectedLocation}
             />
           )}
 
@@ -741,6 +832,10 @@ export const App: React.FC = () => {
               language={language}
               onLanguageChange={setLanguage}
               appVersion={appVersion}
+              selectedLocation={selectedLocation}
+              availableLocations={availableLocations}
+              onLocationChange={handleLocationChange}
+              totalSkus={items.length}
             />
           )}
 
@@ -768,6 +863,7 @@ export const App: React.FC = () => {
         onApproveOrder={handleApproveOrder}
         settings={settings}
         language={language}
+        selectedLocation={selectedLocation}
       />
 
       {/* Containers and Shipping Groups Modal */}

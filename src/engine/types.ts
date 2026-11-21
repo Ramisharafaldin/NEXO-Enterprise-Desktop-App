@@ -32,6 +32,7 @@ export interface TimeSeriesPeriod {
   confLower?: number;
   override?: number;
   promotion?: number; // % promo discount / lift
+  label?: string;     // display label (e.g. for sub-monthly periods)
 }
 
 export interface InventoryItem {
@@ -162,7 +163,7 @@ export interface AppSettings {
   decimal_places: number;
   exchange_rate: number;
   analysis_lookback_periods: number;
-  forecast_horizon_periods: number;
+  forecast_horizon_periods: number | string;
   period_granularity: 'daily' | 'weekly' | 'monthly';
   default_forecast_model: string;
   default_service_level: number;

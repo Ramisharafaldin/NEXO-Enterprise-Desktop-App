@@ -1,5 +1,6 @@
 import React, { useState, useMemo, useRef, useEffect, useCallback } from 'react';
 import { InventoryItem, ModelType, ReplenishmentStrategy, AppSettings, isAnalyzableItem } from '../engine/types';
+import { normalizeHorizonKey } from '../engine/math';
 import { translations, Language } from '../i18n/translations';
 import { formatItemCode } from '../utils/formatters';
 import { api } from '../api/client';
@@ -46,6 +47,7 @@ interface DemandViewProps {
   settings?: AppSettings;
   language: Language;
   projectId?: string;
+  selectedLocation?: string;
 }
 
 export const DemandView: React.FC<DemandViewProps> = ({
@@ -61,6 +63,7 @@ export const DemandView: React.FC<DemandViewProps> = ({
   settings,
   language,
   projectId = 'proj_default_retail',
+  selectedLocation,
 }) => {
   const t = translations[language];
   const isAr = language === 'ar';
@@ -86,14 +89,20 @@ export const DemandView: React.FC<DemandViewProps> = ({
   const [ignoreZeroSales, setIgnoreZeroSales] = useState(true);
   const [ignoreStockoutDays, setIgnoreStockoutDays] = useState(true);
   const [useHolidays, setUseHolidays] = useState(true);
-  const [approvalHorizon, setApprovalHorizon] = useState(6);
+  const [approvalHorizon, setApprovalHorizon] = useState<string>('6m');
   const [adjustLevel, setAdjustLevel] = useState(1.0);
 
   useEffect(() => {
     if (selectedItem) {
       setCurrentNote(selectedItem.notes || '');
+      const m = selectedItem.notes?.match(/approvalHorizon:([0-9a-zA-Z]+)/);
+      if (m && m[1]) {
+        setApprovalHorizon(normalizeHorizonKey(m[1]));
+      } else if (settings?.forecast_horizon_periods) {
+        setApprovalHorizon(normalizeHorizonKey(settings.forecast_horizon_periods));
+      }
     }
-  }, [selectedItem?.id, selectedItem?.notes]);
+  }, [selectedItem?.id, selectedItem?.notes, settings?.forecast_horizon_periods]);
 
   // Pane 2 State
   const [chartMetric, setChartMetric] = useState<'quantity' | 'revenue'>('quantity');
@@ -120,14 +129,14 @@ export const DemandView: React.FC<DemandViewProps> = ({
   const [debouncedSearch, setDebouncedSearch] = useState('');
   const [isLoadingList, setIsLoadingList] = useState(false);
 
-  // Reset on project switch
+  // Reset on project or branch switch
   useEffect(() => {
     setPage(1);
     setTreeSearch('');
     setDebouncedSearch('');
     setPaginatedItems([]);
     setTotalCount(0);
-  }, [projectId]);
+  }, [projectId, selectedLocation]);
 
   // Debounce tree search input (300ms)
   useEffect(() => {
@@ -147,6 +156,7 @@ export const DemandView: React.FC<DemandViewProps> = ({
         page,
         pageSize,
         search: debouncedSearch,
+        location: selectedLocation,
         includeDormant: false
       });
       setPaginatedItems(res.items || []);
@@ -160,7 +170,7 @@ export const DemandView: React.FC<DemandViewProps> = ({
     } finally {
       setIsLoadingList(false);
     }
-  }, [projectId, page, pageSize, debouncedSearch, selectedItem, onSelectItem]);
+  }, [projectId, page, pageSize, debouncedSearch, selectedItem, onSelectItem, selectedLocation]);
 
   useEffect(() => {
     fetchDemandPage();
@@ -169,8 +179,10 @@ export const DemandView: React.FC<DemandViewProps> = ({
   // Strict Defensive Exclusion: Filter out any dormant SKUs (onHand <= 0 && totalSales <= 0)
   const activeItems = useMemo(() => {
     if (paginatedItems.length > 0) return paginatedItems;
-    return (items || []).filter(isAnalyzableItem).slice(0, 50);
-  }, [paginatedItems, items]);
+    const base = (items || []).filter(isAnalyzableItem);
+    if (!selectedLocation || selectedLocation === 'ALL') return base.slice(0, 50);
+    return base.filter(i => (i.location || '').toLowerCase().trim() === selectedLocation.toLowerCase().trim()).slice(0, 50);
+  }, [paginatedItems, items, selectedLocation]);
 
   // Categories group
   const categories = useMemo(() => {
@@ -212,7 +224,7 @@ export const DemandView: React.FC<DemandViewProps> = ({
   // Chart data calculation
   const multiplier = chartMetric === 'revenue' ? (selectedItem?.salesPrice || 1) : 1;
   const chartData = periods.map(p => ({
-    date: p.date,
+    date: p.label || p.date,
     actual: (p.actual || 0) > 0 ? Math.round((p.actual || 0) * multiplier) : undefined,
     model: visibleRows.model && p.model ? Math.round(p.model * multiplier) : undefined,
     forecast: visibleRows.forecast && p.forecast ? Math.round(p.forecast * multiplier) : undefined,
@@ -641,7 +653,7 @@ export const DemandView: React.FC<DemandViewProps> = ({
                         isFuture ? 'bg-blue-50/70 text-blue-900 border-b-2 border-b-[#2196F3]' : ''
                       }`}
                     >
-                      <div>{p.date}</div>
+                      <div>{p.label || p.date}</div>
                       {isFuture && (
                         <div className="text-[10.5px] text-[#2196F3] font-bold">
                           +{idx - historicalPeriods.length + 1}
@@ -1049,16 +1061,23 @@ export const DemandView: React.FC<DemandViewProps> = ({
                 <select
                   value={approvalHorizon}
                   onChange={e => {
-                    const val = Number(e.target.value);
+                    const val = e.target.value;
                     setApprovalHorizon(val);
-                    onParameterChange && onParameterChange(selectedItem.id, { notes: `approvalHorizon:${val}` });
+                    const oldNotes = (selectedItem?.notes || '').replace(/approvalHorizon:[0-9a-zA-Z]+\s*/g, '').trim();
+                    const updatedNotes = oldNotes ? `${oldNotes} approvalHorizon:${val}` : `approvalHorizon:${val}`;
+                    onParameterChange && onParameterChange(selectedItem.id, { notes: updatedNotes });
                   }}
                   className="px-1.5 py-0.5 border border-slate-300 rounded font-semibold text-slate-800 text-[10px] bg-white cursor-pointer"
                 >
-                  <option value={3}>{isAr ? '3 فترات' : '3 periods'}</option>
-                  <option value={6}>{isAr ? '6 فترات' : '6 periods'}</option>
-                  <option value={9}>{isAr ? '9 فترات' : '9 periods'}</option>
-                  <option value={12}>{isAr ? '12 فترة' : '12 periods'}</option>
+                  <option value="1w">{isAr ? 'أسبوع واحد (7 أيام)' : '1 Week (7 Days)'}</option>
+                  <option value="2w">{isAr ? 'أسبوعان (14 يوم)' : '2 Weeks (14 Days)'}</option>
+                  <option value="3w">{isAr ? '3 أسابيع (21 يوم)' : '3 Weeks (21 Days)'}</option>
+                  <option value="1m">{isAr ? 'شهر واحد' : '1 Month'}</option>
+                  <option value="3m">{isAr ? '+3 فترات مقبلة (ربع سنوي)' : '+3 Periods (Quarterly)'}</option>
+                  <option value="6m">{isAr ? '+6 فترات مقبلة (نصف سنوي)' : '+6 Periods (Bi-Annual)'}</option>
+                  <option value="12m">{isAr ? '+12 فترة مقبلة (سنة كاملة)' : '+12 Periods (Annual)'}</option>
+                  <option value="18m">{isAr ? '+18 فترة مقبلة' : '+18 Periods (18 Months)'}</option>
+                  <option value="24m">{isAr ? '+24 فترة مقبلة (سنتان)' : '+24 Periods (24 Months)'}</option>
                 </select>
               </div>
             </div>
