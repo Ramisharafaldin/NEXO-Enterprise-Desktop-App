@@ -35,7 +35,7 @@ import { SettingsView } from './views/SettingsView';
 import { DataHubView } from './views/DataHubView';
 
 import { api, ProjectSummary } from './api/client';
-import * as XLSX from 'xlsx';
+import { exportSheetsToExcel } from './utils/excelExport';
 
 export const App: React.FC = () => {
   const [language, setLanguage] = useState<Language>('en');
@@ -380,7 +380,6 @@ export const App: React.FC = () => {
       await api.downloadExcelExport(activeProjectId, 'all', `${activeDataset.replace('.xlsx', '')}_Export.xlsx`);
     } catch {
       // Fallback client-side XLSX generation
-      const wb = XLSX.utils.book_new();
       const invData = items.map(i => ({
         'Item Code': i.code,
         'Description': i.description,
@@ -399,9 +398,7 @@ export const App: React.FC = () => {
         'Days of Supply': i.daysOfSupply,
         'Forecast Accuracy (%)': i.accuracy?.toFixed(1),
       }));
-      const wsInv = XLSX.utils.json_to_sheet(invData);
-      XLSX.utils.book_append_sheet(wb, wsInv, 'Inventory Planning');
-      XLSX.writeFile(wb, `${activeDataset.replace('.xlsx', '')}_Export.xlsx`);
+      await exportSheetsToExcel([{ name: 'Inventory Planning', rows: invData }], `${activeDataset.replace('.xlsx', '')}_Export.xlsx`);
     }
   };
 

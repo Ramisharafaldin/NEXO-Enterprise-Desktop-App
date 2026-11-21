@@ -51,6 +51,7 @@ os.environ.setdefault(
 
 import time
 import socket
+import secrets
 import logging
 import threading
 import base64
@@ -204,7 +205,6 @@ class DesktopApi:
         
         file_types = (
             'Excel Workbook (*.xlsx)',
-            'All Files (*.*)'
         )
         
         dialog_type = getattr(webview, "FileDialog", None)
@@ -219,6 +219,8 @@ class DesktopApi:
             
             if result:
                 filepath = result[0] if isinstance(result, (list, tuple)) else str(result)
+                if not filepath.lower().endswith(".xlsx"):
+                    filepath += ".xlsx"
                 data = base64.b64decode(base64_content)
                 with open(filepath, "wb") as f:
                     f.write(data)
@@ -232,6 +234,7 @@ class DesktopApi:
 def restart_desktop_process():
     """
     Safely checkpoints DuckDB, spawns a new detached NEXO process, and exits the current instance.
+    Eliminates shell=True and string-formatted commands (SEC-HIGH-02).
     """
     time.sleep(0.5)
     try:
@@ -241,22 +244,31 @@ def restart_desktop_process():
         logger.warning(f"Error closing db during restart: {e}")
 
     vbs_path = os.path.join(WORKSPACE_DIR, "NEXO.vbs")
-    if os.path.exists(vbs_path):
-        cmd = f'ping 127.0.0.1 -n 2 > nul & wscript.exe "{vbs_path}"'
-    else:
-        python_exe = sys.executable
-        app_py = os.path.join(WORKSPACE_DIR, "desktop_app.py")
-        cmd = f'ping 127.0.0.1 -n 2 > nul & "{python_exe}" "{app_py}"'
-
-    import subprocess
+    app_py = os.path.join(WORKSPACE_DIR, "desktop_app.py")
     DETACHED_PROCESS = 0x00000008
     CREATE_NO_WINDOW = 0x08000000
+    creationflags = (DETACHED_PROCESS | CREATE_NO_WINDOW) if sys.platform == "win32" else 0
+
+    if sys.platform == "win32" and os.path.exists(vbs_path):
+        target_args = ["wscript.exe", vbs_path]
+    else:
+        pythonw = sys.executable.replace("python.exe", "pythonw.exe")
+        py_exe = pythonw if os.path.exists(pythonw) else sys.executable
+        target_args = [py_exe, app_py]
+
+    launcher_cmd = [
+        sys.executable,
+        "-c",
+        "import time, subprocess, sys; time.sleep(1.5); subprocess.Popen(sys.argv[1:])",
+        *target_args
+    ]
+
     try:
         subprocess.Popen(
-            cmd,
-            shell=True,
+            launcher_cmd,
+            shell=False,
             cwd=WORKSPACE_DIR,
-            creationflags=DETACHED_PROCESS | CREATE_NO_WINDOW,
+            creationflags=creationflags,
             close_fds=True
         )
         logger.info("Spawned detached process to restart NEXO. Terminating current instance.")
@@ -285,6 +297,12 @@ def on_closed():
 
 def main():
     logger.info("=== NEXO Desktop Application Starting ===")
+
+    # Generate startup secrets for local boundary defense (SEC-CRIT-01, SEC-MED-02)
+    session_secret = os.environ.get("NEXO_SESSION_SECRET") or secrets.token_urlsafe(32)
+    os.environ["NEXO_SESSION_SECRET"] = session_secret
+    bootstrap_nonce = secrets.token_urlsafe(32)
+    os.environ["NEXO_BOOTSTRAP_NONCE"] = bootstrap_nonce
 
     # 1. Ensure nexo.ico exists
     ico_path = os.path.join(WORKSPACE_DIR, "public", "nexo.ico")
@@ -317,9 +335,9 @@ def main():
     # 3. Instantiate JS-API bridge
     api = DesktopApi()
 
-    # 4. Create native Windows OS frame
-    url = f"http://127.0.0.1:{port}/?t={int(time.time())}"
-    logger.info(f"Creating pywebview window pointing to: {url}")
+    # 4. Create native Windows OS frame pointing to bootstrap authentication route
+    url = f"http://127.0.0.1:{port}/auth/bootstrap?nonce={bootstrap_nonce}&t={int(time.time())}"
+    logger.info(f"Creating pywebview window pointing to bootstrap URL: {url}")
     
     window = webview.create_window(
         title="NEXO — Enterprise Demand & Supply Chain Planning",

@@ -3,7 +3,7 @@ import { InventoryItem, AppSettings, isAnalyzableItem } from '../engine/types';
 import { translations, Language } from '../i18n/translations';
 import { formatCurrency, getCurrencySymbol } from '../utils/formatters';
 import { X, ShoppingCart, CheckCircle, Download, FileSpreadsheet, Send } from 'lucide-react';
-import * as XLSX from 'xlsx';
+import { exportSheetsToExcel } from '../utils/excelExport';
 
 interface PlannedOrdersModalProps {
   isOpen: boolean;
@@ -32,8 +32,7 @@ export const PlannedOrdersModal: React.FC<PlannedOrdersModalProps> = ({
   const totalUnits = orderItems.reduce((sum, i) => sum + (i.orderNow || 0), 0);
   const totalValue = orderItems.reduce((sum, i) => sum + (i.orderNowValue || 0), 0);
 
-  const handleExportXlsx = () => {
-    const wb = XLSX.utils.book_new();
+  const handleExportXlsx = async () => {
     const data = orderItems.map(i => ({
       'Item Code': i.code,
       'Description': i.description,
@@ -45,9 +44,7 @@ export const PlannedOrdersModal: React.FC<PlannedOrdersModalProps> = ({
       'Lead Time (Days)': i.leadTimeDays,
       'Status': i.approvalState,
     }));
-    const ws = XLSX.utils.json_to_sheet(data);
-    XLSX.utils.book_append_sheet(wb, ws, 'Purchase Orders');
-    XLSX.writeFile(wb, 'NEXO_Purchase_Orders.xlsx');
+    await exportSheetsToExcel([{ name: 'Purchase Orders', rows: data }], 'NEXO_Purchase_Orders.xlsx');
   };
 
   return (

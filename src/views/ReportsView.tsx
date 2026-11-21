@@ -19,7 +19,7 @@ import {
   Check,
   Upload
 } from 'lucide-react';
-import * as XLSX from 'xlsx';
+import { exportSheetsToExcel } from '../utils/excelExport';
 
 interface ReportsViewProps {
   items: InventoryItem[];
@@ -138,8 +138,7 @@ export const ReportsView: React.FC<ReportsViewProps> = ({
     });
   };
 
-  const handleExportReport = () => {
-    const wb = XLSX.utils.book_new();
+  const handleExportReport = async () => {
     let exportData: any[] = [];
 
     if (reportType === 'replenishment') {
@@ -215,9 +214,7 @@ export const ReportsView: React.FC<ReportsViewProps> = ({
       }));
     }
 
-    const ws = XLSX.utils.json_to_sheet(exportData);
-    XLSX.utils.book_append_sheet(wb, ws, 'Report');
-    XLSX.writeFile(wb, `NEXO_${reportType}_${periodHorizon}_Report.xlsx`);
+    await exportSheetsToExcel([{ name: 'Report', rows: exportData }], `NEXO_${reportType}_${periodHorizon}_Report.xlsx`);
   };
 
   if (activeItems.length === 0) {

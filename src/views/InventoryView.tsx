@@ -21,7 +21,7 @@ import {
   Filter,
   Check
 } from 'lucide-react';
-import * as XLSX from 'xlsx';
+import { exportSheetsToExcel } from '../utils/excelExport';
 import { api, SavedFilter, InTransitionRecord } from '../api/client';
 
 interface InventoryViewProps {
@@ -356,8 +356,7 @@ export const InventoryView: React.FC<InventoryViewProps> = ({
     return true;
   });
 
-  const handleExportTable = () => {
-    const wb = XLSX.utils.book_new();
+  const handleExportTable = async () => {
     const data = filteredItems.map(i => ({
       'Item Code': i.code,
       'Description': i.description,
@@ -376,9 +375,7 @@ export const InventoryView: React.FC<InventoryViewProps> = ({
       'Transfer Suggestion': i.transferQty ? `${i.transferQty} units from ${i.transferSource}` : 'None',
       'Approval': i.approvalState,
     }));
-    const ws = XLSX.utils.json_to_sheet(data);
-    XLSX.utils.book_append_sheet(wb, ws, 'Inventory Replenishment');
-    XLSX.writeFile(wb, `NEXO_Inventory_Replenishment_${projectId}.xlsx`);
+    await exportSheetsToExcel([{ name: 'Inventory Replenishment', rows: data }], `NEXO_Inventory_Replenishment_${projectId}.xlsx`);
   };
 
   const toOrderCount = activeItems.filter(i => (i.orderNow || 0) > 0).length;

@@ -17,9 +17,10 @@ if %errorlevel% neq 0 (
     echo [1/3] PyInstaller verified.
 )
 
-:: 2. Ensure frontend is built
+:: 2. Ensure frontend is built and staging is clean of database/log files (SEC-LOW-04)
 echo [2/3] Building production frontend bundle (npm run build)...
 call npm run build
+del /q /f backend\*.duckdb backend\*.duckdb.wal backend\*.log *.log 2>nul
 
 :: 3. Build executable
 echo [3/3] Packaging NEXO Desktop Application...
@@ -29,6 +30,8 @@ pyinstaller --noconfirm --onedir --windowed ^
     --add-data "dist;dist" ^
     --add-data "backend;backend" ^
     --add-data "public;public" ^
+    --exclude-module "test_endpoints" ^
+    --exclude-module "test_security" ^
     --hidden-import "uvicorn" ^
     --hidden-import "fastapi" ^
     --hidden-import "duckdb" ^

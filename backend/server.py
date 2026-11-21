@@ -45,6 +45,7 @@ if repo_dir not in sys.path:
 
 import io
 import json
+import re
 import uuid
 import datetime
 import tempfile
@@ -52,10 +53,12 @@ import shutil
 import csv
 from pathlib import Path
 from python_calamine import CalamineWorkbook
-from typing import Dict, List, Any, Optional, Tuple
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Query, Response
+from typing import Dict, List, Any, Optional, Tuple, Union
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Query, Response, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse, FileResponse
+from starlette.middleware.trustedhost import TrustedHostMiddleware
+from starlette.responses import RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 import pandas as pd
@@ -64,9 +67,14 @@ import pyodbc
 
 import sqlite3
 import urllib.request
+import urllib.parse
+import socket
+import ipaddress
 import subprocess
 import threading
 import time
+import secrets
+import hmac
 
 REPO_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 SUBPROCESS_FLAGS = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
@@ -178,7 +186,19 @@ app = FastAPI(
     version="1.0.0"
 )
 
-# Enable CORS for local Vite development servers
+# Initialize startup session secret for local boundary defense (SEC-CRIT-01, SEC-MED-02)
+NEXO_SESSION_SECRET = os.environ.get("NEXO_SESSION_SECRET")
+if not NEXO_SESSION_SECRET:
+    NEXO_SESSION_SECRET = secrets.token_urlsafe(32)
+    os.environ["NEXO_SESSION_SECRET"] = NEXO_SESSION_SECRET
+
+# 1. DNS Rebinding Protection via TrustedHostMiddleware (SEC-MED-02)
+app.add_middleware(
+    TrustedHostMiddleware,
+    allowed_hosts=["127.0.0.1", "localhost", "*.localhost", "test", "testserver"]
+)
+
+# 2. Strict CORS Lockdown for Loopback Origins Only (SEC-CRIT-01)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
@@ -188,12 +208,97 @@ app.add_middleware(
         "http://127.0.0.1:4173",
         "http://localhost:3000",
         "http://127.0.0.1:3000",
-        "*"
+        "http://localhost:8000",
+        "http://127.0.0.1:8000",
     ],
+    allow_origin_regex=r"^http://(127\.0\.0\.1|localhost)(:\d+)?$",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# 3. Defensive Security Headers Middleware (SEC-LOW-02)
+@app.middleware("http")
+async def security_headers_middleware(request: Request, call_next):
+    response = await call_next(request)
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["Referrer-Policy"] = "no-referrer"
+    response.headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=()"
+    response.headers["Content-Security-Policy"] = (
+        "default-src 'self'; "
+        "script-src 'self' 'unsafe-inline'; "
+        "style-src 'self' 'unsafe-inline'; "
+        "img-src 'self' data: blob:; "
+        "font-src 'self' data:; "
+        "connect-src 'self' http://127.0.0.1:* http://localhost:* ws://127.0.0.1:* ws://localhost:*; "
+        "frame-ancestors 'none'; "
+        "object-src 'none'; "
+        "base-uri 'self'; "
+        "form-action 'self'"
+    )
+    return response
+
+# 4. Localhost Session Authentication Middleware (SEC-CRIT-01)
+@app.middleware("http")
+async def session_auth_middleware(request: Request, call_next):
+    # Allow CORS preflight requests
+    if request.method == "OPTIONS":
+        return await call_next(request)
+    
+    path = request.url.path
+    
+    # Exempt non-API routes (static frontend, assets, bootstrap)
+    if not path.startswith("/api/") and path != "/api":
+        return await call_next(request)
+    
+    # Exempt health diagnostic endpoints
+    if path in ("/api/health", "/health", "/api/health/"):
+        return await call_next(request)
+    
+    # Require valid session cookie or X-NEXO-Session-Token header for all /api/* routes
+    session_secret = os.environ.get("NEXO_SESSION_SECRET", "")
+    if not session_secret:
+        return JSONResponse(status_code=401, content={"detail": "Unauthorized: Session secret not configured."})
+    
+    cookie_token = request.cookies.get("nexo_session")
+    header_token = request.headers.get("X-NEXO-Session-Token") or request.headers.get("x-nexo-session-token")
+    
+    is_valid = False
+    if cookie_token and hmac.compare_digest(cookie_token, session_secret):
+        is_valid = True
+    elif header_token and hmac.compare_digest(header_token, session_secret):
+        is_valid = True
+    
+    if not is_valid:
+        return JSONResponse(status_code=401, content={"detail": "Unauthorized: Missing or invalid NEXO session authentication."})
+    
+    return await call_next(request)
+
+# 4. Bootstrap Authentication Route for Native WebView2 (SEC-CRIT-01)
+@app.get("/auth/bootstrap", include_in_schema=False)
+def auth_bootstrap(nonce: str = Query(...)):
+    """
+    Single-use bootstrap authentication endpoint for Edge WebView2 desktop runtime.
+    Validates single-use nonce, sets HttpOnly SameSite=Strict session cookie, and redirects to root.
+    """
+    expected_nonce = os.environ.get("NEXO_BOOTSTRAP_NONCE")
+    if not expected_nonce or not nonce or not hmac.compare_digest(nonce, expected_nonce):
+        raise HTTPException(status_code=403, detail="Forbidden: Invalid or expired bootstrap nonce")
+    
+    # Single-use: consume nonce immediately
+    os.environ.pop("NEXO_BOOTSTRAP_NONCE", None)
+    
+    session_secret = os.environ.get("NEXO_SESSION_SECRET", "")
+    resp = RedirectResponse(url=f"/?t={int(time.time())}", status_code=302)
+    resp.set_cookie(
+        key="nexo_session",
+        value=session_secret,
+        httponly=True,
+        samesite="strict",
+        path="/"
+    )
+    return resp
 
 # Initialize DuckDB schema on startup
 @app.on_event("startup")
@@ -639,33 +744,46 @@ class SqlServerTestRequest(BaseModel):
     password: Optional[str] = ""
     driver: Optional[str] = None
     simulate_demo: Optional[bool] = False
+    trust_server_certificate: Optional[bool] = False
 
-def _build_sql_connection_string(req: SqlServerTestRequest, driver_name: str) -> str:
-    """Constructs a valid ODBC connection string for Microsoft SQL Server."""
-    host = (req.server_host or req.server or "localhost").strip()
-    db = (req.database_name or req.database or "master").strip()
-    port = req.port or 1433
+def _clean_odbc_val(val: Any) -> str:
+    s = re.sub(r'[\r\n\x00]', '', str(val or ''))
+    return s.replace('}', '}}')
+
+def _build_sql_connection_string(req: Any, driver_name: str) -> str:
+    """Constructs a valid and injection-safe ODBC connection string for Microsoft SQL Server (SEC-CRIT-04)."""
+    raw_host = (getattr(req, "server_host", None) or getattr(req, "server", None) or "localhost").strip()
+    raw_db = (getattr(req, "database_name", None) or getattr(req, "database", None) or "master").strip()
+    port = getattr(req, "port", None) or 1433
 
     # Clean protocol prefix if present
-    if host.startswith("tcp:"):
-        host = host[4:]
+    if raw_host.startswith("tcp:"):
+        raw_host = raw_host[4:]
 
     # Append port if not already in host and not an instance backslash
-    if "," not in host and "\\" not in host and port != 1433:
-        host_str = f"{host},{port}"
+    if "," not in raw_host and "\\" not in raw_host and port != 1433:
+        host_str = f"{raw_host},{port}"
     else:
-        host_str = host
+        host_str = raw_host
 
-    auth = req.auth_mode or req.auth_type or "sql"
+    safe_driver = _clean_odbc_val(driver_name)
+    safe_server = _clean_odbc_val(host_str)
+    safe_db = _clean_odbc_val(raw_db)
+
+    auth = getattr(req, "auth_mode", None) or getattr(req, "auth_type", None) or "sql"
 
     if auth == "windows":
-        conn_str = f"DRIVER={{{driver_name}}};SERVER={host_str};DATABASE={db};Trusted_Connection=yes;"
+        conn_str = f"DRIVER={{{safe_driver}}};SERVER={{{safe_server}}};DATABASE={{{safe_db}}};Trusted_Connection=yes;"
     else:
-        conn_str = f"DRIVER={{{driver_name}}};SERVER={host_str};DATABASE={db};UID={req.username or ''};PWD={req.password or ''};"
+        safe_uid = _clean_odbc_val(getattr(req, "username", "") or '')
+        safe_pwd = _clean_odbc_val(getattr(req, "password", "") or '')
+        conn_str = f"DRIVER={{{safe_driver}}};SERVER={{{safe_server}}};DATABASE={{{safe_db}}};UID={{{safe_uid}}};PWD={{{safe_pwd}}};"
 
-    # Add certificate trust for modern ODBC Driver 18
-    if "ODBC Driver 18" in driver_name:
+    # Certificate trust: explicit opt-in only (SEC-CRIT-04)
+    if getattr(req, "trust_server_certificate", False):
         conn_str += "TrustServerCertificate=yes;"
+    elif "ODBC Driver 18" in driver_name:
+        conn_str += "TrustServerCertificate=no;"
 
     return conn_str
 
@@ -780,6 +898,7 @@ class SqlServerImportRequest(BaseModel):
     save_profile: Optional[bool] = False
     profile_name: Optional[str] = None
     merge_mode: Optional[str] = "merge"
+    trust_server_certificate: Optional[bool] = False
 
 @app.post("/api/sql/import")
 def import_from_sql_server(req: SqlServerImportRequest):
@@ -788,6 +907,34 @@ def import_from_sql_server(req: SqlServerImportRequest):
     Executes custom SQL or mapped table reads, transforms and upserts them into DuckDB,
     and returns the loaded dataset.
     """
+    # 1. Strict validation of items_table identifier (SEC-CRIT-04)
+    table_pattern = re.compile(r'^[A-Za-z0-9_]+(\.[A-Za-z0-9_]+)?$')
+    raw_table = (req.items_table or "dbo.Dim_Item").strip()
+    if not table_pattern.match(raw_table):
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid items_table format. Only alphanumeric characters, underscores, and an optional schema prefix (e.g. dbo.Dim_Item) are allowed."
+        )
+    if "." in raw_table:
+        parts = raw_table.split(".", 1)
+        safe_items_table = f"[{parts[0]}].[{parts[1]}]"
+    else:
+        safe_items_table = f"[{raw_table}]"
+
+    # 2. Strict validation of custom_sql query (SEC-CRIT-04)
+    if req.custom_sql:
+        c_sql = req.custom_sql.strip()
+        if ";" in c_sql.rstrip(";"):
+            raise HTTPException(status_code=400, detail="Multi-statement SQL queries are not permitted.")
+        forbidden_erp = r'\b(DROP|DELETE|UPDATE|INSERT|ALTER|EXEC|EXECUTE|XP_|SP_|TRUNCATE|MERGE|GRANT|REVOKE)\b'
+        if re.search(forbidden_erp, c_sql, re.IGNORECASE):
+            raise HTTPException(status_code=400, detail="Forbidden SQL keyword in custom ERP query. Only read-only queries are permitted.")
+        if not re.match(r'^\s*(SELECT|WITH)\b', c_sql, re.IGNORECASE):
+            raise HTTPException(status_code=400, detail="Custom SQL query must begin with SELECT or WITH.")
+        erp_query = c_sql
+    else:
+        erp_query = f"SELECT TOP 100 * FROM {safe_items_table}"
+
     installed_drivers = pyodbc.drivers()
     available_drivers = [d for d in ["ODBC Driver 18 for SQL Server", "ODBC Driver 17 for SQL Server", "SQL Server"] if d in installed_drivers]
 
@@ -814,15 +961,14 @@ def import_from_sql_server(req: SqlServerImportRequest):
             port=req.port or 1433,
             auth_mode=req.auth_mode or req.auth_type or "sql",
             username=req.username,
-            password=req.password
+            password=req.password,
+            trust_server_certificate=req.trust_server_certificate
         )
         for driver in available_drivers:
             conn_str = _build_sql_connection_string(test_req, driver)
             try:
                 conn = pyodbc.connect(conn_str, timeout=3)
-                # Attempt to query custom sql or mapped items table
-                query = req.custom_sql if req.custom_sql else f"SELECT TOP 100 * FROM {req.items_table}"
-                df_erp = pd.read_sql(query, conn)
+                df_erp = pd.read_sql(erp_query, conn)
                 conn.close()
 
                 if not df_erp.empty:
@@ -957,10 +1103,11 @@ def import_from_sql_server(req: SqlServerImportRequest):
 def sync_saved_source(project_id: str):
     """
     Executes a live 1-click re-sync from the project's saved SQL Server or API connection profile.
+    Decrypts stored DPAPI credentials in-memory for the duration of the connection (SEC-MED-04).
     """
-    conns = get_erp_connections(project_id)
+    conns = get_erp_connections(project_id, mask_sensitive=False)
     if not conns:
-        conns = get_erp_connections()
+        conns = get_erp_connections(mask_sensitive=False)
     if not conns:
         raise HTTPException(status_code=404, detail="No saved ERP connection profile found for this project.")
 
@@ -968,11 +1115,15 @@ def sync_saved_source(project_id: str):
     host = conn.get("server_host") or "localhost"
     db = conn.get("database_name") or "ERP_SupplyChain_DW"
 
+    from backend.security_utils import decrypt_secret
+    decrypted_pass = decrypt_secret(conn.get("password_enc") or "")
+
     req = SqlServerImportRequest(
         server_host=host,
         database_name=db,
         auth_mode=conn.get("auth_mode", "sql"),
         username=conn.get("username", ""),
+        password=decrypted_pass,
         items_table=conn.get("items_table", "dbo.Dim_Item"),
         sales_table=conn.get("sales_table", "dbo.Fact_Sales_History"),
         inventory_table=conn.get("inventory_table", "dbo.Fact_Inventory_Snapshot"),
@@ -1136,15 +1287,37 @@ def update_job_progress(
         "error": error
     }
 
+MAX_UPLOAD_SIZE = 150 * 1024 * 1024  # 150 MB upload cap (SEC-MED-05)
+
 def stream_upload_to_file(upload_file: UploadFile) -> Tuple[str, str]:
-    """Streams multipart file directly to disk in 1MB chunks without holding in memory."""
+    """Streams multipart file directly to disk in 1MB chunks, enforcing a 150 MB cap."""
     filename = upload_file.filename or "uploaded_data.csv"
     ext = os.path.splitext(filename)[1].lower()
     suffix = ext if ext in [".csv", ".xlsx", ".xls"] else ".tmp"
-    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-        shutil.copyfileobj(upload_file.file, tmp, length=1024 * 1024)
-        tmp_path = tmp.name
-    return tmp_path, filename
+    total_size = 0
+    tmp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+            tmp_path = tmp.name
+            while True:
+                chunk = upload_file.file.read(1024 * 1024)
+                if not chunk:
+                    break
+                total_size += len(chunk)
+                if total_size > MAX_UPLOAD_SIZE:
+                    raise HTTPException(
+                        status_code=413,
+                        detail=f"Uploaded file exceeds maximum allowed size limit ({MAX_UPLOAD_SIZE // (1024 * 1024)} MB)."
+                    )
+                tmp.write(chunk)
+        return tmp_path, filename
+    except Exception:
+        if tmp_path and os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except Exception:
+                pass
+        raise
 
 def normalize_csv_encoding(file_path: str) -> Tuple[str, bool]:
     """
@@ -1187,7 +1360,7 @@ def load_file_into_staging(con: duckdb.DuckDBPyConnection, file_path: str, ext: 
     if ext == ".csv":
         norm_path, was_transcoded = normalize_csv_encoding(file_path)
         try:
-            escaped_path = norm_path.replace("\\", "/")
+            escaped_path = norm_path.replace("\\", "/").replace("'", "''")
             con.execute(f"""
                 CREATE OR REPLACE TEMP TABLE staging_raw AS
                 SELECT * FROM read_csv_auto('{escaped_path}', all_varchar=true, strict_mode=false, null_padding=true, ignore_errors=true, sample_size=-1);
@@ -2333,73 +2506,109 @@ async def import_typed_file(
 # Local Embedded Databases Connector (.duckdb / .sqlite / .db)
 # ==============================================================================
 
+LOCAL_DB_FORBIDDEN = re.compile(
+    r"\b(DROP|DELETE|UPDATE|INSERT|ALTER|ATTACH|DETACH|PRAGMA|CREATE|REPLACE|EXEC|EXECUTE|TRUNCATE|MERGE|GRANT|REVOKE|VACUUM|COPY|WRITE_CSV|INSTALL|LOAD)\b",
+    re.IGNORECASE
+)
+
+def _validate_local_db_query(sql: str) -> str:
+    cleaned = sql.strip().rstrip(";").strip()
+    if ";" in cleaned:
+        raise HTTPException(status_code=400, detail="Multi-statement SQL queries are not permitted.")
+    if not re.match(r"^\s*(SELECT|WITH)\b", cleaned, re.IGNORECASE):
+        raise HTTPException(status_code=400, detail="Only read-only SELECT or WITH queries are permitted.")
+    if LOCAL_DB_FORBIDDEN.search(cleaned):
+        raise HTTPException(status_code=400, detail="Query contains forbidden DDL, DML, or administrative keywords.")
+    return cleaned
+
 @app.post("/api/local-db/inspect")
 async def inspect_local_db(
     file: Optional[UploadFile] = File(None),
     file_path: Optional[str] = Form(None)
 ):
     """
-    Inspects a local DuckDB or SQLite file, returning available tables, column definitions, and sample rows.
+    Inspects an uploaded local DuckDB or SQLite file, returning available tables, column definitions, and sample rows.
+    Arbitrary server-side file_path inspection is strictly blocked (SEC-CRIT-03).
     """
-    temp_target = None
-    if file and file.filename:
-        import tempfile
-        suffix = ".duckdb" if file.filename.endswith(".duckdb") else ".sqlite"
-        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-            tmp.write(await file.read())
-            temp_target = tmp.name
-        db_target = temp_target
-    elif file_path and os.path.isfile(file_path):
-        db_target = file_path
-    else:
-        raise HTTPException(status_code=400, detail="Please provide a valid database file or existing file path.")
+    if file_path and not file:
+        raise HTTPException(
+            status_code=400,
+            detail="Direct server-side file paths are disabled for security. Please upload your database file directly."
+        )
+    if not file or not file.filename:
+        raise HTTPException(status_code=400, detail="Please upload a valid database file (.duckdb, .sqlite, .db).")
 
-    is_duckdb = db_target.lower().endswith(".duckdb")
-    tables_list = []
-    details = {}
+    raw_filename = file.filename.lower()
+    if not (raw_filename.endswith(".duckdb") or raw_filename.endswith(".sqlite") or raw_filename.endswith(".db")):
+        raise HTTPException(status_code=400, detail="Unsupported file format. Please upload a .duckdb, .sqlite, or .db file.")
+
+    is_duckdb = raw_filename.endswith(".duckdb")
+    suffix = ".duckdb" if is_duckdb else ".sqlite"
+    temp_target = None
 
     try:
-        if is_duckdb:
-            con = duckdb.connect(db_target, read_only=True)
-            tables = [r[0] for r in con.execute("SELECT table_name FROM information_schema.tables WHERE table_schema='main'").fetchall()]
-            for t in tables:
-                cols = [{"name": r[1], "type": r[2]} for r in con.execute(f"PRAGMA table_info('{t}')").fetchall()]
-                sample_df = con.execute(f"SELECT * FROM \"{t}\" LIMIT 5").fetchdf()
-                details[t] = {
-                    "columns": cols,
-                    "preview": sample_df.fillna("").to_dict(orient="records"),
-                    "row_count": len(sample_df)
-                }
-            con.close()
-            tables_list = tables
-        else:
-            conn = sqlite3.connect(db_target)
-            c = conn.cursor()
-            c.execute("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")
-            tables = [r[0] for r in c.fetchall()]
-            for t in tables:
-                c.execute(f"PRAGMA table_info('{t}')")
-                cols = [{"name": r[1], "type": r[2]} for r in c.fetchall()]
-                sample_df = pd.read_sql(f"SELECT * FROM [{t}] LIMIT 5", conn)
-                details[t] = {
-                    "columns": cols,
-                    "preview": sample_df.fillna("").to_dict(orient="records"),
-                    "row_count": len(sample_df)
-                }
-            conn.close()
-            tables_list = tables
-    except Exception as e:
-        if temp_target and os.path.exists(temp_target):
-            os.remove(temp_target)
-        raise HTTPException(status_code=400, detail=f"Failed to inspect database: {str(e)}")
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+            temp_target = tmp.name
+            while chunk := await file.read(64 * 1024):
+                tmp.write(chunk)
 
-    return {
-        "success": True,
-        "file_type": "duckdb" if is_duckdb else "sqlite",
-        "db_path": db_target,
-        "tables": tables_list,
-        "table_details": details
-    }
+        tables_list = []
+        details = {}
+
+        if is_duckdb:
+            con = duckdb.connect(temp_target, read_only=True)
+            try:
+                tables = [r[0] for r in con.execute("SELECT table_name FROM information_schema.tables WHERE table_schema='main'").fetchall()]
+                for t in tables:
+                    escaped_table = t.replace('"', '""')
+                    cols = [{"name": r[1], "type": r[2]} for r in con.execute(f'PRAGMA table_info("{escaped_table}")').fetchall()]
+                    sample_df = con.execute(f'SELECT * FROM "{escaped_table}" LIMIT 5').fetchdf()
+                    details[t] = {
+                        "columns": cols,
+                        "preview": sample_df.fillna("").to_dict(orient="records"),
+                        "row_count": len(sample_df)
+                    }
+                tables_list = tables
+            finally:
+                con.close()
+        else:
+            safe_uri = f"file:{Path(temp_target).resolve().as_posix()}?mode=ro"
+            conn = sqlite3.connect(safe_uri, uri=True)
+            try:
+                c = conn.cursor()
+                c.execute("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")
+                tables = [r[0] for r in c.fetchall()]
+                for t in tables:
+                    escaped_table = t.replace(']', ']]')
+                    c.execute(f"PRAGMA table_info([{escaped_table}])")
+                    cols = [{"name": r[1], "type": r[2]} for r in c.fetchall()]
+                    sample_df = pd.read_sql(f"SELECT * FROM [{escaped_table}] LIMIT 5", conn)
+                    details[t] = {
+                        "columns": cols,
+                        "preview": sample_df.fillna("").to_dict(orient="records"),
+                        "row_count": len(sample_df)
+                    }
+                tables_list = tables
+            finally:
+                conn.close()
+
+        return {
+            "success": True,
+            "file_type": "duckdb" if is_duckdb else "sqlite",
+            "db_path": file.filename,
+            "tables": tables_list,
+            "table_details": details
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Failed to inspect database: {str(e)}")
+    finally:
+        if temp_target and os.path.exists(temp_target):
+            try:
+                os.remove(temp_target)
+            except Exception:
+                pass
 
 @app.post("/api/local-db/import")
 async def import_from_local_db(
@@ -2414,112 +2623,223 @@ async def import_from_local_db(
     new_project_name: Optional[str] = Form(None)
 ):
     """
-    Imports rows from a selected table or custom SQL query within a local DuckDB or SQLite file.
+    Imports rows from a selected table or custom SQL query within an uploaded DuckDB or SQLite file.
+    Arbitrary server-side file_path import is strictly blocked (SEC-CRIT-03).
     """
-    temp_target = None
-    if file and file.filename:
-        import tempfile
-        suffix = ".duckdb" if file.filename.endswith(".duckdb") else ".sqlite"
-        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-            tmp.write(await file.read())
-            temp_target = tmp.name
-        db_target = temp_target
-    elif file_path and os.path.isfile(file_path):
-        db_target = file_path
-    else:
-        raise HTTPException(status_code=400, detail="Invalid database source.")
+    if file_path and not file:
+        raise HTTPException(
+            status_code=400,
+            detail="Direct server-side file paths are disabled for security. Please upload your database file directly."
+        )
+    if not file or not file.filename:
+        raise HTTPException(status_code=400, detail="Please upload a valid database file (.duckdb, .sqlite, .db).")
 
-    is_duckdb = db_target.lower().endswith(".duckdb")
-    query = custom_query if custom_query and custom_query.strip() else f"SELECT * FROM [{table_name}]" if not is_duckdb else f"SELECT * FROM \"{table_name}\""
+    raw_filename = file.filename.lower()
+    if not (raw_filename.endswith(".duckdb") or raw_filename.endswith(".sqlite") or raw_filename.endswith(".db")):
+        raise HTTPException(status_code=400, detail="Unsupported file format. Please upload a .duckdb, .sqlite, or .db file.")
+
+    is_duckdb = raw_filename.endswith(".duckdb")
+    suffix = ".duckdb" if is_duckdb else ".sqlite"
+    temp_target = None
 
     try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+            temp_target = tmp.name
+            while chunk := await file.read(64 * 1024):
+                tmp.write(chunk)
+
         if is_duckdb:
-            con = duckdb.connect(db_target, read_only=True)
-            df = con.execute(query).fetchdf()
-            con.close()
+            con = duckdb.connect(temp_target, read_only=True)
+            try:
+                actual_tables = [r[0] for r in con.execute("SELECT table_name FROM information_schema.tables WHERE table_schema='main'").fetchall()]
+                if custom_query and custom_query.strip():
+                    query = _validate_local_db_query(custom_query)
+                else:
+                    if table_name not in actual_tables:
+                        raise HTTPException(status_code=400, detail=f"Table '{table_name}' does not exist in the uploaded database.")
+                    escaped_table = table_name.replace('"', '""')
+                    query = f'SELECT * FROM "{escaped_table}"'
+                df = con.execute(query).fetchdf()
+            finally:
+                con.close()
         else:
-            conn = sqlite3.connect(db_target)
-            df = pd.read_sql(query, conn)
-            conn.close()
+            safe_uri = f"file:{Path(temp_target).resolve().as_posix()}?mode=ro"
+            conn = sqlite3.connect(safe_uri, uri=True)
+            try:
+                c = conn.cursor()
+                c.execute("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")
+                actual_tables = [r[0] for r in c.fetchall()]
+                if custom_query and custom_query.strip():
+                    query = _validate_local_db_query(custom_query)
+                else:
+                    if table_name not in actual_tables:
+                        raise HTTPException(status_code=400, detail=f"Table '{table_name}' does not exist in the uploaded database.")
+                    escaped_table = table_name.replace(']', ']]')
+                    query = f"SELECT * FROM [{escaped_table}]"
+                df = pd.read_sql(query, conn)
+            finally:
+                conn.close()
+
+        if df.empty:
+            raise HTTPException(status_code=400, detail="The query returned zero rows.")
+
+        # Resolve project ID
+        if project_id:
+            proj_id = project_id
+        else:
+            p_name = new_project_name or f"Imported: {os.path.basename(file.filename)}"
+            proj = create_new_project(p_name, f"Imported from local {table_name}", os.path.basename(file.filename))
+            proj_id = proj["id"]
+
+        cols = [str(c).strip() for c in df.columns]
+        mapping: Dict[str, str] = {}
+        if column_mapping:
+            try:
+                mapping = json.loads(column_mapping)
+            except Exception:
+                mapping = {}
+
+        c_code = _match_column(cols, mapping, "code") or cols[0]
+        c_desc = _match_column(cols, mapping, "description")
+        c_cat = _match_column(cols, mapping, "category")
+        c_loc = _match_column(cols, mapping, "location")
+        c_onhand = _match_column(cols, mapping, "on_hand")
+        c_onorder = _match_column(cols, mapping, "on_order")
+        c_lt = _match_column(cols, mapping, "lead_time_days")
+        c_cost = _match_column(cols, mapping, "purchase_price")
+        c_price = _match_column(cols, mapping, "sales_price")
+
+        items_data = []
+        for _, row in df.iterrows():
+            code = str(row.get(c_code, "")).strip()
+            if not code or code.lower() in ["nan", "none"]:
+                continue
+            items_data.append({
+                "code": code,
+                "description": str(row.get(c_desc, f"Item {code}")).strip() if c_desc and pd.notna(row.get(c_desc)) else f"Item {code}",
+                "category": str(row.get(c_cat, "General")).strip() if c_cat and pd.notna(row.get(c_cat)) else "General",
+                "location": str(row.get(c_loc, "Main Warehouse")).strip() if c_loc and pd.notna(row.get(c_loc)) else "Main Warehouse",
+                "on_hand": float(row.get(c_onhand, 0.0)) if c_onhand and pd.notna(row.get(c_onhand)) else 0.0,
+                "on_order": float(row.get(c_onorder, 0.0)) if c_onorder and pd.notna(row.get(c_onorder)) else 0.0,
+                "lead_time_days": float(row.get(c_lt, 30.0)) if c_lt and pd.notna(row.get(c_lt)) else 30.0,
+                "purchase_price": float(row.get(c_cost, 50.0)) if c_cost and pd.notna(row.get(c_cost)) else 50.0,
+                "sales_price": float(row.get(c_price, 100.0)) if c_price and pd.notna(row.get(c_price)) else 100.0
+            })
+
+        res = upsert_items_and_periods(proj_id, items_data, None, merge_mode=merge_mode)
+
+        add_ingestion_log(
+            project_id=proj_id,
+            source_type="duckdb_sqlite",
+            source_name=f"{os.path.basename(file.filename)} / {table_name}",
+            data_category=data_category,
+            rows_processed=len(items_data),
+            status="success"
+        )
+
+        return {
+            "success": True,
+            "project_id": proj_id,
+            "rows_processed": len(items_data),
+            "items_upserted": res.get("items_upserted", 0),
+            "message": f"Successfully imported {len(items_data)} items from {table_name} into DuckDB."
+        }
+    except HTTPException:
+        raise
     except Exception as e:
-        if temp_target and os.path.exists(temp_target):
-            os.remove(temp_target)
         raise HTTPException(status_code=400, detail=f"Query execution failed: {str(e)}")
-
-    if df.empty:
-        raise HTTPException(status_code=400, detail="The query returned zero rows.")
-
-    # Resolve project ID
-    if project_id:
-        proj_id = project_id
-    else:
-        p_name = new_project_name or f"Imported: {os.path.basename(db_target)}"
-        proj = create_new_project(p_name, f"Imported from local {table_name}", os.path.basename(db_target))
-        proj_id = proj["id"]
-
-    cols = [str(c).strip() for c in df.columns]
-    mapping: Dict[str, str] = {}
-    if column_mapping:
-        try:
-            mapping = json.loads(column_mapping)
-        except Exception:
-            mapping = {}
-
-    c_code = _match_column(cols, mapping, "code") or cols[0]
-    c_desc = _match_column(cols, mapping, "description")
-    c_cat = _match_column(cols, mapping, "category")
-    c_loc = _match_column(cols, mapping, "location")
-    c_onhand = _match_column(cols, mapping, "on_hand")
-    c_onorder = _match_column(cols, mapping, "on_order")
-    c_lt = _match_column(cols, mapping, "lead_time_days")
-    c_cost = _match_column(cols, mapping, "purchase_price")
-    c_price = _match_column(cols, mapping, "sales_price")
-
-    items_data = []
-    for _, row in df.iterrows():
-        code = str(row.get(c_code, "")).strip()
-        if not code or code.lower() in ["nan", "none"]:
-            continue
-        items_data.append({
-            "code": code,
-            "description": str(row.get(c_desc, f"Item {code}")).strip() if c_desc and pd.notna(row.get(c_desc)) else f"Item {code}",
-            "category": str(row.get(c_cat, "General")).strip() if c_cat and pd.notna(row.get(c_cat)) else "General",
-            "location": str(row.get(c_loc, "Main Warehouse")).strip() if c_loc and pd.notna(row.get(c_loc)) else "Main Warehouse",
-            "on_hand": float(row.get(c_onhand, 0.0)) if c_onhand and pd.notna(row.get(c_onhand)) else 0.0,
-            "on_order": float(row.get(c_onorder, 0.0)) if c_onorder and pd.notna(row.get(c_onorder)) else 0.0,
-            "lead_time_days": float(row.get(c_lt, 30.0)) if c_lt and pd.notna(row.get(c_lt)) else 30.0,
-            "purchase_price": float(row.get(c_cost, 50.0)) if c_cost and pd.notna(row.get(c_cost)) else 50.0,
-            "sales_price": float(row.get(c_price, 100.0)) if c_price and pd.notna(row.get(c_price)) else 100.0
-        })
-
-    res = upsert_items_and_periods(proj_id, items_data, None, merge_mode=merge_mode)
-
-    add_ingestion_log(
-        project_id=proj_id,
-        source_type="duckdb_sqlite",
-        source_name=f"{os.path.basename(db_target)} / {table_name}",
-        data_category=data_category,
-        rows_processed=len(items_data),
-        status="success"
-    )
-
-    if temp_target and os.path.exists(temp_target):
-        try:
-            os.remove(temp_target)
-        except Exception:
-            pass
-
-    return {
-        "success": True,
-        "project_id": proj_id,
-        "rows_processed": len(items_data),
-        "items_upserted": res.get("items_upserted", 0),
-        "message": f"Successfully imported {len(items_data)} items from {table_name} into DuckDB."
-    }
+    finally:
+        if temp_target and os.path.exists(temp_target):
+            try:
+                os.remove(temp_target)
+            except Exception:
+                pass
 
 # ==============================================================================
 # REST API / External Web Feed Connector (JSON / Google Sheets CSV)
+# Hardened against SSRF, Loopback, Private IPs & Size Bombs (SEC-HIGH-01)
 # ==============================================================================
+
+class SafeRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Prevents SSRF redirect bypass to loopback, private IPs or unsupported schemes."""
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        _validate_safe_url(newurl)
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+def _validate_safe_url(url_str: str) -> str:
+    """
+    Validates that a URL uses http/https and does NOT resolve to localhost,
+    private RFC-1918 ranges, link-local, multicast, or reserved IP addresses.
+    """
+    clean = url_str.strip()
+    parsed = urllib.parse.urlparse(clean)
+    if parsed.scheme.lower() not in ("http", "https"):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported URL scheme '{parsed.scheme}'. Only HTTP and HTTPS are permitted."
+        )
+    hostname = parsed.hostname
+    if not hostname:
+        raise HTTPException(status_code=400, detail="Invalid URL: Missing hostname.")
+
+    try:
+        addr_info = socket.getaddrinfo(hostname, None)
+    except socket.gaierror as e:
+        raise HTTPException(status_code=400, detail=f"Could not resolve host '{hostname}': {str(e)}")
+
+    for item in addr_info:
+        ip_str = item[4][0]
+        try:
+            ip = ipaddress.ip_address(ip_str)
+        except ValueError:
+            continue
+        if (
+            ip.is_private
+            or ip.is_loopback
+            or ip.is_link_local
+            or ip.is_multicast
+            or ip.is_reserved
+            or ip.is_unspecified
+        ):
+            raise HTTPException(
+                status_code=400,
+                detail=f"Access to private, loopback, or reserved IP address ({ip_str}) is blocked."
+            )
+    return clean
+
+def fetch_safe_external_url(
+    url_str: str,
+    headers: dict,
+    timeout: int = 10,
+    max_bytes: int = 10 * 1024 * 1024
+) -> Tuple[bytes, str]:
+    """
+    Fetches remote data safely with SSRF validation, redirect inspection, and 10MB response read cap.
+    """
+    clean_url = _validate_safe_url(url_str)
+    opener = urllib.request.build_opener(SafeRedirectHandler)
+    req = urllib.request.Request(clean_url, headers=headers)
+    try:
+        with opener.open(req, timeout=timeout) as resp:
+            content_type = resp.headers.get("Content-Type", "").lower()
+            chunks = []
+            total_read = 0
+            while True:
+                chunk = resp.read(64 * 1024)
+                if not chunk:
+                    break
+                total_read += len(chunk)
+                if total_read > max_bytes:
+                    raise HTTPException(
+                        status_code=413,
+                        detail=f"Response size exceeded maximum allowed limit ({max_bytes // (1024 * 1024)} MB)."
+                    )
+                chunks.append(chunk)
+            return b"".join(chunks), content_type
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Failed to fetch data from URL: {str(e)}")
 
 @app.post("/api/external-url/preview")
 def preview_external_url(
@@ -2529,6 +2849,7 @@ def preview_external_url(
 ):
     """
     Fetches remote data from an HTTP/HTTPS URL (CSV or JSON array) and returns detected columns and preview rows.
+    Guarded against SSRF and response bombs (SEC-HIGH-01).
     """
     clean_url = url.strip()
     headers = {"User-Agent": "NEXO-Enterprise-Planner/2.0"}
@@ -2537,13 +2858,7 @@ def preview_external_url(
     elif auth_token:
         headers["Authorization"] = f"Bearer {auth_token.strip()}"
 
-    try:
-        req = urllib.request.Request(clean_url, headers=headers)
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            content_bytes = resp.read()
-            content_type = resp.headers.get("Content-Type", "").lower()
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Failed to fetch data from URL: {str(e)}")
+    content_bytes, content_type = fetch_safe_external_url(clean_url, headers=headers, timeout=10)
 
     try:
         # Check if CSV
@@ -2587,7 +2902,7 @@ def import_from_external_url(
 ):
     """
     Fetches data from an external HTTP/HTTPS REST endpoint or published Google Sheet, maps columns,
-    and ingests rows into the DuckDB workspace.
+    and ingests rows into the DuckDB workspace. Guarded against SSRF and response bombs (SEC-HIGH-01).
     """
     clean_url = url.strip()
     headers = {"User-Agent": "NEXO-Enterprise-Planner/2.0"}
@@ -2596,13 +2911,7 @@ def import_from_external_url(
     elif auth_token:
         headers["Authorization"] = f"Bearer {auth_token.strip()}"
 
-    try:
-        req = urllib.request.Request(clean_url, headers=headers)
-        with urllib.request.urlopen(req, timeout=12) as resp:
-            content_bytes = resp.read()
-            content_type = resp.headers.get("Content-Type", "").lower()
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Failed to fetch data from URL: {str(e)}")
+    content_bytes, content_type = fetch_safe_external_url(clean_url, headers=headers, timeout=12)
 
     try:
         if "csv" in content_type or clean_url.endswith(".csv") or b"," in content_bytes[:200]:
@@ -2745,7 +3054,7 @@ async def inspect_file_endpoint(
             sheets = ["Sheet1"]
             norm_path, was_transcoded = normalize_csv_encoding(tmp_path)
             try:
-                escaped = norm_path.replace("\\", "/")
+                escaped = norm_path.replace("\\", "/").replace("'", "''")
                 with _LOCK:
                     con = get_connection()
                     con.execute(f"CREATE OR REPLACE TEMP TABLE staging_inspect AS SELECT * FROM read_csv_auto('{escaped}', all_varchar=true, strict_mode=false, null_padding=true, ignore_errors=true, sample_size=-1);")
@@ -2837,8 +3146,90 @@ async def import_file_endpoint(
     res["columns_detected"] = []
     return res
 
+def sanitize_excel_cell(val: Any) -> Any:
+    """
+    Prevents CSV / Excel formula injection (CWE-1236, SEC-MED-01).
+    Neutralizes leading formula operators (=, +, -, @, \t, \r) on string values.
+    """
+    if isinstance(val, str):
+        if val.startswith(("=", "+", "-", "@", "\t", "\r")):
+            return f"'{val}"
+    return val
+
+class ExcelSheetData(BaseModel):
+    name: str
+    rows: List[Dict[str, Any]]
+
+class ExcelExportRequest(BaseModel):
+    filename: Optional[str] = "NEXO_Export.xlsx"
+    sheets: List[ExcelSheetData]
+
+@app.post("/api/export/excel")
+def export_custom_excel(req: ExcelExportRequest):
+    """
+    Unified, hardened Excel (.xlsx) export endpoint (SEC-HIGH-03, SEC-MED-01).
+    Sanitizes all cells against formula injection and generates openpyxl workbooks
+    with automatic Arabic RTL sheet support.
+    """
+    import openpyxl
+
+    wb = openpyxl.Workbook()
+    default_sheet = wb.active
+
+    for idx, sheet_spec in enumerate(req.sheets):
+        sheet_name = (sheet_spec.name or f"Sheet{idx+1}").strip()[:31]
+        sheet_name = re.sub(r'[\\/*?:\[\]]', '_', sheet_name) or f"Sheet{idx+1}"
+        ws = wb.create_sheet(title=sheet_name)
+        
+        has_arabic = bool(re.search(r'[\u0600-\u06FF]', sheet_name))
+        
+        if sheet_spec.rows:
+            headers = []
+            for row in sheet_spec.rows:
+                for k in row.keys():
+                    if k not in headers:
+                        headers.append(k)
+                        if not has_arabic and re.search(r'[\u0600-\u06FF]', str(k)):
+                            has_arabic = True
+
+            ws.append([sanitize_excel_cell(h) for h in headers])
+
+            for row in sheet_spec.rows:
+                row_vals = []
+                for h in headers:
+                    val = row.get(h, "")
+                    sanitized = sanitize_excel_cell(val)
+                    row_vals.append(sanitized)
+                    if not has_arabic and isinstance(val, str) and re.search(r'[\u0600-\u06FF]', val):
+                        has_arabic = True
+                ws.append(row_vals)
+
+        if has_arabic:
+            ws.views.sheetView[0].rightToLeft = True
+
+    if default_sheet and default_sheet in wb.worksheets:
+        wb.remove(default_sheet)
+
+    if not wb.worksheets:
+        wb.create_sheet(title="Sheet1")
+
+    output = io.BytesIO()
+    wb.save(output)
+    output.seek(0)
+
+    filename = (req.filename or "NEXO_Export.xlsx").strip()
+    if not filename.endswith(".xlsx"):
+        filename += ".xlsx"
+    filename = re.sub(r'[\r\n"]', '_', filename)
+
+    return StreamingResponse(
+        output,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'}
+    )
+
 def _generate_excel_export(project_id: str, export_type: str = "all") -> StreamingResponse:
-    """Generates real .xlsx exports from DuckDB tables."""
+    """Generates real .xlsx exports from DuckDB tables with formula sanitization."""
     items = get_project_items(project_id)
     if not items:
         raise HTTPException(status_code=404, detail="No items found for this project")
@@ -2846,11 +3237,11 @@ def _generate_excel_export(project_id: str, export_type: str = "all") -> Streami
     inv_data = []
     for it in items:
         inv_data.append({
-            "Item Code": it["code"],
-            "Description": it["description"],
-            "Category": it["category"],
-            "Location": it["location"],
-            "Supplier": it["supplier"],
+            "Item Code": sanitize_excel_cell(it["code"]),
+            "Description": sanitize_excel_cell(it["description"]),
+            "Category": sanitize_excel_cell(it["category"]),
+            "Location": sanitize_excel_cell(it["location"]),
+            "Supplier": sanitize_excel_cell(it["supplier"]),
             "Sales Price ($)": it["salesPrice"],
             "Purchase Price ($)": it["purchasePrice"],
             "On Hand": it["onHand"],
@@ -2861,36 +3252,36 @@ def _generate_excel_export(project_id: str, export_type: str = "all") -> Streami
             "Order Now": it["orderNow"],
             "Order Value ($)": it["orderNowValue"],
             "Days of Supply": it["daysOfSupply"],
-            "ABC Class": it["abcClass"],
-            "XYZ Class": it["xyzClass"],
-            "Forecast Model": it["modelType"],
-            "Replenishment Strategy": it["replenishmentStrategy"],
+            "ABC Class": sanitize_excel_cell(it["abcClass"]),
+            "XYZ Class": sanitize_excel_cell(it["xyzClass"]),
+            "Forecast Model": sanitize_excel_cell(it["modelType"]),
+            "Replenishment Strategy": sanitize_excel_cell(it["replenishmentStrategy"]),
             "Forecast Accuracy (%)": it["accuracy"]
         })
 
     forecast_data = []
     for it in items:
         row = {
-            "Item Code": it["code"],
-            "Description": it["description"],
-            "Category": it["category"],
-            "Location": it["location"]
+            "Item Code": sanitize_excel_cell(it["code"]),
+            "Description": sanitize_excel_cell(it["description"]),
+            "Category": sanitize_excel_cell(it["category"]),
+            "Location": sanitize_excel_cell(it["location"])
         }
         for p in it.get("periods", []):
-            label = p["date"]
+            label = sanitize_excel_cell(p["date"])
             val = p.get("override") if p.get("override") is not None else (p.get("forecast") if p.get("actual") == 0 else p.get("actual"))
-            row[label] = val
+            row[label] = sanitize_excel_cell(val)
         forecast_data.append(row)
 
     orders_data = []
     for it in items:
         if it["orderNow"] > 0:
             orders_data.append({
-                "Order No": f"PO-PLAN-{it['code']}",
-                "Item Code": it["code"],
-                "Description": it["description"],
-                "Supplier": it["supplier"],
-                "Destination": it["location"],
+                "Order No": sanitize_excel_cell(f"PO-PLAN-{it['code']}"),
+                "Item Code": sanitize_excel_cell(it["code"]),
+                "Description": sanitize_excel_cell(it["description"]),
+                "Supplier": sanitize_excel_cell(it["supplier"]),
+                "Destination": sanitize_excel_cell(it["location"]),
                 "Order Qty": it["orderNow"],
                 "Unit Cost ($)": it["purchasePrice"],
                 "Total Value ($)": it["orderNowValue"],
@@ -2949,24 +3340,33 @@ def _perform_delayed_restart():
     except Exception:
         pass
 
-    # Launch replacement process detached
+    # Launch replacement process detached without shell=True (SEC-HIGH-02)
     vbs_path = os.path.join(REPO_DIR, "NEXO.vbs")
+    app_py = os.path.join(REPO_DIR, "desktop_app.py")
     DETACHED_PROCESS = 0x00000008
     CREATE_NO_WINDOW = 0x08000000
+    creationflags = (DETACHED_PROCESS | CREATE_NO_WINDOW) if os.name == "nt" else 0
 
-    if os.path.exists(vbs_path):
-        cmd = f'ping 127.0.0.1 -n 2 > nul & wscript.exe "{vbs_path}"'
+    if os.name == "nt" and os.path.exists(vbs_path):
+        target_args = ["wscript.exe", vbs_path]
     else:
-        python_exe = sys.executable
-        app_py = os.path.join(REPO_DIR, "desktop_app.py")
-        cmd = f'ping 127.0.0.1 -n 2 > nul & "{python_exe}" "{app_py}"'
+        pythonw = sys.executable.replace("python.exe", "pythonw.exe")
+        py_exe = pythonw if os.path.exists(pythonw) else sys.executable
+        target_args = [py_exe, app_py]
+
+    launcher_cmd = [
+        sys.executable,
+        "-c",
+        "import time, subprocess, sys; time.sleep(1.5); subprocess.Popen(sys.argv[1:])",
+        *target_args
+    ]
 
     try:
         subprocess.Popen(
-            cmd,
-            shell=True,
+            launcher_cmd,
+            shell=False,
             cwd=REPO_DIR,
-            creationflags=DETACHED_PROCESS | CREATE_NO_WINDOW if os.name == "nt" else 0,
+            creationflags=creationflags,
             close_fds=True
         )
     except Exception as e:
@@ -3237,27 +3637,49 @@ if os.path.isdir(ASSETS_DIR):
 
 @app.get("/{full_path:path}", include_in_schema=False)
 async def serve_spa_frontend(full_path: str):
-    # Do not intercept unmatched /api/* routes
+    # Do not intercept unmatched /api/* or /auth/* routes
     if full_path.startswith("api/") or full_path == "api":
         raise HTTPException(status_code=404, detail="API endpoint not found")
-    
-    # Check if a specific file was requested in dist/ (e.g. nexo.ico, favicon.svg)
-    candidate = os.path.join(DIST_DIR, full_path)
-    if full_path and os.path.isfile(candidate):
-        return FileResponse(candidate)
-    
+    if full_path.startswith("auth/") or full_path == "auth":
+        raise HTTPException(status_code=404, detail="Auth endpoint not found")
+
+    clean_path = full_path.strip().lstrip("/")
+
+    # Strict path traversal defense (SEC-CRIT-02)
+    if (
+        ".." in clean_path
+        or "\\" in clean_path
+        or ":" in clean_path
+        or any(part.startswith(".") for part in clean_path.split("/") if part)
+    ):
+        raise HTTPException(status_code=403, detail="Access denied: invalid path")
+
+    base_dir = Path(DIST_DIR).resolve()
+    try:
+        candidate = (base_dir / clean_path).resolve()
+        is_safe = candidate.is_relative_to(base_dir)
+    except (ValueError, RuntimeError):
+        is_safe = False
+
+    if not is_safe:
+        raise HTTPException(status_code=403, detail="Access denied: path outside document root")
+
+    # If a specific static file was requested in dist/ (e.g. assets/*.js, favicon.svg)
+    if clean_path and candidate.is_file():
+        return FileResponse(str(candidate))
+
     # Return index.html for all client-side SPA routes
-    index_file = os.path.join(DIST_DIR, "index.html")
-    if os.path.isfile(index_file):
+    index_file = base_dir / "index.html"
+    if index_file.is_file():
         return FileResponse(
-            index_file,
+            str(index_file),
             headers={
                 "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
                 "Pragma": "no-cache",
                 "Expires": "0"
             }
         )
-    
+
     return JSONResponse({
         "status": "online",
         "app": "NEXO Enterprise Supply Chain Planning",

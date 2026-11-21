@@ -14,6 +14,12 @@ TEST_TMP_DIR = tempfile.mkdtemp(prefix="nexo_test_")
 TEST_DB_PATH = os.path.join(TEST_TMP_DIR, "isolated_test_workspace.duckdb")
 os.environ["NEXO_DB_PATH"] = TEST_DB_PATH
 
+# Wave 1 Session Secrets for Local Boundary Authentication (SEC-CRIT-01, SEC-MED-02)
+TEST_SESSION_SECRET = "nexo_test_secret_for_automated_test_suite_key_2026"
+TEST_BOOTSTRAP_NONCE = "nexo_test_bootstrap_nonce_1234567890abcdef"
+os.environ["NEXO_SESSION_SECRET"] = TEST_SESSION_SECRET
+os.environ["NEXO_BOOTSTRAP_NONCE"] = TEST_BOOTSTRAP_NONCE
+
 import asyncio
 import uuid
 import time
@@ -25,7 +31,144 @@ from backend.database import init_db, get_connection, close_db
 async def run_tests():
     init_db()
     transport = httpx.ASGITransport(app=app)
-    async with httpx.AsyncClient(transport=transport, base_url='http://test') as client:
+
+    # --------------------------------------------------------------------------
+    # Wave 1: Security Boundary Verification (SEC-CRIT-01..04, SEC-MED-02)
+    # --------------------------------------------------------------------------
+    async with httpx.AsyncClient(transport=transport, base_url='http://test') as sec_client:
+        # 0a. Test unauthenticated API access is rejected with 401
+        r_unauth = await sec_client.get('/api/projects')
+        assert r_unauth.status_code == 401, f"Expected 401 for unauthenticated request, got {r_unauth.status_code}"
+        print("0a. Unauthenticated API access rejected with 401 PASSED")
+
+        # 0b. Test invalid session token is rejected with 401
+        r_bad_token = await sec_client.get('/api/projects', headers={"X-NEXO-Session-Token": "invalid_token_123"})
+        assert r_bad_token.status_code == 401, f"Expected 401 for invalid token, got {r_bad_token.status_code}"
+        print("0b. Invalid session token rejected with 401 PASSED")
+
+        # 0c. Test single-use /auth/bootstrap flow with cookie & replay prevention
+        r_boot = await sec_client.get(f'/auth/bootstrap?nonce={TEST_BOOTSTRAP_NONCE}', follow_redirects=False)
+        assert r_boot.status_code == 302, f"Expected 302 redirect from /auth/bootstrap, got {r_boot.status_code}"
+        assert "nexo_session" in r_boot.cookies, "Expected nexo_session cookie in bootstrap response"
+        set_cookie = r_boot.headers.get("set-cookie", "")
+        assert "path=/" in set_cookie.lower(), f"Expected Path=/ in set-cookie, got {set_cookie}"
+        assert "httponly" in set_cookie.lower(), f"Expected HttpOnly in set-cookie, got {set_cookie}"
+        assert "samesite=strict" in set_cookie.lower(), f"Expected SameSite=strict in set-cookie, got {set_cookie}"
+
+        # Nonce replay must be rejected with 403
+        r_replay = await sec_client.get(f'/auth/bootstrap?nonce={TEST_BOOTSTRAP_NONCE}', follow_redirects=False)
+        assert r_replay.status_code == 403, f"Expected 403 for replayed bootstrap nonce, got {r_replay.status_code}"
+
+        # Invalid nonce must be rejected with 403
+        r_fake_nonce = await sec_client.get('/auth/bootstrap?nonce=fake_nonce', follow_redirects=False)
+        assert r_fake_nonce.status_code == 403, f"Expected 403 for fake bootstrap nonce, got {r_fake_nonce.status_code}"
+        print("0c. Single-use /auth/bootstrap and nonce replay defense PASSED")
+
+        # 0d. Test authenticated access via cookie set by bootstrap
+        cookie_val = r_boot.cookies["nexo_session"]
+        r_cookie_auth = await sec_client.get('/api/projects', cookies={"nexo_session": cookie_val})
+        assert r_cookie_auth.status_code == 200, f"Expected 200 for cookie-authenticated request, got {r_cookie_auth.status_code}"
+        print("0d. Cookie-authenticated API access PASSED")
+
+        # 0e. Path Traversal Defense (SEC-CRIT-02)
+        r_trav1 = await sec_client.get('/C:/Windows/win.ini')
+        assert r_trav1.status_code == 403, f"Expected 403 for C: drive traversal, got {r_trav1.status_code}"
+        r_trav2 = await sec_client.get('/%2e%2e/backend/server.py')
+        assert r_trav2.status_code == 403, f"Expected 403 for .. traversal, got {r_trav2.status_code}"
+        r_trav3 = await sec_client.get('/.env')
+        assert r_trav3.status_code == 403, f"Expected 403 for .env traversal, got {r_trav3.status_code}"
+        print("0e. Static file path traversal defense PASSED")
+
+        # 0f. SQL Server ERP Injection Defense (SEC-CRIT-04)
+        # Malicious items_table identifier
+        r_sqli_table = await sec_client.post(
+            '/api/sql/import',
+            headers={"X-NEXO-Session-Token": TEST_SESSION_SECRET},
+            json={'server': 'localhost', 'database': 'ERP_DB', 'items_table': 'items; DROP TABLE users--', 'simulate_demo': True}
+        )
+        assert r_sqli_table.status_code == 400, f"Expected 400 for malicious items_table, got {r_sqli_table.status_code}"
+
+        # Malicious custom_sql non-SELECT query
+        r_sqli_query = await sec_client.post(
+            '/api/sql/import',
+            headers={"X-NEXO-Session-Token": TEST_SESSION_SECRET},
+            json={'server': 'localhost', 'database': 'ERP_DB', 'custom_sql': 'DELETE FROM Dim_Item', 'simulate_demo': True}
+        )
+        assert r_sqli_query.status_code == 400, f"Expected 400 for non-SELECT custom_sql, got {r_sqli_query.status_code}"
+        print("0f. SQL Server ERP injection defense PASSED")
+
+        # 0g. SSRF Defense in External URL Connector (SEC-HIGH-01)
+        r_ssrf_local = await sec_client.post(
+            '/api/external-url/preview',
+            headers={"X-NEXO-Session-Token": TEST_SESSION_SECRET},
+            data={'url': 'http://127.0.0.1:8000/'}
+        )
+        assert r_ssrf_local.status_code == 400, f"Expected 400 for loopback URL, got {r_ssrf_local.status_code}"
+
+        r_ssrf_file = await sec_client.post(
+            '/api/external-url/preview',
+            headers={"X-NEXO-Session-Token": TEST_SESSION_SECRET},
+            data={'url': 'file:///C:/Windows/win.ini'}
+        )
+        assert r_ssrf_file.status_code == 400, f"Expected 400 for file:// scheme, got {r_ssrf_file.status_code}"
+
+        r_ssrf_host = await sec_client.post(
+            '/api/external-url/preview',
+            headers={"X-NEXO-Session-Token": TEST_SESSION_SECRET},
+            data={'url': 'http://localhost:8000/api/projects'}
+        )
+        assert r_ssrf_host.status_code == 400, f"Expected 400 for localhost, got {r_ssrf_host.status_code}"
+        print("0g. SSRF and scheme defense in Web Feed Connector PASSED")
+
+        # 0h. Formula Sanitization & Unified Backend Excel Export (SEC-HIGH-03, SEC-MED-01)
+        from backend.server import sanitize_excel_cell
+        assert sanitize_excel_cell("=CMD|'/C calc'!A0") == "'=CMD|'/C calc'!A0"
+        assert sanitize_excel_cell("@SUM(1,2)") == "'@SUM(1,2)"
+        assert sanitize_excel_cell("+100") == "'+100"
+        assert sanitize_excel_cell("-calc") == "'-calc"
+        assert sanitize_excel_cell("Safe Product") == "Safe Product"
+        assert sanitize_excel_cell(-42) == -42
+        assert sanitize_excel_cell(100.5) == 100.5
+
+        import openpyxl
+        import io
+        r_export = await sec_client.post(
+            '/api/export/excel',
+            headers={"X-NEXO-Session-Token": TEST_SESSION_SECRET},
+            json={
+                "filename": "Test_Formula.xlsx",
+                "sheets": [
+                    {
+                        "name": "بيانات المخزون",
+                        "rows": [
+                            {"كود الصنف": "SKU-TEST-1", "الحقن": "=CMD|'/C calc'!A0", "الرصيد": 100}
+                        ]
+                    }
+                ]
+            }
+        )
+        assert r_export.status_code == 200, f"Expected 200 for Excel export, got {r_export.status_code}"
+        assert len(r_export.content) > 1000, "Exported Excel file is too small"
+        
+        # Verify openpyxl read of exported bytes
+        test_wb = openpyxl.load_workbook(io.BytesIO(r_export.content))
+        assert "بيانات المخزون" in test_wb.sheetnames
+        test_ws = test_wb["بيانات المخزون"]
+        # Verify rightToLeft enabled for Arabic sheet
+        assert test_ws.views.sheetView[0].rightToLeft is True
+        # Verify cell value is sanitized with leading apostrophe
+        cell_val = test_ws.cell(row=2, column=2).value
+        assert str(cell_val).startswith("'="), f"Formula injection was not neutralized! Got: {cell_val}"
+        print("0h. Formula injection defense & RTL Excel export PASSED")
+
+    # --------------------------------------------------------------------------
+    # Authenticated Client for Full Functional Regression Suite
+    # --------------------------------------------------------------------------
+    async with httpx.AsyncClient(
+        transport=transport,
+        base_url='http://test',
+        headers={"X-NEXO-Session-Token": TEST_SESSION_SECRET}
+    ) as client:
         # 1. Health check & Dynamic Versioning
         r = await client.get('/api/health')
         assert r.status_code == 200, f'health failed: {r.text}'
@@ -129,10 +272,33 @@ async def run_tests():
         assert r_typed.status_code == 200 and r_typed.json()['success'] is True
         print('11. Typed Ingestion PASSED (Rows processed:', r_typed.json()['rows_processed'], ')')
 
-        # 12. Local DB Inspection
-        r_db = await client.post('/api/local-db/inspect', data={'file_path': TEST_DB_PATH})
+        # 12. Local DB Inspection & Hardening (SEC-CRIT-03)
+        # Direct server-side file_path is strictly rejected with 400
+        r_db_blocked = await client.post('/api/local-db/inspect', data={'file_path': TEST_DB_PATH})
+        assert r_db_blocked.status_code == 400, f"Expected 400 for direct file_path, got {r_db_blocked.status_code}"
+
+        # Uploaded file succeeds and discovers tables
+        with open(TEST_DB_PATH, "rb") as f:
+            duckdb_bytes = f.read()
+        r_db = await client.post(
+            '/api/local-db/inspect',
+            files={'file': ('workspace.duckdb', duckdb_bytes, 'application/octet-stream')}
+        )
         assert r_db.status_code == 200 and r_db.json()['success'] is True
-        print(f'12. Local DB Inspect PASSED ({len(r_db.json()["tables"])} tables detected)')
+        print(f'12a. Local DB Inspect PASSED ({len(r_db.json()["tables"])} tables detected, direct file_path blocked with 400)')
+
+        # Import with direct file_path only is blocked with 400
+        r_import_blocked = await client.post('/api/local-db/import', data={'file_path': TEST_DB_PATH, 'table_name': 'items'})
+        assert r_import_blocked.status_code == 400, f"Expected 400 for direct file_path import, got {r_import_blocked.status_code}"
+
+        # Import with malicious DDL in custom_query is blocked with 400
+        r_bad_import = await client.post(
+            '/api/local-db/import',
+            files={'file': ('workspace.duckdb', duckdb_bytes, 'application/octet-stream')},
+            data={'table_name': 'items', 'custom_query': 'DROP TABLE items; SELECT 1', 'project_id': pid}
+        )
+        assert r_bad_import.status_code == 400, f"Expected 400 for DDL custom_query, got {r_bad_import.status_code}"
+        print('12b. Local DB Import DDL and path defense PASSED')
 
         # 13. Ingestion Logs & Re-sync
         r_logs = await client.get(f'/api/projects/{pid}/ingestion-logs')

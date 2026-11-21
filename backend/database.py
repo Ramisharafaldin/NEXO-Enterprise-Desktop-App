@@ -2117,6 +2117,42 @@ def save_erp_connection(conn_dict: Dict[str, Any]) -> Dict[str, Any]:
     """Saves or updates an ERP or API connection profile."""
     conn_id = conn_dict.get("id") or f"conn_{uuid.uuid4().hex[:10]}"
     now_str = datetime.datetime.utcnow().isoformat()
+    raw_pass = conn_dict.get("password") or conn_dict.get("password_enc") or ""
+    enc_pass = ""
+    if raw_pass and raw_pass != "********":
+        try:
+            from backend.security_utils import encrypt_secret
+            enc_pass = encrypt_secret(raw_pass)
+        except Exception:
+            enc_pass = raw_pass
+    elif raw_pass == "********":
+        if conn_id:
+            con_check = get_connection()
+            try:
+                r_pass = con_check.execute("SELECT password_enc FROM erp_connections WHERE id = ?", (conn_id,)).fetchone()
+                if r_pass and r_pass[0]:
+                    enc_pass = r_pass[0]
+            finally:
+                con_check.close()
+
+    raw_auth = conn_dict.get("api_auth_header") or ""
+    enc_auth = ""
+    if raw_auth and raw_auth != "********":
+        try:
+            from backend.security_utils import encrypt_secret
+            enc_auth = encrypt_secret(raw_auth)
+        except Exception:
+            enc_auth = raw_auth
+    elif raw_auth == "********":
+        if conn_id:
+            con_check = get_connection()
+            try:
+                r_auth = con_check.execute("SELECT api_auth_header FROM erp_connections WHERE id = ?", (conn_id,)).fetchone()
+                if r_auth and r_auth[0]:
+                    enc_auth = r_auth[0]
+            finally:
+                con_check.close()
+
     with _LOCK:
         con = get_connection()
         try:
@@ -2132,6 +2168,7 @@ def save_erp_connection(conn_dict: Dict[str, Any]) -> Dict[str, Any]:
                         database_name = ?,
                         auth_mode = ?,
                         username = ?,
+                        password_enc = ?,
                         items_table = ?,
                         sales_table = ?,
                         inventory_table = ?,
@@ -2150,13 +2187,14 @@ def save_erp_connection(conn_dict: Dict[str, Any]) -> Dict[str, Any]:
                     conn_dict.get("database_name"),
                     conn_dict.get("auth_mode", "sql"),
                     conn_dict.get("username"),
+                    enc_pass,
                     conn_dict.get("items_table"),
                     conn_dict.get("sales_table"),
                     conn_dict.get("inventory_table"),
                     conn_dict.get("bom_table"),
                     conn_dict.get("custom_sql"),
                     conn_dict.get("api_url"),
-                    conn_dict.get("api_auth_header"),
+                    enc_auth,
                     now_str,
                     conn_dict.get("last_sync_status", "active"),
                     conn_id
@@ -2165,10 +2203,10 @@ def save_erp_connection(conn_dict: Dict[str, Any]) -> Dict[str, Any]:
                 con.execute("""
                     INSERT INTO erp_connections (
                         id, project_id, name, source_type, server_host, database_name,
-                        auth_mode, username, items_table, sales_table,
+                        auth_mode, username, password_enc, items_table, sales_table,
                         inventory_table, bom_table, custom_sql, api_url,
                         api_auth_header, last_sync_time, last_sync_status, created_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """, (
                     conn_id,
                     conn_dict.get("project_id"),
@@ -2178,25 +2216,28 @@ def save_erp_connection(conn_dict: Dict[str, Any]) -> Dict[str, Any]:
                     conn_dict.get("database_name"),
                     conn_dict.get("auth_mode", "sql"),
                     conn_dict.get("username"),
+                    enc_pass,
                     conn_dict.get("items_table"),
                     conn_dict.get("sales_table"),
                     conn_dict.get("inventory_table"),
                     conn_dict.get("bom_table"),
                     conn_dict.get("custom_sql"),
                     conn_dict.get("api_url"),
-                    conn_dict.get("api_auth_header"),
+                    enc_auth,
                     now_str,
                     conn_dict.get("last_sync_status", "active"),
                     now_str
                 ))
             conn_dict["id"] = conn_id
             conn_dict["last_sync_time"] = now_str
+            conn_dict["password_enc"] = enc_pass
+            conn_dict["api_auth_header"] = enc_auth
             return conn_dict
         finally:
             con.close()
 
-def get_erp_connections(project_id: Optional[str] = None) -> List[Dict[str, Any]]:
-    """Returns saved ERP/API connection profiles."""
+def get_erp_connections(project_id: Optional[str] = None, mask_sensitive: bool = True) -> List[Dict[str, Any]]:
+    """Returns saved ERP/API connection profiles with optional credential masking."""
     with _LOCK:
         con = get_connection()
         try:
@@ -2209,11 +2250,19 @@ def get_erp_connections(project_id: Optional[str] = None) -> List[Dict[str, Any]
                 """, (project_id,)).fetchdf()
             else:
                 df = con.execute("SELECT * FROM erp_connections ORDER BY last_sync_time DESC").fetchdf()
-            return df.fillna("").to_dict(orient="records")
+            records = df.fillna("").to_dict(orient="records")
+            if mask_sensitive:
+                from backend.security_utils import mask_secret
+                for r in records:
+                    if r.get("password_enc"):
+                        r["password_enc"] = mask_secret(r["password_enc"])
+                    if r.get("api_auth_header"):
+                        r["api_auth_header"] = mask_secret(r["api_auth_header"])
+            return records
         finally:
             con.close()
 
-def get_erp_connection(conn_id: str) -> Optional[Dict[str, Any]]:
+def get_erp_connection(conn_id: str, mask_sensitive: bool = False) -> Optional[Dict[str, Any]]:
     """Returns an ERP connection profile by id."""
     with _LOCK:
         con = get_connection()
@@ -2222,7 +2271,14 @@ def get_erp_connection(conn_id: str) -> Optional[Dict[str, Any]]:
             df = con.execute("SELECT * FROM erp_connections WHERE id = ?", (conn_id,)).fetchdf()
             if df.empty:
                 return None
-            return df.fillna("").iloc[0].to_dict()
+            rec = df.fillna("").iloc[0].to_dict()
+            if mask_sensitive:
+                from backend.security_utils import mask_secret
+                if rec.get("password_enc"):
+                    rec["password_enc"] = mask_secret(rec["password_enc"])
+                if rec.get("api_auth_header"):
+                    rec["api_auth_header"] = mask_secret(rec["api_auth_header"])
+            return rec
         finally:
             con.close()
 
