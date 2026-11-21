@@ -318,7 +318,7 @@ def main():
     api = DesktopApi()
 
     # 4. Create native Windows OS frame
-    url = f"http://127.0.0.1:{port}/"
+    url = f"http://127.0.0.1:{port}/?t={int(time.time())}"
     logger.info(f"Creating pywebview window pointing to: {url}")
     
     window = webview.create_window(

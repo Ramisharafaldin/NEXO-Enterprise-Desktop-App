@@ -39,7 +39,12 @@ def clean_opt_float(val: Any) -> Optional[float]:
         return None
 
 BASE_DIR = Path(__file__).resolve().parent
-DB_PATH = str(BASE_DIR / "nexo_workspace.duckdb")
+DEFAULT_DB_PATH = str(BASE_DIR / "nexo_workspace.duckdb")
+
+def get_db_path() -> str:
+    return os.environ.get("NEXO_DB_PATH", DEFAULT_DB_PATH)
+
+DB_PATH = get_db_path()
 _LOCK = threading.RLock()
 
 class DuckDBResilientConnection:
@@ -69,7 +74,7 @@ class DuckDBResilientConnection:
 
 def get_connection():
     """Returns a DuckDB connection to the local database file with memory cap and performance pragmas."""
-    con = duckdb.connect(DB_PATH)
+    con = duckdb.connect(get_db_path())
     try:
         con.execute("SET memory_limit='512MB';")
         con.execute("SET preserve_insertion_order=false;")
@@ -81,7 +86,7 @@ def flush_db():
     """Forces DuckDB WAL changes to be flushed immediately to disk via CHECKPOINT."""
     with _LOCK:
         try:
-            con = duckdb.connect(DB_PATH)
+            con = duckdb.connect(get_db_path())
             con.execute("CHECKPOINT;")
             con.close()
         except Exception:

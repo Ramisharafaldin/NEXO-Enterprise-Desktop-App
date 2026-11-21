@@ -1,10 +1,18 @@
 import os
 import sys
+import tempfile
+import shutil
+import platform
 
 # Ensure root repo directory is on sys.path
 repo_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if repo_dir not in sys.path:
     sys.path.insert(0, repo_dir)
+
+# Create isolated temporary DuckDB file so backend/nexo_workspace.duckdb is never touched or polluted
+TEST_TMP_DIR = tempfile.mkdtemp(prefix="nexo_test_")
+TEST_DB_PATH = os.path.join(TEST_TMP_DIR, "isolated_test_workspace.duckdb")
+os.environ["NEXO_DB_PATH"] = TEST_DB_PATH
 
 import asyncio
 import uuid
@@ -25,6 +33,7 @@ async def run_tests():
         assert health_json['status'] == 'online'
         assert 'version' in health_json, "Expected 'version' in health payload"
         assert 'current_version' in health_json, "Expected 'current_version' in health payload"
+        assert health_json.get('python_version') == platform.python_version(), f"Expected python_version {platform.python_version()}"
         v_file = Path(__file__).resolve().parent.parent / "VERSION"
         expected_v = v_file.read_text(encoding="utf-8").strip() if v_file.exists() else "0.1.0"
         assert health_json['current_version'] == f"v{expected_v}", f"Expected v{expected_v}, got {health_json['current_version']}"
@@ -73,7 +82,7 @@ async def run_tests():
         print('6. SQL Server test PASSED:', r.json()['message'])
 
         # 7. SQL import
-        r = await client.post('/api/sql/import', json={'server': 'localhost', 'database': 'ERP_DB', 'simulate_demo': True})
+        r = await client.post('/api/sql/import', json={'server': 'localhost', 'database': 'ERP_DB', 'simulate_demo': True, 'save_profile': True})
         assert r.status_code == 200, f'sql import failed: {r.text}'
         print('7. SQL Server import PASSED:', r.json()['message'])
 
@@ -121,7 +130,7 @@ async def run_tests():
         print('11. Typed Ingestion PASSED (Rows processed:', r_typed.json()['rows_processed'], ')')
 
         # 12. Local DB Inspection
-        r_db = await client.post('/api/local-db/inspect', data={'file_path': 'backend/nexo_workspace.duckdb'})
+        r_db = await client.post('/api/local-db/inspect', data={'file_path': TEST_DB_PATH})
         assert r_db.status_code == 200 and r_db.json()['success'] is True
         print(f'12. Local DB Inspect PASSED ({len(r_db.json()["tables"])} tables detected)')
 
@@ -683,4 +692,14 @@ SKU_RAGGED_3,طابعة ليزر "HP",مخزن الإسكندرية
         print('\n=== ALL 24 BACKEND & DATA HUB ENDPOINTS TESTED AND VERIFIED 100% OPERATIONAL! ===')
 
 if __name__ == '__main__':
-    asyncio.run(run_tests())
+    try:
+        asyncio.run(run_tests())
+    finally:
+        try:
+            close_db()
+        except Exception:
+            pass
+        try:
+            shutil.rmtree(TEST_TMP_DIR, ignore_errors=True)
+        except Exception:
+            pass

@@ -39,6 +39,7 @@ interface TopMenuBarProps {
   activeDataset: string;
   isServerConnected: boolean;
   appVersion?: string;
+  pythonVersion?: string;
 }
 
 export const TopMenuBar: React.FC<TopMenuBarProps> = ({
@@ -60,6 +61,7 @@ export const TopMenuBar: React.FC<TopMenuBarProps> = ({
   activeDataset,
   isServerConnected,
   appVersion,
+  pythonVersion,
 }) => {
   const t = translations[language];
   const isAr = language === 'ar';
@@ -432,7 +434,7 @@ export const TopMenuBar: React.FC<TopMenuBarProps> = ({
                 </div>
                 <div className="flex justify-between">
                   <span className="text-slate-500 font-medium">{isAr ? 'الخادم المدمج' : 'Backend Server'}:</span>
-                  <span className="font-semibold text-slate-800">FastAPI (Python 3.12)</span>
+                  <span className="font-semibold text-slate-800">FastAPI (Python {pythonVersion || '3.x'})</span>
                 </div>
                 <div className="flex justify-between">
                   <span className="text-slate-500 font-medium">{isAr ? 'المشروع النشط' : 'Active Dataset'}:</span>

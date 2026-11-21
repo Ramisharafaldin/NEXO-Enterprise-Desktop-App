@@ -426,6 +426,7 @@ export const api = {
     version?: string;
     current_version?: string;
     duckdb_version: string;
+    python_version?: string;
     sql_server_driver_available: boolean;
     installed_odbc_drivers: string[];
     excluded_dormant_count?: number;

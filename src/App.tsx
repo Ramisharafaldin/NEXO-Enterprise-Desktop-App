@@ -42,6 +42,7 @@ export const App: React.FC = () => {
   const [activeTab, setActiveTab] = useState<MainTabId>('start');
   const [settings, setSettings] = useState<AppSettings>(DEFAULT_APP_SETTINGS);
   const [appVersion, setAppVersion] = useState<string>('');
+  const [pythonVersion, setPythonVersion] = useState<string>('');
 
   // Projects & Active Dataset
   const [projects, setProjects] = useState<ProjectSummary[]>([]);
@@ -156,6 +157,9 @@ export const App: React.FC = () => {
           const v = health?.current_version || health?.version;
           if (v) {
             setAppVersion(v.startsWith('v') ? v : `v${v}`);
+          }
+          if (health?.python_version) {
+            setPythonVersion(health.python_version);
           }
         })
         .catch(err => {
@@ -609,6 +613,7 @@ export const App: React.FC = () => {
         activeDataset={activeDataset}
         isServerConnected={isServerConnected}
         appVersion={appVersion}
+        pythonVersion={pythonVersion}
       />
 
       {/* 2. Main Workspace Body with Slim Navigation Rail */}

@@ -7,6 +7,7 @@ Excel/CSV import/export, and live reactive inventory calculations.
 
 import os
 import sys
+import platform
 import subprocess
 
 # 1. Safe pythonw.exe stdout/stderr stream redirection
@@ -222,7 +223,7 @@ def health_check():
         "version": f"v{ver}",
         "current_version": f"v{ver}",
         "duckdb_version": duckdb.__version__,
-        "python_version": sys.version.split()[0],
+        "python_version": platform.python_version(),
         "installed_odbc_drivers": drivers,
         "sql_server_driver_available": any("SQL Server" in d for d in drivers),
         "excluded_dormant_count": dormant_cnt,
@@ -3248,7 +3249,14 @@ async def serve_spa_frontend(full_path: str):
     # Return index.html for all client-side SPA routes
     index_file = os.path.join(DIST_DIR, "index.html")
     if os.path.isfile(index_file):
-        return FileResponse(index_file)
+        return FileResponse(
+            index_file,
+            headers={
+                "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+                "Pragma": "no-cache",
+                "Expires": "0"
+            }
+        )
     
     return JSONResponse({
         "status": "online",
