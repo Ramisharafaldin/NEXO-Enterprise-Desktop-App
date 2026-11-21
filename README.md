@@ -1,7 +1,11 @@
-﻿# NEXO — Enterprise Demand & Supply Chain Planning
+# NEXO — Enterprise Demand & Supply Chain Planning
 [![Platform](https://img.shields.io/badge/Platform-Windows%20Desktop-0078D6?style=flat-square&logo=windows)]() [![Backend](https://img.shields.io/badge/Backend-FastAPI%20%2B%20DuckDB-009688?style=flat-square&logo=python)]() [![Frontend](https://img.shields.io/badge/Frontend-React%20%2B%20WebView2-2196F3?style=flat-square&logo=react)]() [![ERP](https://img.shields.io/badge/ERP-SQL%20Server%20ODBC-CC2927?style=flat-square)]()
 
 **NEXO** is a native Windows desktop enterprise planning platform engineered for statistical demand forecasting, dynamic inventory replenishment, and multi-source ERP data integration.
+
+<p align="center">
+  <img src="docs/images/nexo-workspace.png" alt="NEXO Enterprise Demand & Supply Chain Planning" width="100%" />
+</p>
 
 ---
 
