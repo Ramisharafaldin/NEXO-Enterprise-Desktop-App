@@ -1,7 +1,7 @@
 import React, { useMemo } from 'react';
 import { InventoryItem, AppSettings, isAnalyzableItem } from '../engine/types';
 import { translations, Language } from '../i18n/translations';
-import { formatCurrency, getCurrencySymbol } from '../utils/formatters';
+import { formatCurrency, getCurrencySymbol, formatItemCode } from '../utils/formatters';
 import { classifyAbcXyz } from '../engine/math';
 import { X, Grid, Info, CheckCircle2 } from 'lucide-react';
 
@@ -97,7 +97,7 @@ export const AbcXyzModal: React.FC<AbcXyzModalProps> = ({
                     {m.policy}
                   </div>
                   <div className="mt-2 text-[10px] text-slate-600 truncate">
-                    {matchedItems.map(i => i.code).join(', ') || '-'}
+                    {matchedItems.map(i => formatItemCode(i.code)).join(', ') || '-'}
                   </div>
                 </div>
               );
@@ -125,7 +125,7 @@ export const AbcXyzModal: React.FC<AbcXyzModalProps> = ({
                 <tbody>
                   {classifiedItems.map(item => (
                     <tr key={item.id} className="hover:bg-slate-50">
-                      <td className="text-left font-mono font-bold text-slate-800">{item.code}</td>
+                      <td className="text-left font-mono font-bold text-slate-800">{formatItemCode(item.code)}</td>
                       <td className="text-left text-slate-700 truncate max-w-xs">{item.description}</td>
                       <td className="text-center font-bold">
                         <span className={`px-1.5 py-0.5 rounded text-[10px] ${

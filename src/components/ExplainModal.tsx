@@ -2,7 +2,7 @@ import React from 'react';
 import { InventoryItem, AppSettings } from '../engine/types';
 import { explainInventoryCalculation } from '../engine/math';
 import { Language, translations } from '../i18n/translations';
-import { getCurrencySymbol } from '../utils/formatters';
+import { getCurrencySymbol, formatItemCode } from '../utils/formatters';
 import { X, HelpCircle, Calculator, Info, CheckCircle2 } from 'lucide-react';
 
 interface ExplainModalProps {
@@ -34,7 +34,7 @@ export const ExplainModal: React.FC<ExplainModalProps> = ({ item, onClose, setti
                 {explanation.title}
               </h3>
               <p className="text-[11px] text-slate-500 font-mono">
-                {item.code} — {item.description} ({item.location})
+                {formatItemCode(item.code)} — {item.description} ({item.location})
               </p>
             </div>
           </div>

@@ -1,7 +1,7 @@
 import React, { useState, useMemo } from 'react';
 import { InventoryItem, AppSettings, isAnalyzableItem } from '../engine/types';
 import { translations, Language } from '../i18n/translations';
-import { formatCurrency, getCurrencySymbol } from '../utils/formatters';
+import { formatCurrency, getCurrencySymbol, formatItemCode } from '../utils/formatters';
 import { 
   FileSpreadsheet, 
   Search, 
@@ -143,7 +143,7 @@ export const ReportsView: React.FC<ReportsViewProps> = ({
 
     if (reportType === 'replenishment') {
       exportData = filteredItems.map(i => ({
-        'Item Code': i.code,
+        'Item Code': formatItemCode(i.code),
         'Description': i.description,
         'Location': i.location,
         'Supplier': i.supplier,
@@ -161,7 +161,7 @@ export const ReportsView: React.FC<ReportsViewProps> = ({
         const projections = calculateProjectedStockArray(i);
         const minStock = projections.length > 0 ? Math.min(...projections) : i.onHand;
         const row: Record<string, any> = {
-          'Item Code': i.code,
+          'Item Code': formatItemCode(i.code),
           'Description': i.description,
           'Location': i.location,
           'On Hand': i.onHand,
@@ -174,7 +174,7 @@ export const ReportsView: React.FC<ReportsViewProps> = ({
       });
     } else if (reportType === 'accuracy') {
       exportData = filteredItems.map(i => ({
-        'Item Code': i.code,
+        'Item Code': formatItemCode(i.code),
         'Description': i.description,
         'Model Applied': i.fittedModelType || i.modelType,
         'WMAPE (%)': i.wmape?.toFixed(2),
@@ -183,7 +183,7 @@ export const ReportsView: React.FC<ReportsViewProps> = ({
       }));
     } else if (reportType === 'abc') {
       exportData = filteredItems.map(i => ({
-        'Item Code': i.code,
+        'Item Code': formatItemCode(i.code),
         'Description': i.description,
         'ABC Class': i.abcClass,
         'XYZ Class': i.xyzClass,
@@ -193,7 +193,7 @@ export const ReportsView: React.FC<ReportsViewProps> = ({
       }));
     } else if (reportType === 'drp') {
       exportData = filteredItems.map(i => ({
-        'Item Code': i.code,
+        'Item Code': formatItemCode(i.code),
         'Description': i.description,
         'Location': i.location,
         'DC Hub': i.dc ? 'Yes' : 'No',
@@ -205,7 +205,7 @@ export const ReportsView: React.FC<ReportsViewProps> = ({
       }));
     } else {
       exportData = filteredItems.map(i => ({
-        'Item Code': i.code,
+        'Item Code': formatItemCode(i.code),
         'Description': i.description,
         'BOM Type': i.bomType || 'Material',
         'On Hand': i.onHand,
@@ -461,7 +461,7 @@ export const ReportsView: React.FC<ReportsViewProps> = ({
                   className={`hover:bg-blue-50/50 ${idx % 2 === 1 ? 'bg-[#F8F9FA]' : 'bg-white'}`}
                 >
                   <td className="text-left font-mono font-bold text-slate-800 sticky left-0 bg-inherit border-r border-[#CBD5E1]">
-                    {item.code}
+                    {formatItemCode(item.code)}
                   </td>
                   <td className="text-left font-medium text-slate-800 truncate max-w-xs">
                     {item.description}

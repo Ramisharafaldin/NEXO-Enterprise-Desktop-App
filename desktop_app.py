@@ -33,6 +33,16 @@ if sys.platform == "win32":
         except Exception:
             pass
 
+# 1b. Native C-level crash dump handler (faulthandler)
+import faulthandler
+_logs_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "backend", "logs")
+try:
+    os.makedirs(_logs_dir, exist_ok=True)
+    _crash_log_file = open(os.path.join(_logs_dir, "crash_dump.log"), "a", encoding="utf-8")
+    faulthandler.enable(file=_crash_log_file)
+except Exception:
+    pass
+
 # 2. Global Windows subprocess.Popen CREATE_NO_WINDOW monkey-patch
 if sys.platform == "win32" and not getattr(subprocess, "_nexo_silent_patched", False):
     _orig_popen = subprocess.Popen

@@ -1,6 +1,7 @@
 import React, { useState } from 'react';
 import { InventoryItem, isAnalyzableItem } from '../engine/types';
 import { translations, Language } from '../i18n/translations';
+import { formatItemCode } from '../utils/formatters';
 import { api } from '../api/client';
 import { X, Box, CheckCircle2, AlertTriangle, Truck } from 'lucide-react';
 
@@ -198,7 +199,7 @@ export const ContainersModal: React.FC<ContainersModalProps> = ({
 
                       return (
                         <tr key={item.id} className="hover:bg-slate-50">
-                          <td className="text-left font-mono font-bold text-slate-800">{item.code}</td>
+                          <td className="text-left font-mono font-bold text-slate-800">{formatItemCode(item.code)}</td>
                           <td className="text-left text-slate-700 truncate max-w-xs">{item.description}</td>
                           <td className="font-mono font-bold text-amber-800 bg-amber-50/40">{item.orderNow}</td>
                           <td className="text-center">

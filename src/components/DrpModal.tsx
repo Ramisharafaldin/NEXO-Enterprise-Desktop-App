@@ -1,6 +1,7 @@
 import React, { useMemo } from 'react';
 import { InventoryItem, isAnalyzableItem } from '../engine/types';
 import { translations, Language } from '../i18n/translations';
+import { formatItemCode } from '../utils/formatters';
 import { X, Network, ArrowRightLeft, Building2, Store, CheckCircle2 } from 'lucide-react';
 
 interface DrpModalProps {
@@ -168,7 +169,7 @@ export const DrpModal: React.FC<DrpModalProps> = ({
                   {transferRecommendations.length > 0 ? (
                     transferRecommendations.map(rec => (
                       <tr key={rec.id} className="hover:bg-purple-50/40">
-                        <td className="text-left font-mono font-bold text-slate-800">{rec.code}</td>
+                        <td className="text-left font-mono font-bold text-slate-800">{formatItemCode(rec.code)}</td>
                         <td className="text-left font-medium text-slate-800 truncate max-w-xs">{rec.description}</td>
                         <td className="text-left text-slate-600">{rec.source}</td>
                         <td className="text-left font-semibold text-purple-900">{rec.destination}</td>
@@ -220,7 +221,7 @@ export const DrpModal: React.FC<DrpModalProps> = ({
                 <tbody>
                   {(regionalStoreItems.length > 0 ? regionalStoreItems : items).map(item => (
                     <tr key={item.id} className="hover:bg-slate-50">
-                      <td className="text-left font-mono font-bold text-slate-800">{item.code}</td>
+                      <td className="text-left font-mono font-bold text-slate-800">{formatItemCode(item.code)}</td>
                       <td className="text-left text-slate-600">{item.location}</td>
                       <td className="font-mono">{item.onHand.toLocaleString()}</td>
                       <td className="font-mono">{item.safetyStock.toLocaleString()}</td>

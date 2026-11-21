@@ -1,7 +1,7 @@
 import React, { useState, useRef, useEffect, useMemo, useCallback } from 'react';
 import { InventoryItem, ReplenishmentStrategy, AppSettings, isAnalyzableItem } from '../engine/types';
 import { translations, Language } from '../i18n/translations';
-import { formatCurrency, getCurrencySymbol } from '../utils/formatters';
+import { formatCurrency, getCurrencySymbol, formatItemCode } from '../utils/formatters';
 import { 
   Search, 
   Settings, 
@@ -358,7 +358,7 @@ export const InventoryView: React.FC<InventoryViewProps> = ({
 
   const handleExportTable = async () => {
     const data = filteredItems.map(i => ({
-      'Item Code': i.code,
+      'Item Code': formatItemCode(i.code),
       'Description': i.description,
       'Category': i.category,
       'Location': i.location,
@@ -712,7 +712,7 @@ export const InventoryView: React.FC<InventoryViewProps> = ({
                 >
                   {visibleCols.code && (
                     <td className="text-left font-mono font-bold text-slate-800 sticky left-0 bg-inherit z-10 border-r border-[#CBD5E1]">
-                      {item.code}
+                      {formatItemCode(item.code)}
                     </td>
                   )}
                   {visibleCols.desc && (

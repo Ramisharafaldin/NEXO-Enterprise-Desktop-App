@@ -27,7 +27,7 @@ os.environ["NEXO_SESSION_SECRET"] = TEST_SESSION_SECRET
 os.environ["NEXO_BOOTSTRAP_NONCE"] = TEST_BOOTSTRAP_NONCE
 
 import httpx
-from backend.server import app, sanitize_excel_cell
+from backend.server import app, sanitize_excel_cell, stream_upload_to_file, MAX_CSV_UPLOAD_SIZE, MAX_OTHER_UPLOAD_SIZE, MIN_DISK_HEADROOM
 from backend.database import init_db, close_db, get_connection, save_erp_connection
 from backend.security_utils import encrypt_secret, decrypt_secret, mask_secret
 
@@ -187,8 +187,61 @@ async def run_security_suite():
         assert "frame-ancestors 'none'" in csp, f"Assertion 10 Failed: frame-ancestors missing in CSP: {csp}"
         print("[PASS] 10. Security headers (X-Content-Type-Options, X-Frame-Options, CSP, Referrer-Policy) verified")
 
+        # 11. Smart file-type upload limits & disk headroom DoS defense (SEC-MED-05)
+        from io import BytesIO
+        from starlette.datastructures import UploadFile as StarletteUploadFile
+        from fastapi import HTTPException
+
+        assert MAX_CSV_UPLOAD_SIZE == 2048 * 1024 * 1024
+        assert MAX_OTHER_UPLOAD_SIZE == 300 * 1024 * 1024
+        assert MIN_DISK_HEADROOM == 500 * 1024 * 1024
+
+        # Test CSV limit enforcement with simulated threshold
+        os.environ["NEXO_MAX_CSV_MB"] = "1"
+        try:
+            large_csv_stream = BytesIO(b"x" * (2 * 1024 * 1024))
+            mock_csv = StarletteUploadFile(file=large_csv_stream, filename="stress.csv")
+            try:
+                stream_upload_to_file(mock_csv)
+                assert False, "Assertion 11 Failed: CSV file exceeding limit did not raise 413"
+            except HTTPException as e:
+                assert e.status_code == 413
+                assert "1 MB for CSV" in e.detail, f"Expected active limit in detail, got: {e.detail}"
+        finally:
+            os.environ.pop("NEXO_MAX_CSV_MB", None)
+
+        # Test Excel limit enforcement with simulated threshold
+        os.environ["NEXO_MAX_EXCEL_MB"] = "1"
+        try:
+            large_excel_stream = BytesIO(b"x" * (2 * 1024 * 1024))
+            mock_excel = StarletteUploadFile(file=large_excel_stream, filename="stress.xlsx")
+            try:
+                stream_upload_to_file(mock_excel)
+                assert False, "Assertion 11 Failed: Excel file exceeding limit did not raise 413"
+            except HTTPException as e:
+                assert e.status_code == 413
+                assert "1 MB for Excel" in e.detail, f"Expected active limit in detail, got: {e.detail}"
+        finally:
+            os.environ.pop("NEXO_MAX_EXCEL_MB", None)
+
+        # Test disk headroom defense (507 Insufficient Storage)
+        os.environ["NEXO_MIN_DISK_HEADROOM_MB"] = "999999999"
+        try:
+            tiny_stream = BytesIO(b"code,desc\n1,test\n")
+            mock_file = StarletteUploadFile(file=tiny_stream, filename="small.csv")
+            try:
+                stream_upload_to_file(mock_file)
+                assert False, "Assertion 11 Failed: Lack of disk headroom did not raise 507"
+            except HTTPException as e:
+                assert e.status_code == 507
+                assert "Insufficient disk space" in e.detail
+        finally:
+            os.environ.pop("NEXO_MIN_DISK_HEADROOM_MB", None)
+
+        print("[PASS] 11. Smart upload caps (2GB CSV, 300MB Excel) and disk headroom DoS defense (413/507) verified")
+
     print("\n===============================================================================")
-    print("        ALL 10 CYBERSECURITY ASSERTIONS VERIFIED AND 100% PASSING!             ")
+    print("        ALL 11 CYBERSECURITY ASSERTIONS VERIFIED AND 100% PASSING!             ")
     print("===============================================================================")
 
 if __name__ == "__main__":

@@ -26,7 +26,7 @@ import time
 from pathlib import Path
 import httpx
 from backend.server import app
-from backend.database import init_db, get_connection, close_db
+from backend.database import init_db, get_connection, close_db, clean_item_code, cleanup_trailing_decimal_codes
 
 async def run_tests():
     init_db()
@@ -855,7 +855,264 @@ SKU_RAGGED_3,طابعة ليزر "HP",مخزن الإسكندرية
 
         print(f'24. Strict Project Isolation & Zero Demo-Data Contamination Test PASSED')
 
-        print('\n=== ALL 24 BACKEND & DATA HUB ENDPOINTS TESTED AND VERIFIED 100% OPERATIONAL! ===')
+        # Test 25: Trailing .0 Decimal Artifact Ingestion Normalization & Startup DuckDB Cleanup
+        # a. Unit assertions on clean_item_code
+        assert clean_item_code("10006.0") == "10006"
+        assert clean_item_code(1.0) == "1"
+        assert clean_item_code("1.000") == "1"
+        assert clean_item_code("10006.5") == "10006.5"
+        assert clean_item_code("SKU-01.0") == "SKU-01.0"
+        assert clean_item_code("A1.0") == "A1.0"
+        assert clean_item_code(10006) == "10006"
+        assert clean_item_code(None) == ""
+        assert clean_item_code("") == ""
+
+        # b. Bulk insert with float code strings normalizes
+        r_bulk = await client.post(f'/api/projects/{pid}/items/bulk', json={
+            'items': [
+                {'code': '5001.0', 'description': 'Item 5001', 'on_hand': 10.0, 'purchase_price': 20.0},
+                {'code': 'SKU-FLOAT-01.0', 'description': 'Alphanumeric Code', 'on_hand': 5.0, 'purchase_price': 15.0}
+            ]
+        })
+        assert r_bulk.status_code == 200
+        con_check = get_connection()
+        try:
+            row_5001 = con_check.execute("SELECT code FROM items WHERE project_id = ? AND code = '5001'", (pid,)).fetchone()
+            assert row_5001 is not None, "Item '5001.0' should be normalized to '5001' in DuckDB"
+            row_alpha = con_check.execute("SELECT code FROM items WHERE project_id = ? AND code = 'SKU-FLOAT-01.0'", (pid,)).fetchone()
+            assert row_alpha is not None, "Alphanumeric code 'SKU-FLOAT-01.0' should be preserved intact"
+        finally:
+            con_check.close()
+
+        # c. Ingestion of CSV with trailing .0 normalizes
+        csv_content = "code,description,on_hand,price\n7001.0,Item 7001,50,100\n7002,Item 7002,25,50\n"
+        files = {'file': ('test_decimal_skus.csv', csv_content.encode('utf-8'), 'text/csv')}
+        r_csv = await client.post('/api/files/import-typed', data={'project_id': pid, 'import_type': 'inventory', 'merge_mode': 'merge'}, files=files)
+        assert r_csv.status_code == 200
+        con_check = get_connection()
+        try:
+            row_7001 = con_check.execute("SELECT code FROM items WHERE project_id = ? AND code = '7001'", (pid,)).fetchone()
+            assert row_7001 is not None, "CSV SKU '7001.0' should be normalized to '7001' during ingestion"
+        finally:
+            con_check.close()
+
+        # d. Startup cleanup routine
+        con_dirty = get_connection()
+        try:
+            con_dirty.execute("INSERT INTO items (id, project_id, code, description) VALUES ('dirty_1', ?, '8888.0', 'Item 8888.0')", (pid,))
+            con_dirty.execute("INSERT INTO project_items (project_id, code, location) VALUES (?, '8888.0', 'LocA')", (pid,))
+            con_dirty.execute("INSERT INTO daily_sales (id, project_id, item_code, location, sale_date) VALUES ('ds_dirty_1', ?, '8888.0', 'LocA', '2026-01-01')", (pid,))
+        finally:
+            con_dirty.close()
+
+        cleanup_trailing_decimal_codes()
+
+        con_clean = get_connection()
+        try:
+            cleaned_row = con_clean.execute("SELECT code, description FROM items WHERE id = 'dirty_1'").fetchone()
+            assert cleaned_row[0] == '8888', f"Expected '8888', got {cleaned_row[0]}"
+            assert cleaned_row[1] == 'Item 8888', f"Expected 'Item 8888', got {cleaned_row[1]}"
+            pi_cleaned = con_clean.execute("SELECT code FROM project_items WHERE project_id = ? AND code = '8888'", (pid,)).fetchone()
+            assert pi_cleaned is not None, "project_items code should be cleaned to '8888'"
+            ds_cleaned = con_clean.execute("SELECT item_code FROM daily_sales WHERE id = 'ds_dirty_1'").fetchone()
+            assert ds_cleaned[0] == '8888', f"daily_sales item_code should be cleaned to '8888', got {ds_cleaned[0]}"
+            # Cleanup test artifacts
+            con_clean.execute("DELETE FROM items WHERE project_id = ? AND code IN ('5001', 'SKU-FLOAT-01.0', '7001', '7002', '8888')", (pid,))
+            con_clean.execute("DELETE FROM project_items WHERE project_id = ? AND code IN ('8888')", (pid,))
+            con_clean.execute("DELETE FROM daily_sales WHERE id = 'ds_dirty_1'")
+        finally:
+            con_clean.close()
+
+        print(f'25. Trailing .0 Decimal Artifact Ingestion Normalization & Startup DuckDB Cleanup PASSED')
+
+        # 26. 500,000-Row Timestamped CSV Direct Streaming Ingestion & Concurrent API Reads Stress Test
+        stress_csv_path = os.path.join(TEST_TMP_DIR, "stress_500k.csv")
+        with open(stress_csv_path, "w", encoding="utf-8") as f:
+            f.write("CODE,BRANCH,SALE_DATE,QTY_SOLD,REVENUE\n")
+            for i in range(500000):
+                sku = f"{20000 + (i % 500)}.0"
+                branch = f"Store_{(i % 5) + 1}"
+                day = (i % 28) + 1
+                f.write(f"{sku},{branch},2026-07-{day:02d} 00:13:00.019000,2.0,100.0\n")
+
+        keep_reading = True
+        read_count = 0
+
+        async def concurrent_reader():
+            nonlocal read_count
+            while keep_reading:
+                r1 = await client.get("/api/projects")
+                assert r1.status_code == 200
+                r2 = await client.get("/api/health")
+                assert r2.status_code == 200
+                r3 = await client.get("/api/settings")
+                assert r3.status_code == 200
+                read_count += 3
+                await asyncio.sleep(0.05)
+
+        reader_task = asyncio.create_task(concurrent_reader())
+
+        t_s0 = time.perf_counter()
+        with open(stress_csv_path, "rb") as cf:
+            r_stress = await client.post(
+                "/api/files/import-typed",
+                files={"file": ("stress_500k.csv", cf, "text/csv")},
+                data={"import_type": "sales", "project_id": pid, "merge_mode": "merge"}
+            )
+        stress_elapsed = time.perf_counter() - t_s0
+
+        keep_reading = False
+        await reader_task
+
+        assert r_stress.status_code == 200, f"Stress ingest failed: {r_stress.text}"
+        stress_json = r_stress.json()
+        assert stress_json["success"] is True
+        assert stress_json["rows_processed"] == 500000, f"Expected 500,000 rows, got {stress_json['rows_processed']}"
+
+        con_stress = get_connection()
+        try:
+            p_stress = con_stress.execute("""
+                SELECT COUNT(DISTINCT i.code), SUM(p.actual), SUM(p.revenue)
+                FROM periods p
+                JOIN items i ON p.item_id = i.id
+                WHERE p.project_id = ? AND p.date = '2026-07' AND i.code LIKE '20%'
+            """, (pid,)).fetchone()
+            assert p_stress[0] == 500, f"Expected 500 distinct SKUs, got {p_stress[0]}"
+            assert abs(p_stress[1] - 1000000.0) < 1e-4, f"Expected 1,000,000 total qty, got {p_stress[1]}"
+            assert abs(p_stress[2] - 50000000.0) < 1e-4, f"Expected 50,000,000 total rev, got {p_stress[2]}"
+
+            # Verify .0 codes were stripped during ingestion
+            dirty_cnt = con_stress.execute("SELECT COUNT(*) FROM items WHERE project_id = ? AND regexp_matches(code, '^[0-9]+\\.0+$')", (pid,)).fetchone()[0]
+            assert dirty_cnt == 0, f"Expected 0 codes with trailing .0, got {dirty_cnt}"
+
+            # Clean up test artifacts
+            con_stress.execute("DELETE FROM periods WHERE project_id = ? AND date = '2026-07'", (pid,))
+            con_stress.execute("DELETE FROM items WHERE project_id = ? AND code LIKE '20%'", (pid,))
+            con_stress.execute("DELETE FROM daily_sales WHERE project_id = ? AND item_code LIKE '20%'", (pid,))
+        finally:
+            con_stress.close()
+
+        if os.path.exists(stress_csv_path):
+            try:
+                os.remove(stress_csv_path)
+            except Exception:
+                pass
+
+        print(f"26. 500,000-Row Timestamped CSV Direct Streaming Ingestion & Concurrent API Reads PASSED (Processed in {stress_elapsed:.2f}s, Throughput: {500000/stress_elapsed:,.0f} rows/s, Concurrent Reads: {read_count})")
+
+        # 27. Real UTF-8-BOM (utf-8-sig) Arabic CSV Preview & Streaming Ingestion Persistence Test
+        arabic_csv_text = "\ufeffكود الصنف,الفرع / المخزن,تاريخ البيع,الكمية المباعة,قيمة المبيعات\nSKU-AR-01,السلام,2026-01-16 00:00:00,10.0,500.0\n"
+        arabic_csv_bytes = arabic_csv_text.encode("utf-8")
+        assert arabic_csv_bytes.startswith(b"\xef\xbb\xbf"), "Test payload must start with UTF-8 BOM"
+
+        # Step A: File Inspection Preview Endpoint Verification
+        r_insp = await client.post(
+            "/api/files/inspect",
+            files={"file": ("arabic_sales.csv", arabic_csv_bytes, "text/csv")}
+        )
+        assert r_insp.status_code == 200, f"Inspect failed: {r_insp.text}"
+        insp_json = r_insp.json()
+        cols = insp_json.get("columns", [])
+        assert "كود الصنف" in cols, f"Expected 'كود الصنف' in columns, got {cols}"
+        assert "الفرع / المخزن" in cols, f"Expected 'الفرع / المخزن' in columns, got {cols}"
+        assert "تاريخ البيع" in cols, f"Expected 'تاريخ البيع' in columns, got {cols}"
+        assert "الكمية المباعة" in cols, f"Expected 'الكمية المباعة' in columns, got {cols}"
+        assert "قيمة المبيعات" in cols, f"Expected 'قيمة المبيعات' in columns, got {cols}"
+
+        # Assert no BOM or Mojibake in column names
+        for c in cols:
+            assert not c.startswith("\ufeff"), f"Column '{c}' contains unstripped BOM"
+            assert "ï" not in c and "ظ" not in c, f"Mojibake detected in column name: '{c}'"
+
+        preview_rows = insp_json.get("preview_rows", [])
+        assert len(preview_rows) >= 1, "Preview rows should not be empty"
+        assert preview_rows[0].get("كود الصنف") == "SKU-AR-01"
+        assert preview_rows[0].get("الفرع / المخزن") == "السلام"
+
+        sugg = insp_json.get("suggested_mappings", {})
+        assert sugg.get("code") == "كود الصنف"
+        assert sugg.get("location") == "الفرع / المخزن"
+        assert sugg.get("period") == "تاريخ البيع"
+        assert sugg.get("qty_sold") == "الكمية المباعة"
+        assert sugg.get("revenue") == "قيمة المبيعات"
+
+        # Step B: Silent 0-Row Prevention (Missing required sales columns should return HTTP 400)
+        r_bad = await client.post(
+            "/api/files/import-typed",
+            files={"file": ("bad_sales.csv", b"col_a,col_b\nval1,val2\n", "text/csv")},
+            data={"import_type": "sales", "project_id": pid, "merge_mode": "merge"}
+        )
+        assert r_bad.status_code == 400, f"Expected 400 for missing required columns, got {r_bad.status_code}"
+        assert "Missing required sales columns" in r_bad.json().get("detail", "")
+
+        # Step C: Ingest Arabic CSV with UTF-8 BOM
+        r_ingest = await client.post(
+            "/api/files/import-typed",
+            files={"file": ("arabic_sales.csv", arabic_csv_bytes, "text/csv")},
+            data={"import_type": "sales", "project_id": pid, "merge_mode": "merge"}
+        )
+        assert r_ingest.status_code == 200, f"Import failed: {r_ingest.text}"
+        ingest_json = r_ingest.json()
+        assert ingest_json["success"] is True
+        assert ingest_json["rows_processed"] == 1
+        assert ingest_json.get("periods_saved", 0) >= 1
+        assert ingest_json.get("items_affected", 0) >= 1
+        assert ingest_json.get("warning") is None
+
+        # Step D: Verify immediate appearance in Demand & Items API endpoints
+        r_demand = await client.get(f"/api/demand?project_id={pid}&search=SKU-AR-01")
+        assert r_demand.status_code == 200
+        dem_items = r_demand.json().get("items", [])
+        assert len(dem_items) == 1, f"Expected 1 item in demand search, got {len(dem_items)}"
+        ar_item = dem_items[0]
+        assert ar_item["code"] == "SKU-AR-01"
+        assert ar_item["location"] == "السلام", f"Expected location 'السلام', got '{ar_item.get('location')}'"
+        assert len(ar_item.get("periods", [])) >= 1
+        assert any(p.get("date") == "2026-01" and p.get("actual") == 10.0 for p in ar_item["periods"]), f"Expected 10.0 actual in 2026-01, got {ar_item['periods']}"
+
+        r_items_api = await client.get(f"/api/projects/{pid}/items")
+        assert r_items_api.status_code == 200
+        proj_items = r_items_api.json().get("items", [])
+        item_in_proj = next((it for it in proj_items if it["code"] == "SKU-AR-01"), None)
+        assert item_in_proj is not None, "SKU-AR-01 must be present in /api/projects/{pid}/items"
+        assert item_in_proj["location"] == "السلام"
+
+        # Direct DuckDB query assertions
+        con_check = get_connection()
+        try:
+            db_row = con_check.execute("""
+                SELECT p.actual, p.revenue, i.location
+                FROM periods p
+                JOIN items i ON p.item_id = i.id
+                WHERE p.project_id = ? AND i.code = 'SKU-AR-01' AND p.date = '2026-01'
+            """, (pid,)).fetchone()
+            assert db_row is not None, "Periods row for SKU-AR-01 in 2026-01 not found"
+            assert abs(db_row[0] - 10.0) < 1e-4, f"Expected 10.0 actual, got {db_row[0]}"
+            assert abs(db_row[1] - 500.0) < 1e-4, f"Expected 500.0 revenue, got {db_row[1]}"
+            assert db_row[2] == "السلام", f"Expected location 'السلام', got {db_row[2]}"
+
+            ds_row = con_check.execute("""
+                SELECT item_code, location, sale_date, qty_sold, revenue
+                FROM daily_sales
+                WHERE project_id = ? AND item_code = 'SKU-AR-01'
+            """, (pid,)).fetchone()
+            assert ds_row is not None, "daily_sales row for SKU-AR-01 not found"
+            assert ds_row[1] == "السلام"
+            assert ds_row[2] == "2026-01-16"
+            assert abs(ds_row[3] - 10.0) < 1e-4
+
+            # Cleanup test artifacts
+            con_check.execute("DELETE FROM periods WHERE project_id = ? AND item_id IN (SELECT id FROM items WHERE project_id = ? AND code = 'SKU-AR-01')", (pid, pid))
+            con_check.execute("DELETE FROM items WHERE project_id = ? AND code = 'SKU-AR-01'", (pid,))
+            con_check.execute("DELETE FROM project_items WHERE project_id = ? AND code = 'SKU-AR-01'", (pid,))
+            con_check.execute("DELETE FROM project_periods WHERE project_id = ? AND code = 'SKU-AR-01'", (pid,))
+            con_check.execute("DELETE FROM daily_sales WHERE project_id = ? AND item_code = 'SKU-AR-01'", (pid,))
+        finally:
+            con_check.close()
+
+        print(f"27. Real UTF-8-BOM (utf-8-sig) Arabic CSV Preview & Streaming Ingestion Persistence PASSED")
+
+        print('\n=== ALL 27 BACKEND & DATA HUB ENDPOINTS TESTED AND VERIFIED 100% OPERATIONAL! ===')
 
 if __name__ == '__main__':
     try:

@@ -144,4 +144,17 @@ export function formatUnits(val: number | undefined | null): string {
   return (val ?? 0).toLocaleString();
 }
 
+/**
+ * Strips accidental trailing .0 or .00 decimal artifacts from SKU codes
+ * resulting from float/double type coercion in spreadsheets or DuckDB,
+ * while keeping alphanumeric or non-zero decimal codes intact.
+ * e.g., '10006.0' -> '10006', 1.0 -> '1', '10006.5' -> '10006.5', 'SKU-01.0' -> 'SKU-01.0'
+ */
+export function formatItemCode(code: string | number | undefined | null): string {
+  if (code == null) return '';
+  const s = String(code).trim();
+  if (!s || s.toLowerCase() === 'nan' || s.toLowerCase() === 'null') return '';
+  return s.replace(/^(\d+)\.0+$/, '$1');
+}
+
 export { calculateZScore };

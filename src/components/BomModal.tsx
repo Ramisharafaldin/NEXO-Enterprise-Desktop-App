@@ -1,6 +1,7 @@
 import React, { useState, useMemo } from 'react';
 import { InventoryItem } from '../engine/types';
 import { translations, Language } from '../i18n/translations';
+import { formatItemCode } from '../utils/formatters';
 import { X, Layers, AlertCircle, CheckCircle2, ChevronRight, Cog, ArrowRight } from 'lucide-react';
 
 interface BomModalProps {
@@ -114,7 +115,7 @@ export const BomModal: React.FC<BomModalProps> = ({
                 >
                   {items.map(i => (
                     <option key={i.id} value={i.id}>
-                      {i.code} — {i.description}
+                      {formatItemCode(i.code)} — {i.description}
                     </option>
                   ))}
                 </select>
@@ -166,7 +167,7 @@ export const BomModal: React.FC<BomModalProps> = ({
                   {components.length > 0 ? (
                     components.map(({ item: mat, qtyPerParent, grossReq, netShortage, componentOrder }) => (
                       <tr key={mat.id} className="hover:bg-blue-50/30">
-                        <td className="text-left font-mono font-bold text-slate-800">{mat.code}</td>
+                        <td className="text-left font-mono font-bold text-slate-800">{formatItemCode(mat.code)}</td>
                         <td className="text-left text-slate-700 truncate max-w-xs">{mat.description}</td>
                         <td className="text-center font-mono font-bold text-[#2196F3]">{qtyPerParent}.0x</td>
                         <td className="font-mono">{mat.onHand.toLocaleString()}</td>

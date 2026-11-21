@@ -1,7 +1,7 @@
 import React, { useState, useMemo, useRef, useEffect, useCallback } from 'react';
 import { InventoryItem, ModelType, ReplenishmentStrategy, AppSettings, isAnalyzableItem } from '../engine/types';
 import { translations, Language } from '../i18n/translations';
-import { getCurrencySymbol } from '../utils/formatters';
+import { formatItemCode } from '../utils/formatters';
 import { api } from '../api/client';
 import { 
   ResponsiveContainer, 
@@ -221,6 +221,140 @@ export const DemandView: React.FC<DemandViewProps> = ({
     confLower: visibleRows.lowerConf && p.confLower ? Math.round(p.confLower * multiplier) : undefined,
   }));
 
+  // Identify valid Actual Sales data points for dynamic trend gradient
+  const validActualPoints = useMemo(() => {
+    const points: { idx: number; val: number; date: string }[] = [];
+    chartData.forEach((d, idx) => {
+      if (typeof d.actual === 'number' && !isNaN(d.actual)) {
+        points.push({ idx, val: d.actual, date: d.date });
+      }
+    });
+    return points;
+  }, [chartData]);
+
+  // Map trend directions and colors for dots and line vertices
+  const actualTrendsMap = useMemo(() => {
+    const map = new Map<string, { color: string; trend: 'up' | 'down' | 'flat' | 'first' }>();
+    for (let i = 0; i < validActualPoints.length; i++) {
+      const pt = validActualPoints[i];
+      if (i === 0) {
+        map.set(pt.date, { color: '#64748b', trend: 'first' });
+      } else {
+        const prev = validActualPoints[i - 1];
+        if (pt.val > prev.val) {
+          map.set(pt.date, { color: '#16a34a', trend: 'up' });
+        } else if (pt.val < prev.val) {
+          map.set(pt.date, { color: '#dc2626', trend: 'down' });
+        } else {
+          map.set(pt.date, { color: '#64748b', trend: 'flat' });
+        }
+      }
+    }
+    return map;
+  }, [validActualPoints]);
+
+  // Dynamic SVG linearGradient stops for crisp linear trend segments
+  const actualTrendGradientStops = useMemo(() => {
+    if (validActualPoints.length < 2) {
+      return [
+        <stop key="fallback-0" offset="0%" stopColor="#64748b" />,
+        <stop key="fallback-1" offset="100%" stopColor="#64748b" />
+      ];
+    }
+
+    const firstIdx = validActualPoints[0].idx;
+    const lastIdx = validActualPoints[validActualPoints.length - 1].idx;
+    const span = lastIdx - firstIdx;
+
+    if (span <= 0) {
+      return [
+        <stop key="fallback-0" offset="0%" stopColor="#64748b" />,
+        <stop key="fallback-1" offset="100%" stopColor="#64748b" />
+      ];
+    }
+
+    const stops: React.ReactNode[] = [];
+    for (let i = 0; i < validActualPoints.length - 1; i++) {
+      const curr = validActualPoints[i];
+      const next = validActualPoints[i + 1];
+
+      const offsetStart = ((curr.idx - firstIdx) / span) * 100;
+      const offsetEnd = ((next.idx - firstIdx) / span) * 100;
+
+      const segmentColor = 
+        next.val > curr.val ? '#16a34a' :
+        next.val < curr.val ? '#dc2626' : '#64748b';
+
+      stops.push(
+        <stop
+          key={`trend-stop-${i}-start`}
+          offset={`${offsetStart.toFixed(3)}%`}
+          stopColor={segmentColor}
+        />
+      );
+      stops.push(
+        <stop
+          key={`trend-stop-${i}-end`}
+          offset={`${offsetEnd.toFixed(3)}%`}
+          stopColor={segmentColor}
+        />
+      );
+    }
+
+    return stops;
+  }, [validActualPoints]);
+
+  // Custom renderers for data dots colored by trend direction
+  const renderActualDot = useCallback((props: any) => {
+    const { cx, cy, payload } = props || {};
+    if (cx == null || cy == null || isNaN(cx) || isNaN(cy) || payload?.actual == null) {
+      return null;
+    }
+    const trendInfo = actualTrendsMap.get(payload.date);
+    const dotColor = trendInfo?.color || '#64748b';
+
+    return (
+      <circle
+        key={`actual-dot-${payload.date}`}
+        cx={cx}
+        cy={cy}
+        r={3.5}
+        fill={dotColor}
+        stroke="#ffffff"
+        strokeWidth={1.5}
+      />
+    );
+  }, [actualTrendsMap]);
+
+  const renderActualActiveDot = useCallback((props: any) => {
+    const { cx, cy, payload } = props || {};
+    if (cx == null || cy == null || isNaN(cx) || isNaN(cy) || payload?.actual == null) {
+      return null;
+    }
+    const trendInfo = actualTrendsMap.get(payload.date);
+    const dotColor = trendInfo?.color || '#64748b';
+
+    return (
+      <g key={`actual-activedot-${payload.date}`}>
+        <circle
+          cx={cx}
+          cy={cy}
+          r={6.5}
+          fill={dotColor}
+          fillOpacity={0.25}
+        />
+        <circle
+          cx={cx}
+          cy={cy}
+          r={4.5}
+          fill={dotColor}
+          stroke="#ffffff"
+          strokeWidth={2}
+        />
+      </g>
+    );
+  }, [actualTrendsMap]);
+
   const handleStartEdit = (date: string, currentVal?: number) => {
     setEditingPeriod(date);
     setTempOverride(currentVal !== undefined ? currentVal.toString() : '');
@@ -339,7 +473,7 @@ export const DemandView: React.FC<DemandViewProps> = ({
                           <span className={`w-1.5 h-1.5 rounded-full shrink-0 ${
                             isSelected ? 'bg-white' : item.isStockout ? 'bg-rose-500' : 'bg-emerald-500'
                           }`} />
-                          <span className="font-mono text-[10px] shrink-0">{item.code}</span>
+                          <span className="font-mono text-[10px] shrink-0">{formatItemCode(item.code)}</span>
                           <span className="truncate flex-1">{item.description}</span>
                           {showAbc && (
                             <span className={`text-[9px] px-1 rounded font-bold uppercase shrink-0 ${
@@ -453,7 +587,7 @@ export const DemandView: React.FC<DemandViewProps> = ({
         <div className="flex items-center justify-between px-3 h-8 bg-[#F8F9FA] border-b border-[#E2E8F0] shrink-0 text-[11px] font-medium text-slate-700">
           <div className="flex items-center gap-2">
             <span className="font-bold text-slate-900 flex items-center gap-1.5">
-              <span className="font-mono text-[#2196F3]">{selectedItem.code}</span>
+              <span className="font-mono text-[#2196F3]">{formatItemCode(selectedItem.code)}</span>
               <span>-</span>
               <span className="truncate max-w-xs">{selectedItem.description}</span>
             </span>
@@ -665,7 +799,7 @@ export const DemandView: React.FC<DemandViewProps> = ({
                     : 'text-slate-600 hover:text-slate-900'
                 }`}
               >
-                {t.demand.chartTabs.revenue} ({getCurrencySymbol(settings?.currency_code || 'EGP', language)})
+                {t.demand.chartTabs.revenue}
               </button>
             </div>
 
@@ -674,9 +808,15 @@ export const DemandView: React.FC<DemandViewProps> = ({
                 <span className="w-3 h-0.5 bg-[#2196F3] inline-block" />
                 {t.demand.gridRows.forecast}
               </span>
-              <span className="flex items-center gap-1.5">
-                <span className="w-3 h-0.5 bg-slate-700 inline-block" />
-                {t.demand.gridRows.actual}
+              <span 
+                className="flex items-center gap-1.5 font-medium text-slate-700"
+                title={isAr ? "المبيعات الفعلية (أخضر = صعود، أحمر = هبوط)" : "Actual Sales (Green = Up, Red = Down)"}
+              >
+                <span className="inline-flex items-center overflow-hidden rounded-full w-4 h-1 shrink-0">
+                  <span className="w-1/2 h-full bg-[#16a34a]" />
+                  <span className="w-1/2 h-full bg-[#dc2626]" />
+                </span>
+                <span>{t.demand.gridRows.actual}</span>
               </span>
               <span className="flex items-center gap-1.5">
                 <span className="w-3 h-0.5 bg-emerald-600 inline-block border-dashed" />
@@ -689,6 +829,11 @@ export const DemandView: React.FC<DemandViewProps> = ({
           <div className="flex-1 w-full pt-2 min-h-[220px]">
             <ResponsiveContainer width="100%" height="100%" minHeight={200}>
               <ComposedChart data={chartData} margin={{ top: 10, right: 20, left: 0, bottom: 5 }}>
+                <defs>
+                  <linearGradient id="actualTrendGradient" x1="0%" y1="0%" x2="100%" y2="0%">
+                    {actualTrendGradientStops}
+                  </linearGradient>
+                </defs>
                 <CartesianGrid stroke="#E2E8F0" strokeDasharray="3 3" vertical={false} />
                 <XAxis 
                   dataKey="date" 
@@ -719,13 +864,14 @@ export const DemandView: React.FC<DemandViewProps> = ({
                   isAnimationActive={false}
                   connectNulls={false}
                 />
-                {/* Actual Sales Line */}
+                {/* Actual Sales Line - Sharp Linear Trend */}
                 <Line 
-                  type="monotone" 
+                  type="linear" 
                   dataKey="actual" 
-                  stroke="#334155" 
-                  strokeWidth={2} 
-                  dot={{ r: 3, fill: '#334155' }} 
+                  stroke="url(#actualTrendGradient)" 
+                  strokeWidth={2.5} 
+                  dot={renderActualDot} 
+                  activeDot={renderActualActiveDot}
                   isAnimationActive={false}
                   connectNulls={false}
                 />
@@ -764,7 +910,7 @@ export const DemandView: React.FC<DemandViewProps> = ({
         <div>
           <div className="px-3 py-2 border-b border-[#E2E8F0] bg-white font-bold text-slate-800 text-[12px] flex items-center justify-between">
             <span>{t.demand.inspector.title}</span>
-            <span className="text-[10px] text-slate-400 font-mono">{selectedItem.code}</span>
+            <span className="text-[10px] text-slate-400 font-mono">{formatItemCode(selectedItem.code)}</span>
           </div>
 
           {/* 4 Tabs: Forecasting, Model, Inventory, KPIs */}
@@ -1075,7 +1221,7 @@ export const DemandView: React.FC<DemandViewProps> = ({
               <div className="flex items-center gap-2">
                 <FileText className="w-4 h-4 text-[#2196F3]" />
                 <span className="font-bold text-xs text-slate-800">
-                  {isAr ? `ملاحظات الصنف (${selectedItem.code})` : `Item Notes (${selectedItem.code})`}
+                  {isAr ? `ملاحظات الصنف (${formatItemCode(selectedItem.code)})` : `Item Notes (${formatItemCode(selectedItem.code)})`}
                 </span>
               </div>
               <button 

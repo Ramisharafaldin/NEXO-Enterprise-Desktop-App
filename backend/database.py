@@ -38,6 +38,19 @@ def clean_opt_float(val: Any) -> Optional[float]:
     except (ValueError, TypeError):
         return None
 
+def clean_item_code(val: Any) -> str:
+    """
+    Converts value to trimmed string and strips trailing .0 ONLY for numeric-looking
+    floats matching ^\d+\.0+$ (e.g., '10006.0' -> '10006', '1.0' -> '1'),
+    while keeping alphanumeric codes intact.
+    """
+    if val is None:
+        return ""
+    s = str(val).strip()
+    if not s or s.lower() in ("nan", "none", "null"):
+        return ""
+    return re.sub(r"^(\d+)\.0+$", r"\1", s)
+
 BASE_DIR = Path(__file__).resolve().parent
 DEFAULT_DB_PATH = str(BASE_DIR / "nexo_workspace.duckdb")
 
@@ -46,41 +59,92 @@ def get_db_path() -> str:
 
 DB_PATH = get_db_path()
 _LOCK = threading.RLock()
+_GLOBAL_CON: Optional[duckdb.DuckDBPyConnection] = None
+_GLOBAL_CON_PATH: Optional[str] = None
+
+def _apply_duckdb_pragmas(con: duckdb.DuckDBPyConnection):
+    """
+    Configures DuckDB on startup with out-of-core spilling and safe memory settings:
+    - temp_directory set to local writable folder with max 4GB spill capacity
+    - preserve_insertion_order = false (significantly lowers RAM during GROUP BY)
+    - threads = 2 (prevents worker thread oversubscription and aborts on Windows)
+    - memory_limit = '1GB' (with disk spill enabled so queries spill instead of aborting)
+    """
+    try:
+        db_path = get_db_path()
+        if db_path and db_path != ":memory:":
+            db_dir = os.path.dirname(os.path.abspath(db_path))
+            temp_dir = os.path.join(db_dir, "duckdb_temp")
+        else:
+            temp_dir = os.path.join(tempfile.gettempdir(), "nexo_duckdb_temp")
+        os.makedirs(temp_dir, exist_ok=True)
+        norm_temp = temp_dir.replace("\\", "/")
+        con.execute(f"SET temp_directory = '{norm_temp}';")
+        con.execute("SET max_temp_directory_size = '4GB';")
+        con.execute("SET preserve_insertion_order = false;")
+        con.execute("SET threads = 2;")
+        con.execute("SET memory_limit = '1GB';")
+    except Exception:
+        pass
 
 class DuckDBResilientConnection:
     """
-    Wrapper around DuckDBPyConnection that safely normalizes query parameters,
-    such as removing unsupported pseudo-parameters like strict_mode=false
-    so read_csv_auto calls execute cleanly in DuckDB without binder errors.
+    Thread-safe, resilient wrapper around DuckDB cursor/connection.
+    Protects all query executions with an RLock to eliminate C++ concurrency crashes (0xc0000409).
+    Normalizes query parameters (such as stripping unsupported strict_mode=false).
     """
-    def __init__(self, raw_con):
+    def __init__(self, raw_con, raw_parent=None, lock=None):
         self._con = raw_con
+        self._parent = raw_parent
+        self._lock = lock or _LOCK
 
     def execute(self, query, *args, **kwargs):
-        if isinstance(query, str) and "strict_mode" in query:
-            query = re.sub(r'\s*strict_mode\s*=\s*(?:false|true)\s*,?', '', query, flags=re.IGNORECASE)
-            query = re.sub(r',\s*\)', ')', query)
-        return self._con.execute(query, *args, **kwargs)
+        with self._lock:
+            if isinstance(query, str) and "strict_mode" in query:
+                query = re.sub(r'\s*strict_mode\s*=\s*(?:false|true)\s*,?', '', query, flags=re.IGNORECASE)
+                query = re.sub(r',\s*\)', ')', query)
+            return self._con.execute(query, *args, **kwargs)
+
+    def cursor(self):
+        with self._lock:
+            return DuckDBResilientConnection(self._con.cursor(), raw_parent=self._parent, lock=self._lock)
+
+    def close(self):
+        with self._lock:
+            try:
+                self._con.close()
+            except Exception:
+                pass
 
     def __enter__(self):
+        self._lock.acquire()
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
-        if hasattr(self._con, "__exit__"):
-            return self._con.__exit__(exc_type, exc_val, exc_tb)
+        try:
+            if hasattr(self._con, "__exit__"):
+                return self._con.__exit__(exc_type, exc_val, exc_tb)
+        finally:
+            self._lock.release()
 
     def __getattr__(self, name):
-        return getattr(self._con, name)
+        attr = getattr(self._con, name)
+        if callable(attr):
+            def locked_method(*args, **kwargs):
+                with self._lock:
+                    return attr(*args, **kwargs)
+            return locked_method
+        return attr
 
-def get_connection():
-    """Returns a DuckDB connection to the local database file with memory cap and performance pragmas."""
-    con = duckdb.connect(get_db_path())
-    try:
-        con.execute("SET memory_limit='512MB';")
-        con.execute("SET preserve_insertion_order=false;")
-    except Exception:
-        pass
-    return DuckDBResilientConnection(con)
+def get_connection() -> DuckDBResilientConnection:
+    """
+    Returns a thread-safe DuckDB connection configured with out-of-core disk spill
+    and 2-thread cap. Serialized by _LOCK to eliminate concurrent thread races.
+    """
+    with _LOCK:
+        con = duckdb.connect(get_db_path())
+        _apply_duckdb_pragmas(con)
+        return DuckDBResilientConnection(con, lock=_LOCK)
 
 def flush_db():
     """Forces DuckDB WAL changes to be flushed immediately to disk via CHECKPOINT."""
@@ -359,10 +423,142 @@ def init_db():
                     _seed_initial_project(con)
                 con.execute("UPDATE app_settings SET initial_seed_done = 'true' WHERE id = 'global_settings'")
             
+            # 10. Startup cleanup: safely strip trailing .0 decimal artifacts from existing projects
+            cleanup_trailing_decimal_codes(con)
+
             con.execute("CHECKPOINT;")
 
         finally:
             con.close()
+
+def cleanup_trailing_decimal_codes(con=None):
+    """
+    Safe, idempotent startup cleanup routine that strips trailing `.0` from stored
+    `code` and `item_code` values matching `^[0-9]+\.0+$` across existing projects,
+    carefully preserving foreign-key / `item_id` relationships and avoiding duplicate key collisions.
+    """
+    with _LOCK:
+        return _cleanup_trailing_decimal_codes_locked(con)
+
+def _cleanup_trailing_decimal_codes_locked(con=None):
+    owns_con = False
+    if con is None:
+        con = get_connection()
+        owns_con = True
+    try:
+        # Pre-check if any matching codes exist first to make it instantaneous if already cleaned
+        has_items = False
+        has_pi = False
+        has_ds = False
+        try:
+            has_items = bool(con.execute("SELECT 1 FROM items WHERE regexp_matches(code, '^[0-9]+\\.0+$') LIMIT 1").fetchone())
+            has_pi = bool(con.execute("SELECT 1 FROM project_items WHERE regexp_matches(code, '^[0-9]+\\.0+$') LIMIT 1").fetchone())
+            has_ds = bool(con.execute("SELECT 1 FROM daily_sales WHERE regexp_matches(item_code, '^[0-9]+\\.0+$') LIMIT 1").fetchone())
+        except Exception:
+            return
+
+        if not (has_items or has_pi or has_ds):
+            return
+
+        # 1. Daily sales (transaction records)
+        try:
+            con.execute("""
+                UPDATE daily_sales
+                SET item_code = regexp_replace(item_code, '^([0-9]+)\\.0+$', '\\1')
+                WHERE regexp_matches(item_code, '^[0-9]+\\.0+$');
+            """)
+        except Exception:
+            pass
+
+        # 2. In transition
+        try:
+            con.execute("""
+                UPDATE in_transition
+                SET item_code = regexp_replace(item_code, '^([0-9]+)\\.0+$', '\\1')
+                WHERE regexp_matches(item_code, '^[0-9]+\\.0+$');
+            """)
+        except Exception:
+            pass
+
+        # 3. Project in transit
+        try:
+            con.execute("""
+                UPDATE project_in_transit
+                SET code = regexp_replace(code, '^([0-9]+)\\.0+$', '\\1')
+                WHERE regexp_matches(code, '^[0-9]+\\.0+$');
+            """)
+        except Exception:
+            pass
+
+        # 4. Project periods (preserve uniqueness: delete colliding duplicate keys)
+        try:
+            con.execute("""
+                UPDATE project_periods
+                SET code = regexp_replace(code, '^([0-9]+)\\.0+$', '\\1')
+                WHERE regexp_matches(code, '^[0-9]+\\.0+$')
+                  AND NOT EXISTS (
+                      SELECT 1 FROM project_periods e
+                      WHERE e.project_id = project_periods.project_id
+                        AND e.code = regexp_replace(project_periods.code, '^([0-9]+)\\.0+$', '\\1')
+                        AND e.location = project_periods.location
+                        AND e.period = project_periods.period
+                  );
+                DELETE FROM project_periods WHERE regexp_matches(code, '^[0-9]+\\.0+$');
+            """)
+        except Exception:
+            pass
+
+        # 5. Project items (preserve uniqueness: delete colliding duplicate keys)
+        try:
+            con.execute("""
+                UPDATE project_items
+                SET code = regexp_replace(code, '^([0-9]+)\\.0+$', '\\1')
+                WHERE regexp_matches(code, '^[0-9]+\\.0+$')
+                  AND NOT EXISTS (
+                      SELECT 1 FROM project_items e
+                      WHERE e.project_id = project_items.project_id
+                        AND e.code = regexp_replace(project_items.code, '^([0-9]+)\\.0+$', '\\1')
+                        AND e.location = project_items.location
+                  );
+                DELETE FROM project_items WHERE regexp_matches(code, '^[0-9]+\\.0+$');
+            """)
+        except Exception:
+            pass
+
+        # 6. Items: detect and resolve any collisions within the same project
+        try:
+            collisions = con.execute("""
+                SELECT dup.id as dup_id, can.id as can_id
+                FROM items dup
+                JOIN items can 
+                  ON dup.project_id = can.project_id
+                 AND regexp_replace(dup.code, '^([0-9]+)\\.0+$', '\\1') = can.code
+                 AND dup.id != can.id
+                WHERE regexp_matches(dup.code, '^[0-9]+\\.0+$');
+            """).fetchall()
+
+            for dup_id, can_id in collisions:
+                con.execute("UPDATE periods SET item_id = ? WHERE item_id = ?", (can_id, dup_id))
+                con.execute("UPDATE forecast_overrides SET item_id = ? WHERE item_id = ?", (can_id, dup_id))
+                con.execute("UPDATE model_settings SET item_id = ? WHERE item_id = ?", (can_id, dup_id))
+                con.execute("DELETE FROM items WHERE id = ?", (dup_id,))
+
+            # Update remaining items without collisions
+            con.execute("""
+                UPDATE items
+                SET code = regexp_replace(code, '^([0-9]+)\\.0+$', '\\1'),
+                    description = regexp_replace(description, '^Item ([0-9]+)\\.0+$', 'Item \\1')
+                WHERE regexp_matches(code, '^[0-9]+\\.0+$');
+            """)
+        except Exception:
+            pass
+    finally:
+        if owns_con:
+            try:
+                con.execute("CHECKPOINT;")
+                con.close()
+            except Exception:
+                pass
 
 def _seed_initial_project(con):
     """Populates DuckDB with the initial 10 enterprise SKUs and 24 monthly periods."""
@@ -1659,7 +1855,7 @@ def add_in_transition_record(project_id: str, record: Dict[str, Any]) -> Dict[st
                 INSERT INTO in_transition (id, project_id, item_code, order_no, origin, destination, quantity, eta_date, carrier, status)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
-                tid, project_id, record.get("item_code", ""), record.get("order_no", ""),
+                tid, project_id, clean_item_code(record.get("item_code", "")), record.get("order_no", ""),
                 record.get("origin", ""), record.get("destination", ""), float(record.get("quantity", 0)),
                 record.get("eta_date", ""), record.get("carrier", ""), record.get("status", "in_transit")
             ))
@@ -1677,7 +1873,7 @@ def bulk_upsert_in_transit(project_id: str, records: List[Dict[str, Any]], merge
                 con.execute("DELETE FROM in_transition WHERE project_id = ?", (project_id,))
             count = 0
             for r in records:
-                code = str(r.get("item_code", r.get("code", ""))).strip()
+                code = clean_item_code(r.get("item_code", r.get("code", "")))
                 ord_no = str(r.get("order_no", r.get("po_number", r.get("order", "")))).strip()
                 if not code or not ord_no:
                     continue
@@ -2305,7 +2501,7 @@ def record_daily_sales(project_id: str, records: List[Dict[str, Any]]) -> int:
             """)
             for r in records:
                 sale_id = f"ds_{uuid.uuid4().hex[:10]}"
-                code = str(r.get("item_code", r.get("code", ""))).strip()
+                code = clean_item_code(r.get("item_code", r.get("code", "")))
                 loc = str(r.get("location", "Main Warehouse")).strip()
                 date_val = str(r.get("sale_date", r.get("date", ""))).strip()
                 qty = clean_float(r.get("qty_sold", r.get("actual", 0.0)))
@@ -2397,7 +2593,7 @@ def upsert_items_and_periods(
             existing_items_map = {k: v["id"] for k, v in existing_items_dict.items()}
 
             for itm in items_data:
-                code = str(itm.get("code", "")).strip()
+                code = clean_item_code(itm.get("code", ""))
                 if not code:
                     continue
 
@@ -2580,7 +2776,7 @@ def upsert_items_and_periods(
                 # Pre-aggregate periods_data by (code, date) to sum actuals & revenue across repeated transactions
                 pre_agg_periods: Dict[Tuple[str, str], Dict[str, Any]] = {}
                 for per in periods_data:
-                    c = str(per.get("code", "")).strip()
+                    c = clean_item_code(per.get("code", ""))
                     d = str(per.get("date", per.get("period", ""))).strip()
                     if not c or not d:
                         continue

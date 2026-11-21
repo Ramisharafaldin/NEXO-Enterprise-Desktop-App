@@ -12,3 +12,5 @@ __pycache__/
 .python_exe.txt
 *_SPEC.md
 NEXO_ANATOMICAL_AUDIT_REPORT.md
+backend/duckdb_temp/
+backend/logs/

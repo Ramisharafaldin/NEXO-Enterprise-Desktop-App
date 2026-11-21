@@ -25,6 +25,16 @@ if sys.platform == "win32":
         except Exception:
             pass
 
+# 1b. Native C-level crash dump handler (faulthandler)
+import faulthandler
+_backend_logs_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
+try:
+    os.makedirs(_backend_logs_dir, exist_ok=True)
+    _crash_log_file = open(os.path.join(_backend_logs_dir, "crash_dump.log"), "a", encoding="utf-8")
+    faulthandler.enable(file=_crash_log_file)
+except Exception:
+    pass
+
 # 2. Global Windows subprocess.Popen CREATE_NO_WINDOW monkey-patch
 if sys.platform == "win32" and not getattr(subprocess, "_nexo_silent_patched", False):
     _orig_popen = subprocess.Popen
@@ -51,6 +61,7 @@ import datetime
 import tempfile
 import shutil
 import csv
+import codecs
 from pathlib import Path
 from python_calamine import CalamineWorkbook
 from typing import Dict, List, Any, Optional, Tuple, Union
@@ -78,6 +89,19 @@ import hmac
 
 REPO_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 SUBPROCESS_FLAGS = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+
+def log_ingest_milestone(message: str):
+    """Flushes ingestion milestones to desktop_app.log and stdout."""
+    timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    formatted = f"{timestamp} [INGEST] {message}\n"
+    print(f"[INGEST] {message}", flush=True)
+    desktop_log = Path(__file__).resolve().parent.parent / "desktop_app.log"
+    try:
+        with open(desktop_log, "a", encoding="utf-8") as f:
+            f.write(formatted)
+            f.flush()
+    except Exception:
+        pass
 
 def get_app_version() -> str:
     """Reads current application version dynamically from VERSION file on disk on every call."""
@@ -136,6 +160,8 @@ try:
         get_erp_connection,
         record_daily_sales,
         upsert_items_and_periods,
+        clean_item_code,
+        cleanup_trailing_decimal_codes,
         get_connection,
         _LOCK
     )
@@ -176,6 +202,8 @@ except (ImportError, ModuleNotFoundError):
         get_erp_connection,
         record_daily_sales,
         upsert_items_and_periods,
+        clean_item_code,
+        cleanup_trailing_decimal_codes,
         get_connection,
         _LOCK
     )
@@ -978,7 +1006,7 @@ def import_from_sql_server(req: SqlServerImportRequest):
                         con = get_connection()
                         try:
                             for idx, row in df_erp.iterrows():
-                                code = str(row.get("ItemCode", row.get("code", f"SKU-{idx+1}"))).strip()
+                                code = clean_item_code(row.get("ItemCode", row.get("code", f"SKU-{idx+1}")))
                                 desc = str(row.get("Description", row.get("description", f"ERP Item {code}"))).strip()
                                 cat = str(row.get("Category", row.get("category", "General ERP"))).strip()
                                 loc = str(row.get("Location", row.get("location", "Main Plant"))).strip()
@@ -1239,22 +1267,43 @@ def normalize_sales_date(raw_val: Any, granularity: str = "monthly") -> Tuple[st
     fallback = val_str[:10].replace("/", "-") if len(val_str) >= 10 else "2025-01-01"
     return fallback, fallback[:7]
 
+def _clean_header_name(name: Any) -> str:
+    """Strips leading/trailing UTF-8 BOM (\ufeff), quotes, and whitespace from column headers."""
+    if name is None:
+        return ""
+    s = str(name).strip()
+    s = s.lstrip("\ufeff").rstrip("\ufeff").strip()
+    if (s.startswith('"') and s.endswith('"')) or (s.startswith("'") and s.endswith("'")):
+        s = s[1:-1].strip()
+    return s.lstrip("\ufeff").rstrip("\ufeff").strip()
+
 def _match_column(cols: List[str], mapping: Dict[str, str], field: str) -> Optional[str]:
     """Matches field to DataFrame column using explicit mapping or bilingual heuristics."""
-    if field in mapping and mapping[field] in cols:
-        return mapping[field]
-    candidates = BILINGUAL_MAP.get(field, [])
-    # 1. Exact match (case-insensitive)
-    for c in cols:
-        cl = str(c).strip().lower()
-        for cand in candidates:
-            if cand.lower() == cl:
+    clean_cols_map = {_clean_header_name(c): c for c in cols}
+
+    # Check explicit mapping first
+    if field in mapping and mapping[field]:
+        mapped_val = _clean_header_name(mapping[field])
+        if mapped_val in clean_cols_map:
+            return clean_cols_map[mapped_val]
+        for c in cols:
+            if _clean_header_name(c).lower() == mapped_val.lower():
                 return c
+
+    candidates = BILINGUAL_MAP.get(field, [])
+    # 1. Exact match (case-insensitive, BOM-stripped)
+    for c in cols:
+        cl = _clean_header_name(c).lower()
+        for cand in candidates:
+            if _clean_header_name(cand).lower() == cl:
+                return c
+
     # 2. Substring match
     for c in cols:
-        cl = str(c).strip().lower()
+        cl = _clean_header_name(c).lower()
         for cand in candidates:
-            if cand.lower() in cl or cl in cand.lower():
+            cand_l = _clean_header_name(cand).lower()
+            if cand_l in cl or cl in cand_l:
                 return c
     return None
 
@@ -1287,27 +1336,66 @@ def update_job_progress(
         "error": error
     }
 
-MAX_UPLOAD_SIZE = 150 * 1024 * 1024  # 150 MB upload cap (SEC-MED-05)
+# Smart file-type upload size limits (SEC-MED-05)
+MAX_CSV_UPLOAD_SIZE = int(os.environ.get("NEXO_MAX_CSV_MB", 2048)) * 1024 * 1024  # 2 GB for large retail CSV datasets
+MAX_OTHER_UPLOAD_SIZE = int(os.environ.get("NEXO_MAX_EXCEL_MB", 300)) * 1024 * 1024  # 300 MB for Excel/DB/Other files
+MAX_UPLOAD_SIZE = MAX_OTHER_UPLOAD_SIZE  # Backwards compatibility alias
+MIN_DISK_HEADROOM = int(os.environ.get("NEXO_MIN_DISK_HEADROOM_MB", 500)) * 1024 * 1024  # 500 MB minimum free disk headroom
 
 def stream_upload_to_file(upload_file: UploadFile) -> Tuple[str, str]:
-    """Streams multipart file directly to disk in 1MB chunks, enforcing a 150 MB cap."""
+    """
+    Streams multipart file directly to disk in 1MB chunks, enforcing smart file-type limits:
+    - 2048 MB (2 GB default) for .csv / .txt large retail datasets
+    - 300 MB default for .xlsx, .xls, .db, .sqlite, .duckdb and other files
+    Guarantees at least 500 MB free disk headroom in the temp directory to prevent disk exhaustion DoS.
+    Unlinks partial temporary file on HTTP 413 / 507 or any stream error.
+    """
     filename = upload_file.filename or "uploaded_data.csv"
     ext = os.path.splitext(filename)[1].lower()
-    suffix = ext if ext in [".csv", ".xlsx", ".xls"] else ".tmp"
+    suffix = ext if ext in [".csv", ".xlsx", ".xls", ".duckdb", ".sqlite", ".db", ".txt"] else ".tmp"
+
+    # Smart file-type limits configurable via environment variables
+    if ext in [".csv", ".txt"]:
+        limit_mb = int(os.environ.get("NEXO_MAX_CSV_MB", 2048))
+        file_type_label = "CSV"
+    else:
+        limit_mb = int(os.environ.get("NEXO_MAX_EXCEL_MB", 300))
+        file_type_label = "Excel" if ext in [".xlsx", ".xls"] else "database/binary files"
+
+    max_allowed_bytes = limit_mb * 1024 * 1024
+    min_headroom_bytes = int(os.environ.get("NEXO_MIN_DISK_HEADROOM_MB", 500)) * 1024 * 1024
+
+    # Pre-flight check: ensure temp storage has at least min_headroom_bytes available
+    temp_dir = tempfile.gettempdir()
+    free_disk = shutil.disk_usage(temp_dir).free
+    if free_disk < min_headroom_bytes:
+        raise HTTPException(
+            status_code=507,
+            detail=f"Insufficient disk space on server. Less than {min_headroom_bytes // (1024 * 1024)} MB free space remaining."
+        )
+
     total_size = 0
     tmp_path = None
     try:
         with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
             tmp_path = tmp.name
+            target_dir = os.path.dirname(tmp_path) or temp_dir
             while True:
                 chunk = upload_file.file.read(1024 * 1024)
                 if not chunk:
                     break
                 total_size += len(chunk)
-                if total_size > MAX_UPLOAD_SIZE:
+                if total_size > max_allowed_bytes:
                     raise HTTPException(
                         status_code=413,
-                        detail=f"Uploaded file exceeds maximum allowed size limit ({MAX_UPLOAD_SIZE // (1024 * 1024)} MB)."
+                        detail=f"Uploaded file exceeds maximum allowed size limit of {limit_mb} MB for {file_type_label}."
+                    )
+                # Check remaining disk headroom during streaming
+                current_free = shutil.disk_usage(target_dir).free
+                if current_free < min_headroom_bytes:
+                    raise HTTPException(
+                        status_code=507,
+                        detail=f"Insufficient disk space on server. Storage headroom limit ({min_headroom_bytes // (1024 * 1024)} MB) reached during streaming."
                     )
                 tmp.write(chunk)
         return tmp_path, filename
@@ -1322,31 +1410,60 @@ def stream_upload_to_file(upload_file: UploadFile) -> Tuple[str, str]:
 def normalize_csv_encoding(file_path: str) -> Tuple[str, bool]:
     """
     Detects encoding of CSV file (UTF-8, UTF-8-SIG, CP1256 / Windows-1256, ISO-8859-6, Latin-1).
-    If file is already valid UTF-8/UTF-8-SIG, returns (file_path, False).
+    Streams chunks using incremental decoders without loading entire large multi-gigabyte files into memory at once.
+    If file is already valid UTF-8/UTF-8-SIG, returns (file_path, False) directly so DuckDB reads it with 0 copy.
     If file is encoded in CP1256 or other legacy Windows encodings, cleanly transcodes to
     a UTF-8 encoded temporary file and returns (normalized_path, True).
     """
     with open(file_path, "rb") as f:
-        raw_bytes = f.read()
+        sample = f.read(64 * 1024)
 
+    # 1. UTF-8 / UTF-8-SIG Priority Check using streaming incremental decoder
+    is_utf8 = False
     try:
-        raw_bytes.decode("utf-8-sig")
-        return file_path, False
+        sample.decode("utf-8-sig")
+        decoder = codecs.getincrementaldecoder("utf-8-sig")()
+        with open(file_path, "rb") as f:
+            while True:
+                chunk = f.read(64 * 1024)
+                if not chunk:
+                    decoder.decode(b"", final=True)
+                    break
+                decoder.decode(chunk, final=False)
+        is_utf8 = True
     except UnicodeDecodeError:
-        pass
+        is_utf8 = False
 
+    if is_utf8:
+        return file_path, False
+
+    # 2. Genuine legacy non-UTF-8 fallback (CP1256 / Windows-1256, ISO-8859-6, CP1252, Latin-1)
+    detected_enc = None
     for enc in ["cp1256", "windows-1256", "iso-8859-6", "cp1252", "latin1"]:
         try:
-            decoded_text = raw_bytes.decode(enc)
+            sample.decode(enc)
+            detected_enc = enc
             break
         except UnicodeDecodeError:
             continue
-    else:
-        decoded_text = raw_bytes.decode("cp1256", errors="replace")
 
+    if not detected_enc:
+        detected_enc = "cp1256"
+
+    # Stream transcode to UTF-8 in 64 KB chunks
     norm_path = file_path + ".utf8.csv"
-    with open(norm_path, "w", encoding="utf-8", newline="") as out:
-        out.write(decoded_text)
+    decoder = codecs.getincrementaldecoder(detected_enc)(errors="replace")
+    with open(file_path, "rb") as fin, open(norm_path, "w", encoding="utf-8", newline="") as fout:
+        while True:
+            chunk = fin.read(64 * 1024)
+            if not chunk:
+                tail = decoder.decode(b"", final=True)
+                if tail:
+                    fout.write(tail)
+                break
+            text_chunk = decoder.decode(chunk, final=False)
+            if text_chunk:
+                fout.write(text_chunk)
     return norm_path, True
 
 def load_file_into_staging(con: duckdb.DuckDBPyConnection, file_path: str, ext: str) -> Tuple[List[str], int]:
@@ -1363,9 +1480,18 @@ def load_file_into_staging(con: duckdb.DuckDBPyConnection, file_path: str, ext: 
             escaped_path = norm_path.replace("\\", "/").replace("'", "''")
             con.execute(f"""
                 CREATE OR REPLACE TEMP TABLE staging_raw AS
-                SELECT * FROM read_csv_auto('{escaped_path}', all_varchar=true, strict_mode=false, null_padding=true, ignore_errors=true, sample_size=-1);
+                SELECT * FROM read_csv_auto('{escaped_path}', all_varchar=true, strict_mode=false, null_padding=true, ignore_errors=true, sample_size=1000);
             """)
-            cols = [desc[0] for desc in con.execute("DESCRIBE staging_raw").fetchall()]
+            raw_cols = [desc[0] for desc in con.execute("DESCRIBE staging_raw").fetchall()]
+            cols = [_clean_header_name(c) for c in raw_cols]
+            for rc, cc in zip(raw_cols, cols):
+                if rc != cc:
+                    try:
+                        esc_rc = rc.replace('"', '""')
+                        esc_cc = cc.replace('"', '""')
+                        con.execute(f'ALTER TABLE staging_raw RENAME COLUMN "{esc_rc}" TO "{esc_cc}"')
+                    except Exception:
+                        pass
             count = con.execute("SELECT COUNT(*) FROM staging_raw").fetchone()[0]
             return cols, count
         finally:
@@ -1392,7 +1518,7 @@ def load_file_into_staging(con: duckdb.DuckDBPyConnection, file_path: str, ext: 
         col_names = []
         seen: Dict[str, int] = {}
         for i, h in enumerate(raw_headers):
-            name = str(h).strip() if h is not None else f"col_{i}"
+            name = _clean_header_name(h) if h is not None else f"col_{i}"
             if not name:
                 name = f"col_{i}"
             if name in seen:
@@ -1406,7 +1532,16 @@ def load_file_into_staging(con: duckdb.DuckDBPyConnection, file_path: str, ext: 
         clean_rows = []
         for r in rows[1:]:
             row_len = len(r)
-            clean_row = [str(r[i]) if i < row_len and r[i] is not None else None for i in range(num_cols)]
+            clean_row = []
+            for i in range(num_cols):
+                if i < row_len and r[i] is not None:
+                    val = r[i]
+                    if isinstance(val, float) and val.is_integer():
+                        clean_row.append(str(int(val)))
+                    else:
+                        clean_row.append(str(val))
+                else:
+                    clean_row.append(None)
             clean_rows.append(clean_row)
 
         df = pd.DataFrame(clean_rows, columns=col_names)
@@ -1414,7 +1549,7 @@ def load_file_into_staging(con: duckdb.DuckDBPyConnection, file_path: str, ext: 
         con.execute("CREATE OR REPLACE TEMP TABLE staging_raw AS SELECT * FROM staging_excel_df;")
         con.unregister("staging_excel_df")
 
-        cols = [desc[0] for desc in con.execute("DESCRIBE staging_raw").fetchall()]
+        cols = [_clean_header_name(desc[0]) for desc in con.execute("DESCRIBE staging_raw").fetchall()]
         count = con.execute("SELECT COUNT(*) FROM staging_raw").fetchone()[0]
         return cols, count
 
@@ -1878,6 +2013,339 @@ def download_in_transit_template(lang: Optional[str] = None):
         headers={"Content-Disposition": f"attachment; filename={filename}"}
     )
 
+def _stream_ingest_sales_csv(
+    tmp_path: str,
+    filename: str,
+    proj_id: str,
+    merge_mode: str,
+    mapping: Dict[str, str],
+    job_id: Optional[str]
+) -> Tuple[int, int, int]:
+    """
+    Zero-Copy Streaming SQL Aggregation + Out-of-Core Disk Spill for Large Retail CSV Sales Files.
+    Avoids materializing millions of unaggregated string rows into in-memory temp tables.
+    Directly streams and aggregates in DuckDB C++ engine from read_csv_auto.
+    Returns (rows_processed, items_count, periods_count).
+    """
+    norm_path, was_transcoded = normalize_csv_encoding(tmp_path)
+    try:
+        escaped_path = norm_path.replace("\\", "/").replace("'", "''")
+        with _LOCK:
+            con = get_connection()
+            try:
+                # 1. Strictly bounded column discovery from first 1000 rows
+                sample_res = con.execute(f"""
+                    DESCRIBE SELECT * FROM read_csv_auto('{escaped_path}', all_varchar=true, null_padding=true, ignore_errors=true, sample_size=1000) LIMIT 1;
+                """).fetchall()
+                raw_cols = [d[0] for d in sample_res]
+                cols = [_clean_header_name(d[0]) for d in sample_res]
+                if not cols:
+                    raise HTTPException(status_code=400, detail="The uploaded file contains no data columns.")
+
+                raw_col_map = {_clean_header_name(d[0]): d[0] for d in sample_res}
+
+                def esc_c(col_name: str) -> str:
+                    return col_name.replace('"', '""')
+
+                c_code = _match_column(cols, mapping, "code")
+                c_loc = _match_column(cols, mapping, "location")
+                c_period = _match_column(cols, mapping, "period")
+                c_qty_sold = _match_column(cols, mapping, "qty_sold")
+                c_revenue = _match_column(cols, mapping, "revenue")
+
+                if not c_code or not c_period or not c_qty_sold:
+                    missing = []
+                    if not c_code:
+                        missing.append("item_code (كود الصنف)")
+                    if not c_period:
+                        missing.append("date (تاريخ البيع)")
+                    if not c_qty_sold:
+                        missing.append("quantity (الكمية المباعة)")
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"Missing required sales columns: {', '.join(missing)}. Detected columns: {cols}"
+                    )
+
+                code_col = esc_c(raw_col_map.get(c_code, c_code))
+                loc_col = esc_c(raw_col_map.get(c_loc, c_loc)) if c_loc else None
+                period_col = esc_c(raw_col_map.get(c_period, c_period))
+                qty_col = esc_c(raw_col_map.get(c_qty_sold, c_qty_sold))
+                rev_col = esc_c(raw_col_map.get(c_revenue, c_revenue)) if c_revenue else None
+
+                clean_code_sql = f"regexp_replace(TRIM(CAST(s.\"{code_col}\" AS VARCHAR)), '^([0-9]+)\\.0+$', '\\1')"
+                valid_code_cond = f's."{code_col}" IS NOT NULL AND {clean_code_sql} != \'\' AND LOWER({clean_code_sql}) NOT IN (\'nan\', \'none\', \'null\')'
+
+                loc_sql = f'COALESCE(NULLIF(TRIM(CAST(s."{loc_col}" AS VARCHAR)), \'\'), \'Main Warehouse\')' if loc_col else "'Main Warehouse'"
+                qty_sql = f'COALESCE(TRY_CAST(s."{qty_col}" AS DOUBLE), 0.0)'
+                rev_sql = f'COALESCE(TRY_CAST(s."{rev_col}" AS DOUBLE), 0.0)' if rev_col else '0.0'
+
+                p_col = period_col
+                raw_d = f's."{p_col}"'
+                period_expr = f"""
+                CASE 
+                  WHEN {raw_d} IS NULL OR TRIM(CAST({raw_d} AS VARCHAR)) = '' 
+                    THEN strftime(CURRENT_DATE, '%Y-%m')
+                  WHEN regexp_matches(TRIM(CAST({raw_d} AS VARCHAR)), '^[0-9]{{4}}[-/][0-9]{{2}}') 
+                    THEN replace(substr(TRIM(CAST({raw_d} AS VARCHAR)), 1, 7), '/', '-')
+                  WHEN TRY_CAST(TRIM(CAST({raw_d} AS VARCHAR)) AS TIMESTAMP) IS NOT NULL 
+                    THEN strftime(TRY_CAST(TRIM(CAST({raw_d} AS VARCHAR)) AS TIMESTAMP), '%Y-%m')
+                  WHEN TRY_CAST(TRIM(CAST({raw_d} AS VARCHAR)) AS DATE) IS NOT NULL 
+                    THEN strftime(TRY_CAST(TRIM(CAST({raw_d} AS VARCHAR)) AS DATE), '%Y-%m')
+                  WHEN TRY_STRPTIME(TRIM(CAST({raw_d} AS VARCHAR)), '%d/%m/%Y') IS NOT NULL 
+                    THEN strftime(TRY_STRPTIME(TRIM(CAST({raw_d} AS VARCHAR)), '%d/%m/%Y'), '%Y-%m')
+                  WHEN TRY_STRPTIME(TRIM(CAST({raw_d} AS VARCHAR)), '%m/%d/%Y') IS NOT NULL 
+                    THEN strftime(TRY_STRPTIME(TRIM(CAST({raw_d} AS VARCHAR)), '%m/%d/%Y'), '%Y-%m')
+                  WHEN TRY_CAST(TRIM(CAST({raw_d} AS VARCHAR)) AS DOUBLE) >= 30000 AND TRY_CAST(TRIM(CAST({raw_d} AS VARCHAR)) AS DOUBLE) <= 60000 
+                    THEN strftime(DATE '1899-12-30' + (TRY_CAST(TRIM(CAST({raw_d} AS VARCHAR)) AS BIGINT) * INTERVAL 1 DAY), '%Y-%m')
+                  ELSE strftime(CURRENT_DATE, '%Y-%m')
+                END
+                """
+                daily_date_expr = f"""
+                CASE 
+                  WHEN {raw_d} IS NULL OR TRIM(CAST({raw_d} AS VARCHAR)) = '' 
+                    THEN strftime(CURRENT_DATE, '%Y-%m-%d')
+                  WHEN regexp_matches(TRIM(CAST({raw_d} AS VARCHAR)), '^[0-9]{{4}}[-/][0-9]{{2}}[-/][0-9]{{2}}') 
+                    THEN replace(substr(TRIM(CAST({raw_d} AS VARCHAR)), 1, 10), '/', '-')
+                  WHEN TRY_CAST(TRIM(CAST({raw_d} AS VARCHAR)) AS DATE) IS NOT NULL 
+                    THEN strftime(TRY_CAST(TRIM(CAST({raw_d} AS VARCHAR)) AS DATE), '%Y-%m-%d')
+                  WHEN TRY_CAST(TRIM(CAST({raw_d} AS VARCHAR)) AS TIMESTAMP) IS NOT NULL 
+                    THEN strftime(TRY_CAST(TRIM(CAST({raw_d} AS VARCHAR)) AS TIMESTAMP), '%Y-%m-%d')
+                  WHEN TRY_STRPTIME(TRIM(CAST({raw_d} AS VARCHAR)), '%d/%m/%Y') IS NOT NULL 
+                    THEN strftime(TRY_STRPTIME(TRIM(CAST({raw_d} AS VARCHAR)), '%d/%m/%Y'), '%Y-%m-%d')
+                  WHEN TRY_STRPTIME(TRIM(CAST({raw_d} AS VARCHAR)), '%m/%d/%Y') IS NOT NULL 
+                    THEN strftime(TRY_STRPTIME(TRIM(CAST({raw_d} AS VARCHAR)), '%m/%d/%Y'), '%Y-%m-%d')
+                  WHEN length(trim(CAST({raw_d} AS VARCHAR))) = 7 AND substr(trim(CAST({raw_d} AS VARCHAR)), 5, 1) IN ('-', '/') 
+                    THEN replace(substr(trim(CAST({raw_d} AS VARCHAR)), 1, 7), '/', '-') || '-01'
+                  WHEN TRY_CAST(TRIM(CAST({raw_d} AS VARCHAR)) AS DOUBLE) >= 30000 AND TRY_CAST(TRIM(CAST({raw_d} AS VARCHAR)) AS DOUBLE) <= 60000 
+                    THEN strftime(DATE '1899-12-30' + (TRY_CAST(TRIM(CAST({raw_d} AS VARCHAR)) AS BIGINT) * INTERVAL 1 DAY), '%Y-%m-%d')
+                  ELSE strftime(CURRENT_DATE, '%Y-%m-%d')
+                END
+                """
+
+                # 2. Zero-Copy Streaming SQL Aggregation directly from read_csv_auto
+                log_ingest_milestone("streaming_sql: executing zero-copy streaming aggregation from CSV...")
+                update_job_progress(job_id, 75, "تجميع الحركات وتوحيد التواريخ...", "Streaming SQL aggregation...")
+
+                if merge_mode == "replace":
+                    con.execute("DELETE FROM daily_sales WHERE project_id = ?", (proj_id,))
+                    con.execute("DELETE FROM periods WHERE project_id = ?", (proj_id,))
+
+                con.execute(f"""
+                    CREATE OR REPLACE TEMP TABLE streaming_sales_agg AS
+                    SELECT
+                      {clean_code_sql} as clean_code,
+                      {loc_sql} as branch,
+                      {period_expr} as period,
+                      SUM({qty_sql}) as qty_sold,
+                      SUM({rev_sql}) as revenue,
+                      COUNT(*) as row_count
+                    FROM read_csv_auto('{escaped_path}', all_varchar=true, null_padding=true, ignore_errors=true, sample_size=1000) s
+                    WHERE {valid_code_cond}
+                    GROUP BY 1, 2, 3;
+                """)
+
+                cnt_row = con.execute("SELECT COALESCE(SUM(row_count), 0) FROM streaming_sales_agg").fetchone()
+                total_rows = cnt_row[0] if cnt_row else 0
+                if total_rows == 0:
+                    raise HTTPException(status_code=400, detail="The uploaded file contains no data rows.")
+
+                # Stream into daily_sales using row_number() over()
+                con.execute(f"""
+                    INSERT INTO daily_sales (id, project_id, item_code, location, sale_date, qty_sold, revenue, created_at)
+                    SELECT
+                      ? || '_ds_' || substr(md5(random()::VARCHAR || row_number() over ()), 1, 10) || '_' || row_number() over (),
+                      ?,
+                      {clean_code_sql},
+                      {loc_sql},
+                      {daily_date_expr},
+                      {qty_sql},
+                      {rev_sql},
+                      strftime(CURRENT_TIMESTAMP, '%Y-%m-%dT%H:%M:%SZ')
+                    FROM read_csv_auto('{escaped_path}', all_varchar=true, null_padding=true, ignore_errors=true, sample_size=1000) s
+                    WHERE {valid_code_cond};
+                """, (proj_id, proj_id))
+
+                # 3. Committing to project items & periods
+                log_ingest_milestone(f"committing: aggregated {total_rows} raw records into periods, syncing workspace...")
+                update_job_progress(job_id, 88, "حفظ البيانات وتحديث الأصناف...", "Committing periods & updating items...", rows_processed=total_rows, total_rows=total_rows)
+
+                # Auto-create missing items in items table
+                con.execute(f"""
+                    INSERT INTO items (
+                      id, project_id, code, description, category, location, channel, supplier,
+                      sales_price, purchase_price, margin, on_hand, on_order, backorders,
+                      lead_time_days, lead_time_variance_days, order_cycle_days, service_level,
+                      min_batch, batch_rounding, model_type, replenishment_strategy,
+                      check_state, approval_state, abc_class, xyz_class,
+                      safety_stock, reorder_point, order_now, order_now_value, days_of_supply,
+                      accuracy, mean_daily_demand, updated_at
+                    )
+                    SELECT
+                      ? || '_' || substr(md5(random()::VARCHAR || TRIM(sub.code)), 1, 8),
+                      ?,
+                      sub.code,
+                      'Item ' || sub.code,
+                      'General',
+                      sub.loc,
+                      'Direct Retail',
+                      'Primary Supplier',
+                      100.0, 50.0, 50.0,
+                      0.0, 0.0, 0.0,
+                      30.0, 5.0, 30.0, 0.95,
+                      1.0, 1.0, 'auto', 'periodic',
+                      'checked', 'unapproved', 'B', 'Y',
+                      0.0, 0.0, 0.0, 0.0, 0.0,
+                      92.0, 0.0,
+                      strftime(CURRENT_TIMESTAMP, '%Y-%m-%dT%H:%M:%SZ')
+                    FROM (
+                      SELECT clean_code as code, MIN(branch) as loc
+                      FROM streaming_sales_agg
+                      GROUP BY clean_code
+                    ) sub
+                    LEFT JOIN items i 
+                      ON i.project_id = ? 
+                      AND i.code = sub.code
+                    WHERE i.code IS NULL;
+                """, (proj_id, proj_id, proj_id))
+
+                # If existing items had default/empty location, update with branch from incoming sales
+                con.execute("""
+                    UPDATE items
+                    SET location = sub.loc
+                    FROM (
+                      SELECT clean_code as code, MIN(branch) as loc
+                      FROM streaming_sales_agg
+                      WHERE branch IS NOT NULL AND branch != 'Main Warehouse' AND branch != ''
+                      GROUP BY clean_code
+                    ) sub
+                    WHERE items.project_id = ? 
+                      AND items.code = sub.code 
+                      AND (items.location IS NULL OR items.location = '' OR items.location = 'Main Warehouse');
+                """, (proj_id,))
+
+                # Update existing periods
+                con.execute("""
+                    UPDATE periods
+                    SET 
+                      actual = periods.actual + inc.qty_sold,
+                      revenue = periods.revenue + inc.revenue
+                    FROM (
+                      SELECT i.id as item_id, inc_agg.period as norm_period, SUM(inc_agg.qty_sold) as qty_sold, SUM(inc_agg.revenue) as revenue
+                      FROM streaming_sales_agg inc_agg
+                      JOIN items i ON i.project_id = ? AND i.code = inc_agg.clean_code
+                      GROUP BY i.id, inc_agg.period
+                    ) inc
+                    WHERE periods.project_id = ?
+                      AND periods.item_id = inc.item_id
+                      AND periods.date = inc.norm_period;
+                """, (proj_id, proj_id))
+
+                # Insert new periods
+                con.execute("""
+                    INSERT INTO periods (id, project_id, item_id, date, actual, forecast, model, conf_upper, conf_lower, override, promotion, revenue)
+                    SELECT 
+                      uuid()::VARCHAR,
+                      ?,
+                      inc.item_id,
+                      inc.norm_period,
+                      inc.qty_sold,
+                      0.0, 0.0, 0.0, 0.0, NULL, 0.0,
+                      inc.revenue
+                    FROM (
+                      SELECT i.id as item_id, inc_agg.period as norm_period, SUM(inc_agg.qty_sold) as qty_sold, SUM(inc_agg.revenue) as revenue
+                      FROM streaming_sales_agg inc_agg
+                      JOIN items i ON i.project_id = ? AND i.code = inc_agg.clean_code
+                      GROUP BY i.id, inc_agg.period
+                    ) inc
+                    LEFT JOIN periods p 
+                      ON p.project_id = ? 
+                      AND p.item_id = inc.item_id 
+                      AND p.date = inc.norm_period
+                    WHERE p.id IS NULL;
+                """, (proj_id, proj_id, proj_id))
+
+                # Auto-update items demand statistics
+                con.execute("""
+                    UPDATE items
+                    SET 
+                      mean_daily_demand = COALESCE(agg.avg_daily, 0.0),
+                      safety_stock = ROUND(
+                        (CASE WHEN items.service_level >= 0.98 THEN 2.054 WHEN items.service_level >= 0.95 THEN 1.645 ELSE 1.282 END) * 
+                        SQRT(items.lead_time_days * POWER(COALESCE(agg.avg_daily, 0.0) * 0.3, 2) + POWER(COALESCE(agg.avg_daily, 0.0), 2) * POWER(items.lead_time_variance_days, 2))
+                      ),
+                      reorder_point = ROUND(COALESCE(agg.avg_daily, 0.0) * items.lead_time_days + ROUND(
+                        (CASE WHEN items.service_level >= 0.98 THEN 2.054 WHEN items.service_level >= 0.95 THEN 1.645 ELSE 1.282 END) * 
+                        SQRT(items.lead_time_days * POWER(COALESCE(agg.avg_daily, 0.0) * 0.3, 2) + POWER(COALESCE(agg.avg_daily, 0.0), 2) * POWER(items.lead_time_variance_days, 2))
+                      )),
+                      days_of_supply = CASE WHEN COALESCE(agg.avg_daily, 0.0) > 0 THEN ROUND(items.on_hand / agg.avg_daily) ELSE 999.0 END
+                    FROM (
+                      SELECT item_id, (SUM(actual) / GREATEST(COUNT(DISTINCT date), 1)) / 30.0 as avg_daily
+                      FROM periods
+                      WHERE project_id = ?
+                      GROUP BY item_id
+                    ) agg
+                    WHERE items.project_id = ? AND items.id = agg.item_id;
+                """, (proj_id, proj_id))
+
+                con.execute("""
+                    UPDATE items
+                    SET 
+                      days_of_supply = ROUND(items.on_hand / 5.0)
+                    WHERE project_id = ? AND (mean_daily_demand IS NULL OR mean_daily_demand = 0.0);
+                """, (proj_id,))
+
+                con.execute("""
+                    UPDATE items
+                    SET
+                      order_now = CASE 
+                        WHEN (reorder_point - on_hand - on_order + backorders) > 0 
+                        THEN GREATEST((reorder_point - on_hand - on_order + backorders), min_batch)
+                        ELSE 0.0 
+                      END
+                    WHERE project_id = ?;
+                """, (proj_id,))
+
+                con.execute("""
+                    UPDATE items
+                    SET
+                      order_now_value = order_now * purchase_price,
+                      abc_class = CASE 
+                        WHEN (mean_daily_demand * 365.0 * sales_price) >= 25000 THEN 'A'
+                        WHEN (mean_daily_demand * 365.0 * sales_price) >= 8000 THEN 'B'
+                        ELSE 'C'
+                      END,
+                      xyz_class = CASE 
+                        WHEN model_type IN ('constant', 'linear') THEN 'X'
+                        WHEN model_type IN ('intermittent', 'preorder') THEN 'Z'
+                        ELSE 'Y'
+                      END
+                    WHERE project_id = ?;
+                """, (proj_id,))
+
+                con.execute("DROP TABLE IF EXISTS streaming_sales_agg;")
+                save_project_workspace(proj_id)
+
+                items_count = con.execute("SELECT COUNT(*) FROM items WHERE project_id = ?", (proj_id,)).fetchone()[0]
+                periods_count = con.execute("SELECT COUNT(*) FROM periods WHERE project_id = ?", (proj_id,)).fetchone()[0]
+
+                add_ingestion_log(
+                    project_id=proj_id,
+                    source_type="direct_duckdb",
+                    source_name=filename,
+                    data_category="sales",
+                    rows_processed=total_rows,
+                    status="success"
+                )
+                return total_rows, items_count, periods_count
+            finally:
+                con.close()
+    finally:
+        if was_transcoded and os.path.exists(norm_path):
+            try:
+                os.remove(norm_path)
+            except Exception:
+                pass
+
 @app.post("/api/files/import-typed")
 async def import_typed_file(
     file: UploadFile = File(...),
@@ -1914,568 +2382,617 @@ async def import_typed_file(
         proj_id = proj["id"]
 
     try:
-        with _LOCK:
-            con = get_connection()
-            cols, total_rows = load_file_into_staging(con, tmp_path, ext)
-            if total_rows == 0 or not cols:
-                raise HTTPException(status_code=400, detail="The uploaded file contains no data rows.")
+        file_size_mb = os.path.getsize(tmp_path) / (1024 * 1024) if os.path.exists(tmp_path) else 0.0
+        log_ingest_milestone(f"start: file={filename}, size={file_size_mb:.2f}MB, type={import_type}")
 
-            update_job_progress(job_id, 60, "تحميل البيانات إلى محرك DuckDB...", "Loading rows into DuckDB engine...", total_rows=total_rows)
+        if ext == ".csv" and import_type == "sales":
+            rows_processed, items_count, periods_count = _stream_ingest_sales_csv(
+                tmp_path=tmp_path,
+                filename=filename,
+                proj_id=proj_id,
+                merge_mode=merge_mode,
+                mapping=mapping,
+                job_id=job_id
+            )
+        else:
+            with _LOCK:
+                con = get_connection()
+                try:
+                    cols, total_rows = load_file_into_staging(con, tmp_path, ext)
+                    if total_rows == 0 or not cols:
+                        raise HTTPException(status_code=400, detail="The uploaded file contains no data rows.")
 
-            def esc_c(col_name: str) -> str:
-                return col_name.replace('"', '""')
+                    update_job_progress(job_id, 60, "تحميل البيانات إلى محرك DuckDB...", "Loading rows into DuckDB engine...", total_rows=total_rows)
 
-            c_code = _match_column(cols, mapping, "code") or cols[0]
-            c_desc = _match_column(cols, mapping, "description")
-            c_cat = _match_column(cols, mapping, "category")
-            c_loc = _match_column(cols, mapping, "location")
-            c_onhand = _match_column(cols, mapping, "on_hand")
-            c_onorder = _match_column(cols, mapping, "on_order")
-            c_lt = _match_column(cols, mapping, "lead_time_days")
-            c_lt_var = _match_column(cols, mapping, "lead_time_variance_days")
-            c_sl = _match_column(cols, mapping, "service_level")
-            c_moq = _match_column(cols, mapping, "min_batch")
-            c_brou = _match_column(cols, mapping, "batch_rounding")
-            c_cost = _match_column(cols, mapping, "purchase_price")
-            c_price = _match_column(cols, mapping, "sales_price")
-            c_supp = _match_column(cols, mapping, "supplier")
-            c_period = _match_column(cols, mapping, "period")
-            c_qty_sold = _match_column(cols, mapping, "qty_sold")
-            c_revenue = _match_column(cols, mapping, "revenue")
+                    def esc_c(col_name: str) -> str:
+                        return col_name.replace('"', '""')
 
-            update_job_progress(job_id, 75, "مطابقة الأعمدة وتوحيد التواريخ...", "Mapping columns & normalizing dates...", total_rows=total_rows)
+                    c_code = _match_column(cols, mapping, "code")
+                    c_desc = _match_column(cols, mapping, "description")
+                    c_cat = _match_column(cols, mapping, "category")
+                    c_loc = _match_column(cols, mapping, "location")
+                    c_onhand = _match_column(cols, mapping, "on_hand")
+                    c_onorder = _match_column(cols, mapping, "on_order")
+                    c_lt = _match_column(cols, mapping, "lead_time_days")
+                    c_lt_var = _match_column(cols, mapping, "lead_time_variance_days")
+                    c_sl = _match_column(cols, mapping, "service_level")
+                    c_moq = _match_column(cols, mapping, "min_batch")
+                    c_brou = _match_column(cols, mapping, "batch_rounding")
+                    c_cost = _match_column(cols, mapping, "purchase_price")
+                    c_price = _match_column(cols, mapping, "sales_price")
+                    c_supp = _match_column(cols, mapping, "supplier")
+                    c_period = _match_column(cols, mapping, "period")
+                    c_qty_sold = _match_column(cols, mapping, "qty_sold")
+                    c_revenue = _match_column(cols, mapping, "revenue")
 
-            code_col = esc_c(c_code)
-            valid_code_cond = f's."{code_col}" IS NOT NULL AND TRIM(s."{code_col}") != \'\' AND LOWER(TRIM(s."{code_col}")) NOT IN (\'nan\', \'none\', \'null\')'
+                    if import_type == "sales":
+                        if not c_code or not c_period or not c_qty_sold:
+                            missing = []
+                            if not c_code:
+                                missing.append("item_code (كود الصنف)")
+                            if not c_period:
+                                missing.append("date (تاريخ البيع)")
+                            if not c_qty_sold:
+                                missing.append("quantity (الكمية المباعة)")
+                            raise HTTPException(
+                                status_code=400,
+                                detail=f"Missing required sales columns: {', '.join(missing)}. Detected columns: {cols}"
+                            )
+                    else:
+                        if not c_code:
+                            c_code = cols[0]
 
-            update_job_progress(job_id, 88, "تجميع الحركات وتصفية الأصناف...", "Aggregating transactions & filtering SKUs...", rows_processed=total_rows, total_rows=total_rows)
+                    update_job_progress(job_id, 75, "مطابقة الأعمدة وتوحيد التواريخ...", "Mapping columns & normalizing dates...", total_rows=total_rows)
 
-            if import_type == "sales":
-                if merge_mode == "replace":
-                    con.execute("DELETE FROM daily_sales WHERE project_id = ?", (proj_id,))
-                    con.execute("DELETE FROM periods WHERE project_id = ?", (proj_id,))
+                    code_col = esc_c(c_code)
+                    clean_code_sql = f"regexp_replace(TRIM(s.\"{code_col}\"), '^([0-9]+)\\.0+$', '\\1')"
+                    valid_code_cond = f's."{code_col}" IS NOT NULL AND {clean_code_sql} != \'\' AND LOWER({clean_code_sql}) NOT IN (\'nan\', \'none\', \'null\')'
 
-                loc_sql = f'COALESCE(NULLIF(TRIM(s."{esc_c(c_loc)}"), \'\'), \'Main Warehouse\')' if c_loc else "'Main Warehouse'"
-                qty_sql = f'COALESCE(TRY_CAST(s."{esc_c(c_qty_sold)}" AS DOUBLE), 0.0)' if c_qty_sold else '0.0'
-                rev_sql = f'COALESCE(TRY_CAST(s."{esc_c(c_revenue)}" AS DOUBLE), 0.0)' if c_revenue else '0.0'
+                    update_job_progress(job_id, 88, "تجميع الحركات وتصفية الأصناف...", "Aggregating transactions & filtering SKUs...", rows_processed=total_rows, total_rows=total_rows)
 
-                if c_period:
-                    p_col = esc_c(c_period)
-                    raw_d = f's."{p_col}"'
-                    daily_date_sql = f"""
-                    CASE 
-                      WHEN TRY_CAST({raw_d} AS DATE) IS NOT NULL 
-                        THEN strftime(TRY_CAST({raw_d} AS DATE), '%Y-%m-%d')
-                      WHEN TRY_STRPTIME({raw_d}, '%d/%m/%Y') IS NOT NULL 
-                        THEN strftime(TRY_STRPTIME({raw_d}, '%d/%m/%Y'), '%Y-%m-%d')
-                      WHEN TRY_STRPTIME({raw_d}, '%Y/%m/%d') IS NOT NULL 
-                        THEN strftime(TRY_STRPTIME({raw_d}, '%Y/%m/%d'), '%Y-%m-%d')
-                      WHEN TRY_STRPTIME({raw_d}, '%m/%d/%Y') IS NOT NULL 
-                        THEN strftime(TRY_STRPTIME({raw_d}, '%m/%d/%Y'), '%Y-%m-%d')
-                      WHEN length(trim({raw_d})) = 7 AND substr(trim({raw_d}), 5, 1) IN ('-', '/') 
-                        THEN replace(substr(trim({raw_d}), 1, 7), '/', '-') || '-01'
-                      WHEN TRY_CAST({raw_d} AS DOUBLE) >= 30000 AND TRY_CAST({raw_d} AS DOUBLE) <= 60000 
-                        THEN strftime(DATE '1899-12-30' + (TRY_CAST({raw_d} AS BIGINT)) * INTERVAL 1 DAY, '%Y-%m-%d')
-                      ELSE strftime(CURRENT_DATE, '%Y-%m-%d')
-                    END
-                    """
-                else:
-                    daily_date_sql = "strftime(CURRENT_DATE, '%Y-%m-%d')"
+                    if import_type == "sales":
+                        if merge_mode == "replace":
+                            con.execute("DELETE FROM daily_sales WHERE project_id = ?", (proj_id,))
+                            con.execute("DELETE FROM periods WHERE project_id = ?", (proj_id,))
 
-                norm_period_sql = f"substr({daily_date_sql}, 1, 7)"
+                        loc_sql = f'COALESCE(NULLIF(TRIM(s."{esc_c(c_loc)}"), \'\'), \'Main Warehouse\')' if c_loc else "'Main Warehouse'"
+                        qty_sql = f'COALESCE(TRY_CAST(s."{esc_c(c_qty_sold)}" AS DOUBLE), 0.0)' if c_qty_sold else '0.0'
+                        rev_sql = f'COALESCE(TRY_CAST(s."{esc_c(c_revenue)}" AS DOUBLE), 0.0)' if c_revenue else '0.0'
 
-                # 1. Insert into daily_sales
-                con.execute(f"""
-                    INSERT INTO daily_sales (id, project_id, item_code, location, sale_date, qty_sold, revenue, created_at)
-                    SELECT
-                      uuid()::VARCHAR,
-                      ?,
-                      TRIM(s."{code_col}"),
-                      {loc_sql},
-                      {daily_date_sql},
-                      {qty_sql},
-                      {rev_sql},
-                      strftime(CURRENT_TIMESTAMP, '%Y-%m-%dT%H:%M:%SZ')
-                    FROM staging_raw s
-                    WHERE {valid_code_cond};
-                """, (proj_id,))
+                        if c_period:
+                            p_col = esc_c(c_period)
+                            raw_d = f's."{p_col}"'
+                            daily_date_sql = f"""
+                            CASE 
+                              WHEN TRY_CAST({raw_d} AS DATE) IS NOT NULL 
+                                THEN strftime(TRY_CAST({raw_d} AS DATE), '%Y-%m-%d')
+                              WHEN TRY_STRPTIME({raw_d}, '%d/%m/%Y') IS NOT NULL 
+                                THEN strftime(TRY_STRPTIME({raw_d}, '%d/%m/%Y'), '%Y-%m-%d')
+                              WHEN TRY_STRPTIME({raw_d}, '%Y/%m/%d') IS NOT NULL 
+                                THEN strftime(TRY_STRPTIME({raw_d}, '%Y/%m/%d'), '%Y-%m-%d')
+                              WHEN TRY_STRPTIME({raw_d}, '%m/%d/%Y') IS NOT NULL 
+                                THEN strftime(TRY_STRPTIME({raw_d}, '%m/%d/%Y'), '%Y-%m-%d')
+                              WHEN length(trim({raw_d})) = 7 AND substr(trim({raw_d}), 5, 1) IN ('-', '/') 
+                                THEN replace(substr(trim({raw_d}), 1, 7), '/', '-') || '-01'
+                              WHEN TRY_CAST({raw_d} AS DOUBLE) >= 30000 AND TRY_CAST({raw_d} AS DOUBLE) <= 60000 
+                                THEN strftime(DATE '1899-12-30' + (TRY_CAST({raw_d} AS BIGINT)) * INTERVAL 1 DAY, '%Y-%m-%d')
+                              ELSE strftime(CURRENT_DATE, '%Y-%m-%d')
+                            END
+                            """
+                        else:
+                            daily_date_sql = "strftime(CURRENT_DATE, '%Y-%m-%d')"
 
-                # 2. Auto-create missing items in items
-                con.execute(f"""
-                    INSERT INTO items (
-                      id, project_id, code, description, category, location, channel, supplier,
-                      sales_price, purchase_price, margin, on_hand, on_order, backorders,
-                      lead_time_days, lead_time_variance_days, order_cycle_days, service_level,
-                      min_batch, batch_rounding, model_type, replenishment_strategy,
-                      check_state, approval_state, abc_class, xyz_class,
-                      safety_stock, reorder_point, order_now, order_now_value, days_of_supply,
-                      accuracy, mean_daily_demand, updated_at
-                    )
-                    SELECT
-                      ? || '_' || substr(md5(random()::VARCHAR || TRIM(sub.code)), 1, 8),
-                      ?,
-                      sub.code,
-                      'Item ' || sub.code,
-                      'General',
-                      sub.loc,
-                      'Direct Retail',
-                      'Primary Supplier',
-                      100.0, 50.0, 50.0,
-                      0.0, 0.0, 0.0,
-                      30.0, 5.0, 30.0, 0.95,
-                      1.0, 1.0, 'auto', 'periodic',
-                      'checked', 'unapproved', 'B', 'Y',
-                      0.0, 0.0, 0.0, 0.0, 0.0,
-                      92.0, 0.0,
-                      strftime(CURRENT_TIMESTAMP, '%Y-%m-%dT%H:%M:%SZ')
-                    FROM (
-                      SELECT TRIM(s."{code_col}") as code, MIN({loc_sql}) as loc
-                      FROM staging_raw s
-                      WHERE {valid_code_cond}
-                      GROUP BY TRIM(s."{code_col}")
-                    ) sub
-                    LEFT JOIN items i 
-                      ON i.project_id = ? 
-                      AND i.code = sub.code
-                    WHERE i.code IS NULL;
-                """, (proj_id, proj_id, proj_id))
+                        norm_period_sql = f"substr({daily_date_sql}, 1, 7)"
 
-                # 3. Aggregate periods by (item_id, norm_period)
-                con.execute(f"""
-                    CREATE OR REPLACE TEMP TABLE incoming_sales_agg AS
-                    SELECT 
-                      i.id as item_id,
-                      {norm_period_sql} as norm_period,
-                      SUM({qty_sql}) as actual,
-                      SUM({rev_sql}) as revenue
-                    FROM staging_raw s
-                    JOIN items i ON i.project_id = ? AND i.code = TRIM(s."{code_col}")
-                    WHERE {valid_code_cond}
-                    GROUP BY i.id, {norm_period_sql};
-                """, (proj_id,))
-
-                # Update existing periods if any
-                con.execute("""
-                    UPDATE periods
-                    SET 
-                      actual = periods.actual + inc.actual,
-                      revenue = periods.revenue + inc.revenue
-                    FROM incoming_sales_agg inc
-                    WHERE periods.project_id = ?
-                      AND periods.item_id = inc.item_id
-                      AND periods.date = inc.norm_period;
-                """, (proj_id,))
-
-                # Insert new periods
-                con.execute("""
-                    INSERT INTO periods (id, project_id, item_id, date, actual, forecast, model, conf_upper, conf_lower, override, promotion, revenue)
-                    SELECT 
-                      uuid()::VARCHAR,
-                      ?,
-                      inc.item_id,
-                      inc.norm_period,
-                      inc.actual,
-                      0.0, 0.0, 0.0, 0.0, NULL, 0.0,
-                      inc.revenue
-                    FROM incoming_sales_agg inc
-                    LEFT JOIN periods p 
-                      ON p.project_id = ? 
-                      AND p.item_id = inc.item_id 
-                      AND p.date = inc.norm_period
-                    WHERE p.id IS NULL;
-                """, (proj_id, proj_id))
-
-                # 4. Auto-update items demand statistics
-                con.execute("""
-                    UPDATE items
-                    SET 
-                      mean_daily_demand = COALESCE(agg.avg_daily, 0.0),
-                      safety_stock = ROUND(
-                        (CASE WHEN items.service_level >= 0.98 THEN 2.054 WHEN items.service_level >= 0.95 THEN 1.645 ELSE 1.282 END) * 
-                        SQRT(items.lead_time_days * POWER(COALESCE(agg.avg_daily, 0.0) * 0.3, 2) + POWER(COALESCE(agg.avg_daily, 0.0), 2) * POWER(items.lead_time_variance_days, 2))
-                      ),
-                      reorder_point = ROUND(COALESCE(agg.avg_daily, 0.0) * items.lead_time_days + ROUND(
-                        (CASE WHEN items.service_level >= 0.98 THEN 2.054 WHEN items.service_level >= 0.95 THEN 1.645 ELSE 1.282 END) * 
-                        SQRT(items.lead_time_days * POWER(COALESCE(agg.avg_daily, 0.0) * 0.3, 2) + POWER(COALESCE(agg.avg_daily, 0.0), 2) * POWER(items.lead_time_variance_days, 2))
-                      )),
-                      days_of_supply = CASE WHEN COALESCE(agg.avg_daily, 0.0) > 0 THEN ROUND(items.on_hand / agg.avg_daily) ELSE 999.0 END
-                    FROM (
-                      SELECT item_id, (SUM(actual) / GREATEST(COUNT(DISTINCT date), 1)) / 30.0 as avg_daily
-                      FROM periods
-                      WHERE project_id = ?
-                      GROUP BY item_id
-                    ) agg
-                    WHERE items.project_id = ? AND items.id = agg.item_id;
-                """, (proj_id, proj_id))
-
-                rows_processed = total_rows
-
-            elif import_type == "in_transit":
-                c_ord_no = _match_column(cols, mapping, "order_no")
-                c_dest = _match_column(cols, mapping, "destination") or _match_column(cols, mapping, "location")
-                c_eta = _match_column(cols, mapping, "eta_date")
-                c_supp_col = _match_column(cols, mapping, "supplier")
-                c_carrier = _match_column(cols, mapping, "carrier") or c_supp_col
-                c_origin = _match_column(cols, mapping, "origin") or c_supp_col
-                c_status = _match_column(cols, mapping, "status")
-                c_qty = _match_column(cols, mapping, "quantity") or _match_column(cols, mapping, "qty_sold")
-
-                if merge_mode == "replace":
-                    con.execute("DELETE FROM in_transition WHERE project_id = ?", (proj_id,))
-
-                ord_sql = f'COALESCE(NULLIF(TRIM(s."{esc_c(c_ord_no)}"), \'\'), \'PO-\' || substr(md5(random()::VARCHAR), 1, 6))' if c_ord_no else "'PO-' || substr(md5(random()::VARCHAR), 1, 6)"
-                dest_sql = f'COALESCE(NULLIF(TRIM(s."{esc_c(c_dest)}"), \'\'), \'Main Warehouse\')' if c_dest else "'Main Warehouse'"
-                supp_sql = f'COALESCE(NULLIF(TRIM(s."{esc_c(c_supp_col)}"), \'\'), \'Primary Supplier\')' if c_supp_col else "'Primary Supplier'"
-                origin_sql = f'COALESCE(NULLIF(TRIM(s."{esc_c(c_origin)}"), \'\'), {supp_sql})' if c_origin else supp_sql
-                carrier_sql = f'COALESCE(NULLIF(TRIM(s."{esc_c(c_carrier)}"), \'\'), {supp_sql})' if c_carrier else supp_sql
-                eta_sql = f'COALESCE(NULLIF(TRIM(s."{esc_c(c_eta)}"), \'\'), \'2026-03-30\')' if c_eta else "'2026-03-30'"
-                qty_sql = f'COALESCE(TRY_CAST(s."{esc_c(c_qty)}" AS DOUBLE), 0.0)' if c_qty else '0.0'
-
-                if c_status:
-                    raw_stat = f'LOWER(TRIM(s."{esc_c(c_status)}"))'
-                    status_sql = f"""
-                    CASE {raw_stat}
-                      WHEN 'في البحر' THEN 'on_water'
-                      WHEN 'on water' THEN 'on_water'
-                      WHEN 'on_water' THEN 'on_water'
-                      WHEN 'في الطريق' THEN 'in_transit'
-                      WHEN 'in transit' THEN 'in_transit'
-                      WHEN 'in_transit' THEN 'in_transit'
-                      WHEN 'تخليص جمركي' THEN 'customs_clearance'
-                      WHEN 'customs clearance' THEN 'customs_clearance'
-                      WHEN 'customs' THEN 'customs_clearance'
-                      WHEN 'customs_clearance' THEN 'customs_clearance'
-                      WHEN 'تم الاستلام' THEN 'received'
-                      WHEN 'received' THEN 'received'
-                      WHEN 'تم التسليم' THEN 'delivered'
-                      WHEN 'delivered' THEN 'delivered'
-                      ELSE COALESCE({raw_stat}, 'in_transit')
-                    END
-                    """
-                else:
-                    status_sql = "'in_transit'"
-
-                con.execute(f"""
-                    INSERT INTO in_transition (
-                      id, project_id, item_code, order_no, origin, destination, quantity, eta_date, carrier, status
-                    )
-                    SELECT 
-                      uuid()::VARCHAR,
-                      ?,
-                      TRIM(s."{code_col}"),
-                      {ord_sql},
-                      {origin_sql},
-                      {dest_sql},
-                      {qty_sql},
-                      {eta_sql},
-                      {carrier_sql},
-                      {status_sql}
-                    FROM staging_raw s
-                    WHERE {valid_code_cond};
-                """, (proj_id,))
-
-                # Update on_order in items
-                con.execute("""
-                    UPDATE items
-                    SET on_order = COALESCE(tr.total_transit, 0.0)
-                    FROM (
-                      SELECT item_code, SUM(quantity) as total_transit
-                      FROM in_transition
-                      WHERE project_id = ? AND status NOT IN ('delivered', 'received', 'تم الاستلام', 'تم التسليم')
-                      GROUP BY item_code
-                    ) tr
-                    WHERE items.project_id = ? AND items.code = tr.item_code;
-                """, (proj_id, proj_id))
-
-                rows_processed = total_rows
-
-            else:
-                # Inventory or Combined
-                settings_row = con.execute("SELECT default_service_level, default_lead_time_days, default_order_cycle_days FROM app_settings WHERE id = 'global_settings'").fetchone()
-                def_sl = float(settings_row[0]) if settings_row and settings_row[0] is not None else 0.95
-                def_lt = float(settings_row[1]) if settings_row and settings_row[1] is not None else 30.0
-                def_cycle = float(settings_row[2]) if settings_row and settings_row[2] is not None else 30.0
-                def_lt_var = 5.0
-                def_moq = 1.0
-                def_brou = 1.0
-
-                desc_sql = f'COALESCE(NULLIF(TRIM(s."{esc_c(c_desc)}"), \'\'), \'Item \' || TRIM(s."{code_col}"))' if c_desc else f"'Item ' || TRIM(s.\"{code_col}\")"
-                cat_sql = f'COALESCE(NULLIF(TRIM(s."{esc_c(c_cat)}"), \'\'), \'General\')' if c_cat else "'General'"
-                loc_sql = f'COALESCE(NULLIF(TRIM(s."{esc_c(c_loc)}"), \'\'), \'Main Warehouse\')' if c_loc else "'Main Warehouse'"
-                onhand_sql = f'COALESCE(TRY_CAST(s."{esc_c(c_onhand)}" AS DOUBLE), 0.0)' if c_onhand else '0.0'
-                cost_sql = f'TRY_CAST(s."{esc_c(c_cost)}" AS DOUBLE)' if c_cost else 'NULL'
-                price_sql = f'TRY_CAST(s."{esc_c(c_price)}" AS DOUBLE)' if c_price else 'NULL'
-                onorder_sql = f'TRY_CAST(s."{esc_c(c_onorder)}" AS DOUBLE)' if c_onorder else 'NULL'
-                lt_sql = f'TRY_CAST(s."{esc_c(c_lt)}" AS DOUBLE)' if c_lt else 'NULL'
-                lt_var_sql = f'TRY_CAST(s."{esc_c(c_lt_var)}" AS DOUBLE)' if c_lt_var else 'NULL'
-                sl_sql = f'TRY_CAST(s."{esc_c(c_sl)}" AS DOUBLE)' if c_sl else 'NULL'
-                moq_sql = f'TRY_CAST(s."{esc_c(c_moq)}" AS DOUBLE)' if c_moq else 'NULL'
-                brou_sql = f'TRY_CAST(s."{esc_c(c_brou)}" AS DOUBLE)' if c_brou else 'NULL'
-                supp_sql = f'COALESCE(NULLIF(TRIM(s."{esc_c(c_supp)}"), \'\'), \'Primary Supplier\')' if c_supp else "'Primary Supplier'"
-
-                con.execute(f"""
-                    CREATE OR REPLACE TEMP TABLE staging_inv AS
-                    SELECT 
-                      TRIM(s."{code_col}") as code,
-                      {desc_sql} as description,
-                      {cat_sql} as category,
-                      {loc_sql} as location,
-                      {onhand_sql} as on_hand,
-                      {cost_sql} as raw_cost,
-                      {price_sql} as raw_price,
-                      {onorder_sql} as raw_on_order,
-                      {lt_sql} as raw_lt,
-                      {lt_var_sql} as raw_lt_var,
-                      {sl_sql} as raw_sl,
-                      {moq_sql} as raw_moq,
-                      {brou_sql} as raw_brou,
-                      {supp_sql} as supplier
-                    FROM staging_raw s
-                    WHERE {valid_code_cond};
-                """)
-
-                # Deduplicate staging_inv if file has multiple rows for same SKU
-                con.execute("""
-                    CREATE OR REPLACE TEMP TABLE staging_inv_dedup AS
-                    SELECT 
-                      code,
-                      FIRST(description) as description,
-                      FIRST(category) as category,
-                      FIRST(location) as location,
-                      SUM(on_hand) as on_hand,
-                      FIRST(raw_cost) as raw_cost,
-                      FIRST(raw_price) as raw_price,
-                      SUM(raw_on_order) as raw_on_order,
-                      FIRST(raw_lt) as raw_lt,
-                      FIRST(raw_lt_var) as raw_lt_var,
-                      FIRST(raw_sl) as raw_sl,
-                      FIRST(raw_moq) as raw_moq,
-                      FIRST(raw_brou) as raw_brou,
-                      FIRST(supplier) as supplier
-                    FROM staging_inv
-                    GROUP BY code;
-                """)
-
-                con.execute("""
-                    CREATE OR REPLACE TEMP TABLE sku_transit AS
-                    SELECT item_code, COALESCE(SUM(quantity), 0.0) as transit_qty
-                    FROM in_transition
-                    WHERE project_id = ? AND status NOT IN ('delivered', 'received', 'تم الاستلام', 'تم التسليم')
-                    GROUP BY item_code;
-                """, (proj_id,))
-
-                con.execute("""
-                    CREATE OR REPLACE TEMP TABLE sku_avg_price AS
-                    SELECT i.code, 
-                           CASE WHEN SUM(p.actual) > 0 AND SUM(p.revenue) > 0 
-                                THEN ROUND(SUM(p.revenue) / SUM(p.actual), 2) 
-                                ELSE NULL END as avg_price
-                    FROM periods p
-                    JOIN items i ON p.item_id = i.id
-                    WHERE p.project_id = ?
-                    GROUP BY i.code;
-                """, (proj_id,))
-
-                if merge_mode == "replace":
-                    con.execute("DELETE FROM periods WHERE project_id = ?", (proj_id,))
-                    con.execute("DELETE FROM items WHERE project_id = ?", (proj_id,))
-
-                # Update existing items
-                con.execute("""
-                    UPDATE items
-                    SET
-                      description = COALESCE(stg.description, items.description),
-                      category = COALESCE(stg.category, items.category),
-                      location = COALESCE(stg.location, items.location),
-                      supplier = COALESCE(stg.supplier, items.supplier),
-                      on_hand = COALESCE(stg.on_hand, items.on_hand),
-                      purchase_price = COALESCE(stg.raw_cost, items.purchase_price, 50.0),
-                      sales_price = COALESCE(stg.raw_price, items.sales_price, prc.avg_price, ROUND(COALESCE(stg.raw_cost, items.purchase_price, 50.0) * 1.5, 2), 100.0),
-                      margin = ROUND((COALESCE(stg.raw_price, items.sales_price, prc.avg_price, ROUND(COALESCE(stg.raw_cost, items.purchase_price, 50.0) * 1.5, 2), 100.0) - COALESCE(stg.raw_cost, items.purchase_price, 50.0)) / NULLIF(COALESCE(stg.raw_price, items.sales_price, prc.avg_price, ROUND(COALESCE(stg.raw_cost, items.purchase_price, 50.0) * 1.5, 2), 100.0), 0) * 100.0, 1),
-                      on_order = COALESCE(stg.raw_on_order, tr.transit_qty, items.on_order, 0.0),
-                      lead_time_days = COALESCE(stg.raw_lt, items.lead_time_days, ?),
-                      lead_time_variance_days = COALESCE(stg.raw_lt_var, items.lead_time_variance_days, ?),
-                      service_level = CASE 
-                        WHEN COALESCE(stg.raw_sl, items.service_level, ?) > 1.0 
-                        THEN COALESCE(stg.raw_sl, items.service_level, ?) / 100.0 
-                        ELSE COALESCE(stg.raw_sl, items.service_level, ?) 
-                      END,
-                      min_batch = COALESCE(stg.raw_moq, items.min_batch, ?),
-                      batch_rounding = COALESCE(stg.raw_brou, items.batch_rounding, ?),
-                      updated_at = strftime(CURRENT_TIMESTAMP, '%Y-%m-%dT%H:%M:%SZ')
-                    FROM staging_inv_dedup stg
-                    LEFT JOIN sku_transit tr ON tr.item_code = stg.code
-                    LEFT JOIN sku_avg_price prc ON prc.code = stg.code
-                    WHERE items.project_id = ? AND items.code = stg.code;
-                """, (def_lt, def_lt_var, def_sl, def_sl, def_sl, def_moq, def_brou, proj_id))
-
-                # Insert new items
-                con.execute("""
-                    INSERT INTO items (
-                      id, project_id, code, description, category, location, channel, supplier,
-                      sales_price, purchase_price, margin, on_hand, on_order, backorders,
-                      lead_time_days, lead_time_variance_days, order_cycle_days, service_level,
-                      min_batch, batch_rounding, model_type, replenishment_strategy,
-                      check_state, approval_state, abc_class, xyz_class,
-                      safety_stock, reorder_point, order_now, order_now_value, days_of_supply,
-                      accuracy, mean_daily_demand, updated_at
-                    )
-                    SELECT
-                      ? || '_' || substr(md5(random()::VARCHAR || stg.code), 1, 8),
-                      ?,
-                      stg.code,
-                      stg.description,
-                      stg.category,
-                      stg.location,
-                      'Direct Retail',
-                      stg.supplier,
-                      COALESCE(stg.raw_price, prc.avg_price, ROUND(COALESCE(stg.raw_cost, 50.0) * 1.5, 2), 100.0) as sales_price,
-                      COALESCE(stg.raw_cost, 50.0) as purchase_price,
-                      ROUND((COALESCE(stg.raw_price, prc.avg_price, ROUND(COALESCE(stg.raw_cost, 50.0) * 1.5, 2), 100.0) - COALESCE(stg.raw_cost, 50.0)) / NULLIF(COALESCE(stg.raw_price, prc.avg_price, ROUND(COALESCE(stg.raw_cost, 50.0) * 1.5, 2), 100.0), 0) * 100.0, 1) as margin,
-                      COALESCE(stg.on_hand, 0.0),
-                      COALESCE(stg.raw_on_order, tr.transit_qty, 0.0) as on_order,
-                      0.0,
-                      COALESCE(stg.raw_lt, ?),
-                      COALESCE(stg.raw_lt_var, ?),
-                      ?,
-                      CASE WHEN COALESCE(stg.raw_sl, ?) > 1.0 THEN COALESCE(stg.raw_sl, ?) / 100.0 ELSE COALESCE(stg.raw_sl, ?) END,
-                      COALESCE(stg.raw_moq, ?),
-                      COALESCE(stg.raw_brou, ?),
-                      'auto', 'periodic',
-                      'checked', 'unapproved', 'B', 'Y',
-                      0.0, 0.0, 0.0, 0.0, 0.0,
-                      95.0, 0.0,
-                      strftime(CURRENT_TIMESTAMP, '%Y-%m-%dT%H:%M:%SZ')
-                    FROM staging_inv_dedup stg
-                    LEFT JOIN sku_transit tr ON tr.item_code = stg.code
-                    LEFT JOIN sku_avg_price prc ON prc.code = stg.code
-                    LEFT JOIN items i ON i.project_id = ? AND i.code = stg.code
-                    WHERE i.id IS NULL;
-                """, (
-                    proj_id, proj_id,
-                    def_lt, def_lt_var, def_cycle,
-                    def_sl, def_sl, def_sl,
-                    def_moq, def_brou,
-                    proj_id
-                ))
-
-                # If combined, unpivot time series columns into periods
-                if import_type == "combined":
-                    period_cols = [c for c in cols if any(yr in c for yr in ["2024", "2025", "2026", "2027"]) or any(m in c.lower() for m in ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"])]
-                    if period_cols:
-                        escaped_pcols = ", ".join(f'"{esc_c(c)}"' for c in period_cols)
+                        # 1. Insert into daily_sales
                         con.execute(f"""
+                            INSERT INTO daily_sales (id, project_id, item_code, location, sale_date, qty_sold, revenue, created_at)
+                            SELECT
+                              uuid()::VARCHAR,
+                              ?,
+                              {clean_code_sql},
+                              {loc_sql},
+                              {daily_date_sql},
+                              {qty_sql},
+                              {rev_sql},
+                              strftime(CURRENT_TIMESTAMP, '%Y-%m-%dT%H:%M:%SZ')
+                            FROM staging_raw s
+                            WHERE {valid_code_cond};
+                        """, (proj_id,))
+
+                        # 2. Auto-create missing items in items
+                        con.execute(f"""
+                            INSERT INTO items (
+                              id, project_id, code, description, category, location, channel, supplier,
+                              sales_price, purchase_price, margin, on_hand, on_order, backorders,
+                              lead_time_days, lead_time_variance_days, order_cycle_days, service_level,
+                              min_batch, batch_rounding, model_type, replenishment_strategy,
+                              check_state, approval_state, abc_class, xyz_class,
+                              safety_stock, reorder_point, order_now, order_now_value, days_of_supply,
+                              accuracy, mean_daily_demand, updated_at
+                            )
+                            SELECT
+                              ? || '_' || substr(md5(random()::VARCHAR || TRIM(sub.code)), 1, 8),
+                              ?,
+                              sub.code,
+                              'Item ' || sub.code,
+                              'General',
+                              sub.loc,
+                              'Direct Retail',
+                              'Primary Supplier',
+                              100.0, 50.0, 50.0,
+                              0.0, 0.0, 0.0,
+                              30.0, 5.0, 30.0, 0.95,
+                              1.0, 1.0, 'auto', 'periodic',
+                              'checked', 'unapproved', 'B', 'Y',
+                              0.0, 0.0, 0.0, 0.0, 0.0,
+                              92.0, 0.0,
+                              strftime(CURRENT_TIMESTAMP, '%Y-%m-%dT%H:%M:%SZ')
+                            FROM (
+                              SELECT {clean_code_sql} as code, MIN({loc_sql}) as loc
+                              FROM staging_raw s
+                              WHERE {valid_code_cond}
+                              GROUP BY {clean_code_sql}
+                            ) sub
+                            LEFT JOIN items i 
+                              ON i.project_id = ? 
+                              AND i.code = sub.code
+                            WHERE i.code IS NULL;
+                        """, (proj_id, proj_id, proj_id))
+
+                        # If existing items had default/empty location, update with branch from incoming sales
+                        con.execute(f"""
+                            UPDATE items
+                            SET location = sub.loc
+                            FROM (
+                              SELECT {clean_code_sql} as code, MIN({loc_sql}) as loc
+                              FROM staging_raw s
+                              WHERE {valid_code_cond} AND {loc_sql} IS NOT NULL AND {loc_sql} != 'Main Warehouse' AND {loc_sql} != ''
+                              GROUP BY {clean_code_sql}
+                            ) sub
+                            WHERE items.project_id = ? 
+                              AND items.code = sub.code 
+                              AND (items.location IS NULL OR items.location = '' OR items.location = 'Main Warehouse');
+                        """, (proj_id,))
+
+                        # 3. Aggregate periods by (item_id, norm_period)
+                        con.execute(f"""
+                            CREATE OR REPLACE TEMP TABLE incoming_sales_agg AS
+                            SELECT 
+                              i.id as item_id,
+                              {norm_period_sql} as norm_period,
+                              SUM({qty_sql}) as actual,
+                              SUM({rev_sql}) as revenue
+                            FROM staging_raw s
+                            JOIN items i ON i.project_id = ? AND i.code = {clean_code_sql}
+                            WHERE {valid_code_cond}
+                            GROUP BY i.id, {norm_period_sql};
+                        """, (proj_id,))
+
+                        # Update existing periods if any
+                        con.execute("""
+                            UPDATE periods
+                            SET 
+                              actual = periods.actual + inc.actual,
+                              revenue = periods.revenue + inc.revenue
+                            FROM incoming_sales_agg inc
+                            WHERE periods.project_id = ?
+                              AND periods.item_id = inc.item_id
+                              AND periods.date = inc.norm_period;
+                        """, (proj_id,))
+
+                        # Insert new periods
+                        con.execute("""
                             INSERT INTO periods (id, project_id, item_id, date, actual, forecast, model, conf_upper, conf_lower, override, promotion, revenue)
                             SELECT 
                               uuid()::VARCHAR,
                               ?,
-                              i.id,
-                              unp.name,
-                              COALESCE(TRY_CAST(unp.value AS DOUBLE), 0.0),
+                              inc.item_id,
+                              inc.norm_period,
+                              inc.actual,
                               0.0, 0.0, 0.0, 0.0, NULL, 0.0,
-                              0.0
-                            FROM (
-                              SELECT TRIM(s."{code_col}") as code, name, value
-                              FROM staging_raw s
-                              UNPIVOT (value FOR name IN ({escaped_pcols}))
-                              WHERE {valid_code_cond} AND value IS NOT NULL
-                            ) unp
-                            JOIN items i ON i.project_id = ? AND i.code = unp.code;
+                              inc.revenue
+                            FROM incoming_sales_agg inc
+                            LEFT JOIN periods p 
+                              ON p.project_id = ? 
+                              AND p.item_id = inc.item_id 
+                              AND p.date = inc.norm_period
+                            WHERE p.id IS NULL;
                         """, (proj_id, proj_id))
 
-                # Update demand statistics for items
-                con.execute("""
-                    UPDATE items
-                    SET 
-                      mean_daily_demand = COALESCE(agg.avg_daily, 5.0),
-                      safety_stock = ROUND(
-                        (CASE WHEN items.service_level >= 0.98 THEN 2.054 WHEN items.service_level >= 0.95 THEN 1.645 ELSE 1.282 END) * 
-                        SQRT(items.lead_time_days * POWER(COALESCE(agg.avg_daily, 5.0) * 0.3, 2) + POWER(COALESCE(agg.avg_daily, 5.0), 2) * POWER(items.lead_time_variance_days, 2))
-                      ),
-                      reorder_point = ROUND(COALESCE(agg.avg_daily, 5.0) * items.lead_time_days + ROUND(
-                        (CASE WHEN items.service_level >= 0.98 THEN 2.054 WHEN items.service_level >= 0.95 THEN 1.645 ELSE 1.282 END) * 
-                        SQRT(items.lead_time_days * POWER(COALESCE(agg.avg_daily, 5.0) * 0.3, 2) + POWER(COALESCE(agg.avg_daily, 5.0), 2) * POWER(items.lead_time_variance_days, 2))
-                      )),
-                      days_of_supply = CASE WHEN COALESCE(agg.avg_daily, 5.0) > 0 THEN ROUND(items.on_hand / COALESCE(agg.avg_daily, 5.0)) ELSE 999.0 END
-                    FROM (
-                      SELECT item_id, (SUM(actual) / GREATEST(COUNT(DISTINCT date), 1)) / 30.0 as avg_daily
-                      FROM periods
-                      WHERE project_id = ?
-                      GROUP BY item_id
-                    ) agg
-                    WHERE items.project_id = ? AND items.id = agg.item_id;
-                """, (proj_id, proj_id))
+                        # 4. Auto-update items demand statistics
+                        con.execute("""
+                            UPDATE items
+                            SET 
+                              mean_daily_demand = COALESCE(agg.avg_daily, 0.0),
+                              safety_stock = ROUND(
+                                (CASE WHEN items.service_level >= 0.98 THEN 2.054 WHEN items.service_level >= 0.95 THEN 1.645 ELSE 1.282 END) * 
+                                SQRT(items.lead_time_days * POWER(COALESCE(agg.avg_daily, 0.0) * 0.3, 2) + POWER(COALESCE(agg.avg_daily, 0.0), 2) * POWER(items.lead_time_variance_days, 2))
+                              ),
+                              reorder_point = ROUND(COALESCE(agg.avg_daily, 0.0) * items.lead_time_days + ROUND(
+                                (CASE WHEN items.service_level >= 0.98 THEN 2.054 WHEN items.service_level >= 0.95 THEN 1.645 ELSE 1.282 END) * 
+                                SQRT(items.lead_time_days * POWER(COALESCE(agg.avg_daily, 0.0) * 0.3, 2) + POWER(COALESCE(agg.avg_daily, 0.0), 2) * POWER(items.lead_time_variance_days, 2))
+                              )),
+                              days_of_supply = CASE WHEN COALESCE(agg.avg_daily, 0.0) > 0 THEN ROUND(items.on_hand / agg.avg_daily) ELSE 999.0 END
+                            FROM (
+                              SELECT item_id, (SUM(actual) / GREATEST(COUNT(DISTINCT date), 1)) / 30.0 as avg_daily
+                              FROM periods
+                              WHERE project_id = ?
+                              GROUP BY item_id
+                            ) agg
+                            WHERE items.project_id = ? AND items.id = agg.item_id;
+                        """, (proj_id, proj_id))
 
-                con.execute("""
-                    UPDATE items
-                    SET 
-                      mean_daily_demand = 5.0,
-                      safety_stock = ROUND(
-                        (CASE WHEN items.service_level >= 0.98 THEN 2.054 WHEN items.service_level >= 0.95 THEN 1.645 ELSE 1.282 END) * 
-                        SQRT(items.lead_time_days * POWER(1.5, 2) + POWER(5.0, 2) * POWER(items.lead_time_variance_days, 2))
-                      ),
-                      reorder_point = ROUND(5.0 * items.lead_time_days + ROUND(
-                        (CASE WHEN items.service_level >= 0.98 THEN 2.054 WHEN items.service_level >= 0.95 THEN 1.645 ELSE 1.282 END) * 
-                        SQRT(items.lead_time_days * POWER(1.5, 2) + POWER(5.0, 2) * POWER(items.lead_time_variance_days, 2))
-                      )),
-                      days_of_supply = ROUND(items.on_hand / 5.0)
-                    WHERE project_id = ? AND (mean_daily_demand IS NULL OR mean_daily_demand = 0.0);
-                """, (proj_id,))
+                        rows_processed = total_rows
 
-                con.execute("""
-                    UPDATE items
-                    SET
-                      order_now = CASE 
-                        WHEN (reorder_point - on_hand - on_order + backorders) > 0 
-                        THEN GREATEST((reorder_point - on_hand - on_order + backorders), min_batch)
-                        ELSE 0.0 
-                      END
-                    WHERE project_id = ?;
-                """, (proj_id,))
+                    elif import_type == "in_transit":
+                        c_ord_no = _match_column(cols, mapping, "order_no")
+                        c_dest = _match_column(cols, mapping, "destination") or _match_column(cols, mapping, "location")
+                        c_eta = _match_column(cols, mapping, "eta_date")
+                        c_supp_col = _match_column(cols, mapping, "supplier")
+                        c_carrier = _match_column(cols, mapping, "carrier") or c_supp_col
+                        c_origin = _match_column(cols, mapping, "origin") or c_supp_col
+                        c_status = _match_column(cols, mapping, "status")
+                        c_qty = _match_column(cols, mapping, "quantity") or _match_column(cols, mapping, "qty_sold")
 
-                con.execute("""
-                    UPDATE items
-                    SET
-                      order_now_value = order_now * purchase_price,
-                      abc_class = CASE 
-                        WHEN (mean_daily_demand * 365.0 * sales_price) >= 25000 THEN 'A'
-                        WHEN (mean_daily_demand * 365.0 * sales_price) >= 8000 THEN 'B'
-                        ELSE 'C'
-                      END,
-                      xyz_class = CASE 
-                        WHEN model_type IN ('constant', 'linear') THEN 'X'
-                        WHEN model_type IN ('intermittent', 'preorder') THEN 'Z'
-                        ELSE 'Y'
-                      END
-                    WHERE project_id = ?;
-                """, (proj_id,))
+                        if merge_mode == "replace":
+                            con.execute("DELETE FROM in_transition WHERE project_id = ?", (proj_id,))
 
-                rows_processed = total_rows
+                        ord_sql = f'COALESCE(NULLIF(TRIM(s."{esc_c(c_ord_no)}"), \'\'), \'PO-\' || substr(md5(random()::VARCHAR), 1, 6))' if c_ord_no else "'PO-' || substr(md5(random()::VARCHAR), 1, 6)"
+                        dest_sql = f'COALESCE(NULLIF(TRIM(s."{esc_c(c_dest)}"), \'\'), \'Main Warehouse\')' if c_dest else "'Main Warehouse'"
+                        supp_sql = f'COALESCE(NULLIF(TRIM(s."{esc_c(c_supp_col)}"), \'\'), \'Primary Supplier\')' if c_supp_col else "'Primary Supplier'"
+                        origin_sql = f'COALESCE(NULLIF(TRIM(s."{esc_c(c_origin)}"), \'\'), {supp_sql})' if c_origin else supp_sql
+                        carrier_sql = f'COALESCE(NULLIF(TRIM(s."{esc_c(c_carrier)}"), \'\'), {supp_sql})' if c_carrier else supp_sql
+                        eta_sql = f'COALESCE(NULLIF(TRIM(s."{esc_c(c_eta)}"), \'\'), \'2026-03-30\')' if c_eta else "'2026-03-30'"
+                        qty_sql = f'COALESCE(TRY_CAST(s."{esc_c(c_qty)}" AS DOUBLE), 0.0)' if c_qty else '0.0'
 
-            update_job_progress(job_id, 96, "حفظ البيانات وتأمين قاعدة البيانات...", "Saving workspace & running CHECKPOINT...", rows_processed=total_rows, total_rows=total_rows)
+                        if c_status:
+                            raw_stat = f'LOWER(TRIM(s."{esc_c(c_status)}"))'
+                            status_sql = f"""
+                            CASE {raw_stat}
+                              WHEN 'في البحر' THEN 'on_water'
+                              WHEN 'on water' THEN 'on_water'
+                              WHEN 'on_water' THEN 'on_water'
+                              WHEN 'في الطريق' THEN 'in_transit'
+                              WHEN 'in transit' THEN 'in_transit'
+                              WHEN 'in_transit' THEN 'in_transit'
+                              WHEN 'تخليص جمركي' THEN 'customs_clearance'
+                              WHEN 'customs clearance' THEN 'customs_clearance'
+                              WHEN 'customs' THEN 'customs_clearance'
+                              WHEN 'customs_clearance' THEN 'customs_clearance'
+                              WHEN 'تم الاستلام' THEN 'received'
+                              WHEN 'received' THEN 'received'
+                              WHEN 'تم التسليم' THEN 'delivered'
+                              WHEN 'delivered' THEN 'delivered'
+                              ELSE COALESCE({raw_stat}, 'in_transit')
+                            END
+                            """
+                        else:
+                            status_sql = "'in_transit'"
 
-            # Mirror to persistent project tables & flush checkpoint
-            save_project_workspace(proj_id)
+                        con.execute(f"""
+                            INSERT INTO in_transition (
+                              id, project_id, item_code, order_no, origin, destination, quantity, eta_date, carrier, status
+                            )
+                            SELECT 
+                              uuid()::VARCHAR,
+                              ?,
+                              {clean_code_sql},
+                              {ord_sql},
+                              {origin_sql},
+                              {dest_sql},
+                              {qty_sql},
+                              {eta_sql},
+                              {carrier_sql},
+                              {status_sql}
+                            FROM staging_raw s
+                            WHERE {valid_code_cond};
+                        """, (proj_id,))
 
-            # Drop temp tables
-            con.execute("DROP TABLE IF EXISTS staging_raw;")
-            con.execute("DROP TABLE IF EXISTS staging_inv;")
-            con.execute("DROP TABLE IF EXISTS staging_inv_dedup;")
-            con.execute("DROP TABLE IF EXISTS incoming_sales_agg;")
-            con.execute("DROP TABLE IF EXISTS sku_transit;")
-            con.execute("DROP TABLE IF EXISTS sku_avg_price;")
+                        # Update on_order in items
+                        con.execute("""
+                            UPDATE items
+                            SET on_order = COALESCE(tr.total_transit, 0.0)
+                            FROM (
+                              SELECT item_code, SUM(quantity) as total_transit
+                              FROM in_transition
+                              WHERE project_id = ? AND status NOT IN ('delivered', 'received', 'تم الاستلام', 'تم التسليم')
+                              GROUP BY item_code
+                            ) tr
+                            WHERE items.project_id = ? AND items.code = tr.item_code;
+                        """, (proj_id, proj_id))
 
-            items_count = con.execute("SELECT COUNT(*) FROM items WHERE project_id = ?", (proj_id,)).fetchone()[0]
-            periods_count = con.execute("SELECT COUNT(*) FROM periods WHERE project_id = ?", (proj_id,)).fetchone()[0]
+                        rows_processed = total_rows
 
-            add_ingestion_log(
-                project_id=proj_id,
-                source_type="direct_duckdb",
-                source_name=filename,
-                data_category=import_type,
-                rows_processed=rows_processed,
-                status="success"
-            )
+                    else:
+                        # Inventory or Combined
+                        settings_row = con.execute("SELECT default_service_level, default_lead_time_days, default_order_cycle_days FROM app_settings WHERE id = 'global_settings'").fetchone()
+                        def_sl = float(settings_row[0]) if settings_row and settings_row[0] is not None else 0.95
+                        def_lt = float(settings_row[1]) if settings_row and settings_row[1] is not None else 30.0
+                        def_cycle = float(settings_row[2]) if settings_row and settings_row[2] is not None else 30.0
+                        def_lt_var = 5.0
+                        def_moq = 1.0
+                        def_brou = 1.0
+
+                        desc_sql = f'COALESCE(NULLIF(TRIM(s."{esc_c(c_desc)}"), \'\'), \'Item \' || {clean_code_sql})' if c_desc else f"'Item ' || {clean_code_sql}"
+                        cat_sql = f'COALESCE(NULLIF(TRIM(s."{esc_c(c_cat)}"), \'\'), \'General\')' if c_cat else "'General'"
+                        loc_sql = f'COALESCE(NULLIF(TRIM(s."{esc_c(c_loc)}"), \'\'), \'Main Warehouse\')' if c_loc else "'Main Warehouse'"
+                        onhand_sql = f'COALESCE(TRY_CAST(s."{esc_c(c_onhand)}" AS DOUBLE), 0.0)' if c_onhand else '0.0'
+                        cost_sql = f'TRY_CAST(s."{esc_c(c_cost)}" AS DOUBLE)' if c_cost else 'NULL'
+                        price_sql = f'TRY_CAST(s."{esc_c(c_price)}" AS DOUBLE)' if c_price else 'NULL'
+                        onorder_sql = f'TRY_CAST(s."{esc_c(c_onorder)}" AS DOUBLE)' if c_onorder else 'NULL'
+                        lt_sql = f'TRY_CAST(s."{esc_c(c_lt)}" AS DOUBLE)' if c_lt else 'NULL'
+                        lt_var_sql = f'TRY_CAST(s."{esc_c(c_lt_var)}" AS DOUBLE)' if c_lt_var else 'NULL'
+                        sl_sql = f'TRY_CAST(s."{esc_c(c_sl)}" AS DOUBLE)' if c_sl else 'NULL'
+                        moq_sql = f'TRY_CAST(s."{esc_c(c_moq)}" AS DOUBLE)' if c_moq else 'NULL'
+                        brou_sql = f'TRY_CAST(s."{esc_c(c_brou)}" AS DOUBLE)' if c_brou else 'NULL'
+                        supp_sql = f'COALESCE(NULLIF(TRIM(s."{esc_c(c_supp)}"), \'\'), \'Primary Supplier\')' if c_supp else "'Primary Supplier'"
+
+                        con.execute(f"""
+                            CREATE OR REPLACE TEMP TABLE staging_inv AS
+                            SELECT 
+                              {clean_code_sql} as code,
+                              {desc_sql} as description,
+                              {cat_sql} as category,
+                              {loc_sql} as location,
+                              {onhand_sql} as on_hand,
+                              {cost_sql} as raw_cost,
+                              {price_sql} as raw_price,
+                              {onorder_sql} as raw_on_order,
+                              {lt_sql} as raw_lt,
+                              {lt_var_sql} as raw_lt_var,
+                              {sl_sql} as raw_sl,
+                              {moq_sql} as raw_moq,
+                              {brou_sql} as raw_brou,
+                              {supp_sql} as supplier
+                            FROM staging_raw s
+                            WHERE {valid_code_cond};
+                        """)
+
+                        # Deduplicate staging_inv if file has multiple rows for same SKU
+                        con.execute("""
+                            CREATE OR REPLACE TEMP TABLE staging_inv_dedup AS
+                            SELECT 
+                              code,
+                              FIRST(description) as description,
+                              FIRST(category) as category,
+                              FIRST(location) as location,
+                              SUM(on_hand) as on_hand,
+                              FIRST(raw_cost) as raw_cost,
+                              FIRST(raw_price) as raw_price,
+                              SUM(raw_on_order) as raw_on_order,
+                              FIRST(raw_lt) as raw_lt,
+                              FIRST(raw_lt_var) as raw_lt_var,
+                              FIRST(raw_sl) as raw_sl,
+                              FIRST(raw_moq) as raw_moq,
+                              FIRST(raw_brou) as raw_brou,
+                              FIRST(supplier) as supplier
+                            FROM staging_inv
+                            GROUP BY code;
+                        """)
+
+                        con.execute("""
+                            CREATE OR REPLACE TEMP TABLE sku_transit AS
+                            SELECT item_code, COALESCE(SUM(quantity), 0.0) as transit_qty
+                            FROM in_transition
+                            WHERE project_id = ? AND status NOT IN ('delivered', 'received', 'تم الاستلام', 'تم التسليم')
+                            GROUP BY item_code;
+                        """, (proj_id,))
+
+                        con.execute("""
+                            CREATE OR REPLACE TEMP TABLE sku_avg_price AS
+                            SELECT i.code, 
+                                   CASE WHEN SUM(p.actual) > 0 AND SUM(p.revenue) > 0 
+                                        THEN ROUND(SUM(p.revenue) / SUM(p.actual), 2) 
+                                        ELSE NULL END as avg_price
+                            FROM periods p
+                            JOIN items i ON p.item_id = i.id
+                            WHERE p.project_id = ?
+                            GROUP BY i.code;
+                        """, (proj_id,))
+
+                        if merge_mode == "replace":
+                            con.execute("DELETE FROM periods WHERE project_id = ?", (proj_id,))
+                            con.execute("DELETE FROM items WHERE project_id = ?", (proj_id,))
+
+                        # Update existing items
+                        con.execute("""
+                            UPDATE items
+                            SET
+                              description = COALESCE(stg.description, items.description),
+                              category = COALESCE(stg.category, items.category),
+                              location = COALESCE(stg.location, items.location),
+                              supplier = COALESCE(stg.supplier, items.supplier),
+                              on_hand = COALESCE(stg.on_hand, items.on_hand),
+                              purchase_price = COALESCE(stg.raw_cost, items.purchase_price, 50.0),
+                              sales_price = COALESCE(stg.raw_price, items.sales_price, prc.avg_price, ROUND(COALESCE(stg.raw_cost, items.purchase_price, 50.0) * 1.5, 2), 100.0),
+                              margin = ROUND((COALESCE(stg.raw_price, items.sales_price, prc.avg_price, ROUND(COALESCE(stg.raw_cost, items.purchase_price, 50.0) * 1.5, 2), 100.0) - COALESCE(stg.raw_cost, items.purchase_price, 50.0)) / NULLIF(COALESCE(stg.raw_price, items.sales_price, prc.avg_price, ROUND(COALESCE(stg.raw_cost, items.purchase_price, 50.0) * 1.5, 2), 100.0), 0) * 100.0, 1),
+                              on_order = COALESCE(stg.raw_on_order, tr.transit_qty, items.on_order, 0.0),
+                              lead_time_days = COALESCE(stg.raw_lt, items.lead_time_days, ?),
+                              lead_time_variance_days = COALESCE(stg.raw_lt_var, items.lead_time_variance_days, ?),
+                              service_level = CASE 
+                                WHEN COALESCE(stg.raw_sl, items.service_level, ?) > 1.0 
+                                THEN COALESCE(stg.raw_sl, items.service_level, ?) / 100.0 
+                                ELSE COALESCE(stg.raw_sl, items.service_level, ?) 
+                              END,
+                              min_batch = COALESCE(stg.raw_moq, items.min_batch, ?),
+                              batch_rounding = COALESCE(stg.raw_brou, items.batch_rounding, ?),
+                              updated_at = strftime(CURRENT_TIMESTAMP, '%Y-%m-%dT%H:%M:%SZ')
+                            FROM staging_inv_dedup stg
+                            LEFT JOIN sku_transit tr ON tr.item_code = stg.code
+                            LEFT JOIN sku_avg_price prc ON prc.code = stg.code
+                            WHERE items.project_id = ? AND items.code = stg.code;
+                        """, (def_lt, def_lt_var, def_sl, def_sl, def_sl, def_moq, def_brou, proj_id))
+
+                        # Insert new items
+                        con.execute("""
+                            INSERT INTO items (
+                              id, project_id, code, description, category, location, channel, supplier,
+                              sales_price, purchase_price, margin, on_hand, on_order, backorders,
+                              lead_time_days, lead_time_variance_days, order_cycle_days, service_level,
+                              min_batch, batch_rounding, model_type, replenishment_strategy,
+                              check_state, approval_state, abc_class, xyz_class,
+                              safety_stock, reorder_point, order_now, order_now_value, days_of_supply,
+                              accuracy, mean_daily_demand, updated_at
+                            )
+                            SELECT
+                              ? || '_' || substr(md5(random()::VARCHAR || stg.code), 1, 8),
+                              ?,
+                              stg.code,
+                              stg.description,
+                              stg.category,
+                              stg.location,
+                              'Direct Retail',
+                              stg.supplier,
+                              COALESCE(stg.raw_price, prc.avg_price, ROUND(COALESCE(stg.raw_cost, 50.0) * 1.5, 2), 100.0) as sales_price,
+                              COALESCE(stg.raw_cost, 50.0) as purchase_price,
+                              ROUND((COALESCE(stg.raw_price, prc.avg_price, ROUND(COALESCE(stg.raw_cost, 50.0) * 1.5, 2), 100.0) - COALESCE(stg.raw_cost, 50.0)) / NULLIF(COALESCE(stg.raw_price, prc.avg_price, ROUND(COALESCE(stg.raw_cost, 50.0) * 1.5, 2), 100.0), 0) * 100.0, 1) as margin,
+                              COALESCE(stg.on_hand, 0.0),
+                              COALESCE(stg.raw_on_order, tr.transit_qty, 0.0) as on_order,
+                              0.0,
+                              COALESCE(stg.raw_lt, ?),
+                              COALESCE(stg.raw_lt_var, ?),
+                              ?,
+                              CASE WHEN COALESCE(stg.raw_sl, ?) > 1.0 THEN COALESCE(stg.raw_sl, ?) / 100.0 ELSE COALESCE(stg.raw_sl, ?) END,
+                              COALESCE(stg.raw_moq, ?),
+                              COALESCE(stg.raw_brou, ?),
+                              'auto', 'periodic',
+                              'checked', 'unapproved', 'B', 'Y',
+                              0.0, 0.0, 0.0, 0.0, 0.0,
+                              95.0, 0.0,
+                              strftime(CURRENT_TIMESTAMP, '%Y-%m-%dT%H:%M:%SZ')
+                            FROM staging_inv_dedup stg
+                            LEFT JOIN sku_transit tr ON tr.item_code = stg.code
+                            LEFT JOIN sku_avg_price prc ON prc.code = stg.code
+                            LEFT JOIN items i ON i.project_id = ? AND i.code = stg.code
+                            WHERE i.id IS NULL;
+                        """, (
+                            proj_id, proj_id,
+                            def_lt, def_lt_var, def_cycle,
+                            def_sl, def_sl, def_sl,
+                            def_moq, def_brou,
+                            proj_id
+                        ))
+
+                        # If combined, unpivot time series columns into periods
+                        if import_type == "combined":
+                            period_cols = [c for c in cols if any(yr in c for yr in ["2024", "2025", "2026", "2027"]) or any(m in c.lower() for m in ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"])]
+                            if period_cols:
+                                escaped_pcols = ", ".join(f'"{esc_c(c)}"' for c in period_cols)
+                                con.execute(f"""
+                                    INSERT INTO periods (id, project_id, item_id, date, actual, forecast, model, conf_upper, conf_lower, override, promotion, revenue)
+                                    SELECT 
+                                      uuid()::VARCHAR,
+                                      ?,
+                                      i.id,
+                                      unp.name,
+                                      COALESCE(TRY_CAST(unp.value AS DOUBLE), 0.0),
+                                      0.0, 0.0, 0.0, 0.0, NULL, 0.0,
+                                      0.0
+                                    FROM (
+                                      SELECT {clean_code_sql} as code, name, value
+                                      FROM staging_raw s
+                                      UNPIVOT (value FOR name IN ({escaped_pcols}))
+                                      WHERE {valid_code_cond} AND value IS NOT NULL
+                                    ) unp
+                                    JOIN items i ON i.project_id = ? AND i.code = unp.code;
+                                """, (proj_id, proj_id))
+
+                        # Update demand statistics for items
+                        con.execute("""
+                            UPDATE items
+                            SET 
+                              mean_daily_demand = COALESCE(agg.avg_daily, 5.0),
+                              safety_stock = ROUND(
+                                (CASE WHEN items.service_level >= 0.98 THEN 2.054 WHEN items.service_level >= 0.95 THEN 1.645 ELSE 1.282 END) * 
+                                SQRT(items.lead_time_days * POWER(COALESCE(agg.avg_daily, 5.0) * 0.3, 2) + POWER(COALESCE(agg.avg_daily, 5.0), 2) * POWER(items.lead_time_variance_days, 2))
+                              ),
+                              reorder_point = ROUND(COALESCE(agg.avg_daily, 5.0) * items.lead_time_days + ROUND(
+                                (CASE WHEN items.service_level >= 0.98 THEN 2.054 WHEN items.service_level >= 0.95 THEN 1.645 ELSE 1.282 END) * 
+                                SQRT(items.lead_time_days * POWER(COALESCE(agg.avg_daily, 5.0) * 0.3, 2) + POWER(COALESCE(agg.avg_daily, 5.0), 2) * POWER(items.lead_time_variance_days, 2))
+                              )),
+                              days_of_supply = CASE WHEN COALESCE(agg.avg_daily, 5.0) > 0 THEN ROUND(items.on_hand / COALESCE(agg.avg_daily, 5.0)) ELSE 999.0 END
+                            FROM (
+                              SELECT item_id, (SUM(actual) / GREATEST(COUNT(DISTINCT date), 1)) / 30.0 as avg_daily
+                              FROM periods
+                              WHERE project_id = ?
+                              GROUP BY item_id
+                            ) agg
+                            WHERE items.project_id = ? AND items.id = agg.item_id;
+                        """, (proj_id, proj_id))
+
+                        con.execute("""
+                            UPDATE items
+                            SET 
+                              mean_daily_demand = 5.0,
+                              safety_stock = ROUND(
+                                (CASE WHEN items.service_level >= 0.98 THEN 2.054 WHEN items.service_level >= 0.95 THEN 1.645 ELSE 1.282 END) * 
+                                SQRT(items.lead_time_days * POWER(1.5, 2) + POWER(5.0, 2) * POWER(items.lead_time_variance_days, 2))
+                              ),
+                              reorder_point = ROUND(5.0 * items.lead_time_days + ROUND(
+                                (CASE WHEN items.service_level >= 0.98 THEN 2.054 WHEN items.service_level >= 0.95 THEN 1.645 ELSE 1.282 END) * 
+                                SQRT(items.lead_time_days * POWER(1.5, 2) + POWER(5.0, 2) * POWER(items.lead_time_variance_days, 2))
+                              )),
+                              days_of_supply = ROUND(items.on_hand / 5.0)
+                            WHERE project_id = ? AND (mean_daily_demand IS NULL OR mean_daily_demand = 0.0);
+                        """, (proj_id,))
+
+                        con.execute("""
+                            UPDATE items
+                            SET
+                              order_now = CASE 
+                                WHEN (reorder_point - on_hand - on_order + backorders) > 0 
+                                THEN GREATEST((reorder_point - on_hand - on_order + backorders), min_batch)
+                                ELSE 0.0 
+                              END
+                            WHERE project_id = ?;
+                        """, (proj_id,))
+
+                        con.execute("""
+                            UPDATE items
+                            SET
+                              order_now_value = order_now * purchase_price,
+                              abc_class = CASE 
+                                WHEN (mean_daily_demand * 365.0 * sales_price) >= 25000 THEN 'A'
+                                WHEN (mean_daily_demand * 365.0 * sales_price) >= 8000 THEN 'B'
+                                ELSE 'C'
+                              END,
+                              xyz_class = CASE 
+                                WHEN model_type IN ('constant', 'linear') THEN 'X'
+                                WHEN model_type IN ('intermittent', 'preorder') THEN 'Z'
+                                ELSE 'Y'
+                              END
+                            WHERE project_id = ?;
+                        """, (proj_id,))
+
+                        rows_processed = total_rows
+
+                    update_job_progress(job_id, 96, "حفظ البيانات وتأمين قاعدة البيانات...", "Saving workspace & running CHECKPOINT...", rows_processed=total_rows, total_rows=total_rows)
+
+                    # Mirror to persistent project tables & flush checkpoint
+                    save_project_workspace(proj_id)
+
+                    # Drop temp tables
+                    con.execute("DROP TABLE IF EXISTS staging_raw;")
+                    con.execute("DROP TABLE IF EXISTS staging_inv;")
+                    con.execute("DROP TABLE IF EXISTS staging_inv_dedup;")
+                    con.execute("DROP TABLE IF EXISTS incoming_sales_agg;")
+                    con.execute("DROP TABLE IF EXISTS sku_transit;")
+                    con.execute("DROP TABLE IF EXISTS sku_avg_price;")
+
+                    items_count = con.execute("SELECT COUNT(*) FROM items WHERE project_id = ?", (proj_id,)).fetchone()[0]
+                    periods_count = con.execute("SELECT COUNT(*) FROM periods WHERE project_id = ?", (proj_id,)).fetchone()[0]
+
+                    add_ingestion_log(
+                        project_id=proj_id,
+                        source_type="direct_duckdb",
+                        source_name=filename,
+                        data_category=import_type,
+                        rows_processed=rows_processed,
+                        status="success"
+                    )
+                finally:
+                    con.close()
     except HTTPException as he:
         update_job_progress(job_id, 100, "حدث خطأ أثناء الاستيراد", f"Import failed: {he.detail}", status="error", error=he.detail)
         raise
@@ -2490,14 +3007,24 @@ async def import_typed_file(
                 pass
 
     elapsed = round(time.perf_counter() - start_time, 3)
+    log_ingest_milestone(f"done: ingestion completed in {elapsed:.3f}s with {rows_processed} rows processed")
     update_job_progress(job_id, 100, "اكتمل الاستيراد بنجاح!", "Import completed successfully!", rows_processed=rows_processed, total_rows=rows_processed, status="done")
+    
+    warning_msg = None
+    if import_type == "sales" and periods_count == 0:
+        warning_msg = "No sales periods were saved. Please check column mappings and date formats."
+
     return {
         "success": True,
         "project_id": proj_id,
         "import_type": import_type,
+        "rows_scanned": rows_processed,
         "rows_processed": rows_processed,
+        "periods_saved": periods_count,
+        "items_affected": items_count,
         "items_upserted": items_count,
         "periods_upserted": periods_count,
+        "warning": warning_msg,
         "elapsed_seconds": elapsed,
         "message": f"Successfully ingested {rows_processed:,} rows into DuckDB in {elapsed}s."
     }
@@ -2691,7 +3218,7 @@ async def import_from_local_db(
             proj = create_new_project(p_name, f"Imported from local {table_name}", os.path.basename(file.filename))
             proj_id = proj["id"]
 
-        cols = [str(c).strip() for c in df.columns]
+        cols = [_clean_header_name(c) for c in df.columns]
         mapping: Dict[str, str] = {}
         if column_mapping:
             try:
@@ -2711,7 +3238,7 @@ async def import_from_local_db(
 
         items_data = []
         for _, row in df.iterrows():
-            code = str(row.get(c_code, "")).strip()
+            code = clean_item_code(row.get(c_code, ""))
             if not code or code.lower() in ["nan", "none"]:
                 continue
             items_data.append({
@@ -2878,7 +3405,7 @@ def preview_external_url(
     if df.empty:
         raise HTTPException(status_code=400, detail="The remote response contains no data records.")
 
-    cols = [str(c).strip() for c in df.columns]
+    cols = [_clean_header_name(c) for c in df.columns]
     return {
         "success": True,
         "url": clean_url,
@@ -2938,7 +3465,7 @@ def import_from_external_url(
         proj = create_new_project(p_name, f"Web feed from {clean_url[:40]}...", "REST Feed")
         proj_id = proj["id"]
 
-    cols = [str(c).strip() for c in df.columns]
+    cols = [_clean_header_name(c) for c in df.columns]
     mapping: Dict[str, str] = {}
     if column_mapping:
         try:
@@ -2958,7 +3485,7 @@ def import_from_external_url(
 
     items_data = []
     for _, row in df.iterrows():
-        code = str(row.get(c_code, "")).strip()
+        code = clean_item_code(row.get(c_code, ""))
         if not code or code.lower() in ["nan", "none"]:
             continue
         items_data.append({
@@ -3057,12 +3584,37 @@ async def inspect_file_endpoint(
                 escaped = norm_path.replace("\\", "/").replace("'", "''")
                 with _LOCK:
                     con = get_connection()
-                    con.execute(f"CREATE OR REPLACE TEMP TABLE staging_inspect AS SELECT * FROM read_csv_auto('{escaped}', all_varchar=true, strict_mode=false, null_padding=true, ignore_errors=true, sample_size=-1);")
-                    cols = [d[0] for d in con.execute("DESCRIBE staging_inspect").fetchall()]
-                    row_count = con.execute("SELECT COUNT(*) FROM staging_inspect").fetchone()[0]
-                    preview_data = con.execute("SELECT * FROM staging_inspect LIMIT 5").fetchall()
-                    preview_rows = [dict(zip(cols, [val if val is not None else "" for val in row])) for row in preview_data]
-                    con.execute("DROP TABLE IF EXISTS staging_inspect;")
+                    try:
+                        # Strictly bounded inspection: sample up to 1,000 rows to discover columns and preview
+                        con.execute(f"""
+                            CREATE OR REPLACE TEMP TABLE staging_inspect AS 
+                            SELECT * FROM read_csv_auto('{escaped}', all_varchar=true, null_padding=true, ignore_errors=true, sample_size=1000)
+                            LIMIT 1000;
+                        """)
+                        cols = [_clean_header_name(d[0]) for d in con.execute("DESCRIBE staging_inspect").fetchall()]
+                        sample_count = con.execute("SELECT COUNT(*) FROM staging_inspect").fetchone()[0]
+                        preview_data = con.execute("SELECT * FROM staging_inspect LIMIT 5").fetchall()
+                        preview_rows = [dict(zip(cols, [val if val is not None else "" for val in row])) for row in preview_data]
+                        con.execute("DROP TABLE IF EXISTS staging_inspect;")
+
+                        if sample_count < 1000:
+                            row_count = sample_count
+                        else:
+                            # Estimate total rows without scanning entire 5M-row file during preview
+                            try:
+                                fsize = os.path.getsize(norm_path)
+                                with open(norm_path, "rb") as bf:
+                                    chunk = bf.read(64 * 1024)
+                                    nl_count = chunk.count(b"\n")
+                                    if nl_count > 0:
+                                        avg_line = len(chunk) / nl_count
+                                        row_count = max(sample_count, int(fsize / avg_line) - 1)
+                                    else:
+                                        row_count = sample_count
+                            except Exception:
+                                row_count = sample_count
+                    finally:
+                        con.close()
             finally:
                 if was_transcoded and os.path.exists(norm_path):
                     try:
@@ -3078,7 +3630,7 @@ async def inspect_file_endpoint(
             sheet = wb.get_sheet_by_name(sheets[0])
             rows = sheet.to_python()
             if rows:
-                cols = [str(c).strip() if c is not None else f"col_{i}" for i, c in enumerate(rows[0])]
+                cols = [_clean_header_name(c) if c is not None else f"col_{i}" for i, c in enumerate(rows[0])]
                 row_count = max(0, len(rows) - 1)
                 preview_rows = []
                 for r in rows[1:6]:

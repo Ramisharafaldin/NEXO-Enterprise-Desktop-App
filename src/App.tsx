@@ -13,7 +13,7 @@ import {
   mean
 } from './engine/math';
 import { Language, translations } from './i18n/translations';
-import { DEFAULT_APP_SETTINGS, formatCurrency, getCurrencySymbol } from './utils/formatters';
+import { DEFAULT_APP_SETTINGS, formatCurrency, getCurrencySymbol, formatItemCode } from './utils/formatters';
 import { NavigationRail, MainTabId } from './components/NavigationRail';
 import { TopMenuBar } from './components/TopMenuBar';
 import { UpdateBanner } from './components/UpdateBanner';
@@ -381,7 +381,7 @@ export const App: React.FC = () => {
     } catch {
       // Fallback client-side XLSX generation
       const invData = items.map(i => ({
-        'Item Code': i.code,
+        'Item Code': formatItemCode(i.code),
         'Description': i.description,
         'Category': i.category,
         'Location': i.location,
