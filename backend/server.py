@@ -63,10 +63,7 @@ import shutil
 import csv
 import codecs
 from pathlib import Path
-try:
-    from python_calamine import CalamineWorkbook
-except Exception:
-    CalamineWorkbook = None
+import openpyxl
 from typing import Dict, List, Any, Optional, Tuple, Union
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Query, Response, Request
 from fastapi.middleware.cors import CORSMiddleware

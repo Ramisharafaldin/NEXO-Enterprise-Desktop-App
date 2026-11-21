@@ -1385,21 +1385,34 @@ def get_project_items_paginated(
 
             full_filter_sql = " AND ".join(filter_clauses)
 
-            # 4. Total count matching current filters
-            count_query = f"""
-                SELECT COUNT(*)
-                FROM items i
-                LEFT JOIN (
-                    SELECT item_id, COALESCE(SUM(actual), 0.0) as total_sales
-                    FROM periods
-                    WHERE project_id = ?
-                    GROUP BY item_id
-                ) p ON i.id = p.item_id
-                WHERE {full_filter_sql}
-            """
-            count_row = con.execute(count_query, [project_id] + filter_params).fetchone()
-            total_count = int(count_row[0] or 0) if count_row else 0
-            total_pages = max(1, math.ceil(total_count / page_size))
+            # 4. Total count matching current filters (re-use summary_counts when no search/category)
+            if not search and not category:
+                if ft in ("to_buy", "toorder"):
+                    total_count = summary_counts["to_buy"]
+                elif ft in ("stockout_risk", "stockout"):
+                    total_count = summary_counts["stockout_risk"]
+                elif ft == "overstock":
+                    total_count = summary_counts["overstock"]
+                elif ft in ("in_transit", "transition"):
+                    total_count = summary_counts["in_transit"]
+                else:
+                    total_count = summary_counts["all"]
+                total_pages = max(1, math.ceil(total_count / page_size))
+            else:
+                count_query = f"""
+                    SELECT COUNT(*)
+                    FROM items i
+                    LEFT JOIN (
+                        SELECT item_id, COALESCE(SUM(actual), 0.0) as total_sales
+                        FROM periods
+                        WHERE project_id = ?
+                        GROUP BY item_id
+                    ) p ON i.id = p.item_id
+                    WHERE {full_filter_sql}
+                """
+                count_row = con.execute(count_query, [project_id] + filter_params).fetchone()
+                total_count = int(count_row[0] or 0) if count_row else 0
+                total_pages = max(1, math.ceil(total_count / page_size))
 
             # 5. Fetch ONLY the requested page slice
             items_query = f"""
@@ -1972,33 +1985,34 @@ def bulk_upsert_in_transit(project_id: str, records: List[Dict[str, Any]], merge
             con.close()
 
 def compute_project_kpis(project_id: str, location: Optional[str] = None) -> Dict[str, Any]:
-    """Computes real aggregate supply chain KPIs dynamically from DuckDB, excluding dormant SKUs (0 stock & 0 sales), optionally filtered by branch."""
+    """Computes real aggregate supply chain KPIs dynamically from DuckDB in a single SQL pass, excluding dormant SKUs (0 stock & 0 sales), optionally filtered by branch."""
     with _LOCK:
         con = get_connection()
         try:
-            dormant_count = get_project_dormant_count(project_id, location=location)
             is_loc_filter = bool(location and location.strip() and location.strip().upper() != "ALL")
             loc_val = location.strip() if is_loc_filter else None
 
-            where_clause = "i.project_id = ? AND (COALESCE(i.on_hand, 0) > 0 OR COALESCE(p.total_sales, 0) > 0)"
+            base_where = "i.project_id = ?"
             params = [project_id, project_id]
             if is_loc_filter:
-                where_clause += " AND LOWER(TRIM(i.location)) = LOWER(TRIM(?))"
+                base_where += " AND LOWER(TRIM(i.location)) = LOWER(TRIM(?))"
                 params.append(loc_val)
 
-            # Query aggregates only from active, analyzable items
+            # Query all aggregates (including dormant and active orders counts) in ONE single pass
             row = con.execute(f"""
                 SELECT 
-                    COUNT(*) as total_skus,
-                    COALESCE(SUM(i.on_hand * COALESCE(NULLIF(i.purchase_price, 0.0), i.sales_price, 0.0)), 0.0) as total_inventory_value,
-                    COALESCE(SUM(i.order_now * COALESCE(NULLIF(i.purchase_price, 0.0), i.sales_price, 0.0)), 0.0) as total_order_value,
-                    SUM(CASE WHEN i.days_of_supply > 90 THEN (i.days_of_supply - 90) * (i.purchase_price * i.mean_daily_demand) ELSE 0 END) as total_overstock,
-                    SUM(CASE WHEN i.days_of_supply < 14 THEN (14 - i.days_of_supply) * (i.sales_price * i.mean_daily_demand) ELSE 0 END) as total_stockout_loss,
-                    SUM(CASE WHEN i.model_type = 'zero' THEN i.on_hand * i.purchase_price ELSE 0 END) as total_dead_inv,
-                    AVG(i.accuracy) as avg_accuracy,
-                    AVG(i.days_of_supply) as avg_days_supply,
-                    SUM(i.mean_daily_demand * 365 * i.sales_price) as projected_annual_revenue,
-                    SUM(i.mean_daily_demand * 365 * i.purchase_price) as projected_annual_cogs
+                    COUNT(CASE WHEN (COALESCE(i.on_hand, 0) > 0 OR COALESCE(p.total_sales, 0) > 0) THEN 1 END) as total_skus,
+                    COALESCE(SUM(CASE WHEN (COALESCE(i.on_hand, 0) > 0 OR COALESCE(p.total_sales, 0) > 0) THEN i.on_hand * COALESCE(NULLIF(i.purchase_price, 0.0), i.sales_price, 0.0) ELSE 0 END), 0.0) as total_inventory_value,
+                    COALESCE(SUM(CASE WHEN (COALESCE(i.on_hand, 0) > 0 OR COALESCE(p.total_sales, 0) > 0) THEN i.order_now * COALESCE(NULLIF(i.purchase_price, 0.0), i.sales_price, 0.0) ELSE 0 END), 0.0) as total_order_value,
+                    SUM(CASE WHEN (COALESCE(i.on_hand, 0) > 0 OR COALESCE(p.total_sales, 0) > 0) AND i.days_of_supply > 90 THEN (i.days_of_supply - 90) * (i.purchase_price * i.mean_daily_demand) ELSE 0 END) as total_overstock,
+                    SUM(CASE WHEN (COALESCE(i.on_hand, 0) > 0 OR COALESCE(p.total_sales, 0) > 0) AND i.days_of_supply < 14 THEN (14 - i.days_of_supply) * (i.sales_price * i.mean_daily_demand) ELSE 0 END) as total_stockout_loss,
+                    SUM(CASE WHEN (COALESCE(i.on_hand, 0) > 0 OR COALESCE(p.total_sales, 0) > 0) AND i.model_type = 'zero' THEN i.on_hand * i.purchase_price ELSE 0 END) as total_dead_inv,
+                    AVG(CASE WHEN (COALESCE(i.on_hand, 0) > 0 OR COALESCE(p.total_sales, 0) > 0) THEN i.accuracy ELSE NULL END) as avg_accuracy,
+                    AVG(CASE WHEN (COALESCE(i.on_hand, 0) > 0 OR COALESCE(p.total_sales, 0) > 0) THEN i.days_of_supply ELSE NULL END) as avg_days_supply,
+                    SUM(CASE WHEN (COALESCE(i.on_hand, 0) > 0 OR COALESCE(p.total_sales, 0) > 0) THEN i.mean_daily_demand * 365 * i.sales_price ELSE 0 END) as projected_annual_revenue,
+                    SUM(CASE WHEN (COALESCE(i.on_hand, 0) > 0 OR COALESCE(p.total_sales, 0) > 0) THEN i.mean_daily_demand * 365 * i.purchase_price ELSE 0 END) as projected_annual_cogs,
+                    COUNT(CASE WHEN (COALESCE(i.on_hand, 0) > 0 OR COALESCE(p.total_sales, 0) > 0) AND i.order_now > 0 THEN 1 END) as active_orders_count,
+                    COUNT(CASE WHEN COALESCE(i.on_hand, 0) <= 0 AND COALESCE(p.total_sales, 0) <= 0 THEN 1 END) as dormant_count
                 FROM items i
                 LEFT JOIN (
                     SELECT item_id, COALESCE(SUM(actual), 0.0) as total_sales
@@ -2006,7 +2020,7 @@ def compute_project_kpis(project_id: str, location: Optional[str] = None) -> Dic
                     WHERE project_id = ?
                     GROUP BY item_id
                 ) p ON i.id = p.item_id
-                WHERE {where_clause}
+                WHERE {base_where}
             """, params).fetchone()
 
             total_skus = row[0] or 0
@@ -2019,23 +2033,11 @@ def compute_project_kpis(project_id: str, location: Optional[str] = None) -> Dic
             avg_dos = float(row[7] or 0)
             revenue = float(row[8] or 0)
             cogs = float(row[9] or 0)
+            active_orders_count = row[10] or 0
+            dormant_count = row[11] or 0
 
             margin_pct = ((revenue - cogs) / revenue * 100.0) if revenue > 0 else 0.0
             turns = (cogs / inv_val) if inv_val > 0 else 0.0
-
-            active_orders_row = con.execute(f"""
-                SELECT COUNT(*)
-                FROM items i
-                LEFT JOIN (
-                    SELECT item_id, COALESCE(SUM(actual), 0.0) as total_sales
-                    FROM periods
-                    WHERE project_id = ?
-                    GROUP BY item_id
-                ) p ON i.id = p.item_id
-                WHERE {where_clause}
-                  AND i.order_now > 0
-            """, params).fetchone()
-            active_orders_count = active_orders_row[0] if active_orders_row else 0
 
             return {
                 "totalSkus": total_skus,

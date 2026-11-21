@@ -768,7 +768,7 @@ SKU_RAGGED_3,طابعة ليزر "HP",مخزن الإسكندرية
         inspect_data = r_inspect_cp1256.json()
         assert len(inspect_data['columns']) >= 3
 
-        # Verify Direct XLSX ingestion without temp CSV conversion
+        # Verify Direct XLSX ingestion via pure-Python openpyxl streaming
         xlsx_buffer = io.BytesIO()
         df_excel_test = pd.DataFrame([
             {"CODE": "SKU_XLSX_1", "DESC": "Direct Excel Item 1", "ONHA": 25.0, "COST": 120.0},
@@ -780,14 +780,22 @@ SKU_RAGGED_3,طابعة ليزر "HP",مخزن الإسكندرية
 
         r_xlsx = await client.post(
             '/api/files/import-typed',
-            files={'file': ('direct_calamine.xlsx', xlsx_bytes, 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')},
+            files={'file': ('openpyxl_streaming.xlsx', xlsx_bytes, 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')},
             data={'import_type': 'inventory', 'project_id': pid, 'merge_mode': 'merge'}
         )
         assert r_xlsx.status_code == 200, f"Direct XLSX ingestion failed: {r_xlsx.text}"
         assert r_xlsx.json()['success'] is True
         assert r_xlsx.json()['rows_processed'] == 2
 
-        print(f'23. Resilient CSV Parser (Unescaped Quotes, Ragged Cells, CP1256 Arabic) & Direct XLSX Ingestion PASSED')
+        # Verify legacy .xls rejection
+        r_xls = await client.post(
+            '/api/files/inspect',
+            files={'file': ('legacy.xls', b'DUMMY_BIFF8_XLS_CONTENT', 'application/vnd.ms-excel')}
+        )
+        assert r_xls.status_code == 400
+        assert "Legacy binary .xls files are not supported" in r_xls.json()["detail"]
+
+        print(f'23. Resilient CSV Parser (Unescaped Quotes, Ragged Cells, CP1256 Arabic) & Direct Pure-Python XLSX Ingestion PASSED')
 
         # 24. Strict Project Isolation & Zero Demo-Data Contamination Test
         # Step a: Verify a previous project with data exists

@@ -216,7 +216,7 @@ While the platform demonstrates strong engineering foundations—including loopb
 - **Potential Impact**:
   Maliciously crafted Excel spreadsheets opened in the client can trigger prototype pollution or hang the WebView2 renderer thread.
 - **Recommended Defensive Fix**:
-  Since backend Excel ingestion has already been migrated to memory-efficient `python-calamine` and `openpyxl`, eliminate client-side `xlsx` from `package.json` and route all parsing/exporting through the backend API.
+  Since backend Excel ingestion has already been migrated to pure-Python streaming `openpyxl`, eliminate client-side `xlsx` from `package.json` and route all parsing/exporting through the backend API.
 
 ---
 
