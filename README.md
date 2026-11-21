@@ -32,12 +32,11 @@ Open **Command Prompt (`cmd.exe`)** and execute:
 mkdir "%USERPROFILE%\NEXO" 2>nul & cd /d "%USERPROFILE%\NEXO" & curl -L "https://github.com/Ramisharafaldin/NEXO-Enterprise-Desktop-App/archive/refs/heads/main.zip" -o nexo.zip & tar -xf nexo.zip --strip-components=1 & del nexo.zip & setup.bat
 ```
 
-### Option 3: Developer Clone via Git
-```bash
-git clone https://github.com/Ramisharafaldin/NEXO-Enterprise-Desktop-App.git
-cd NEXO-Enterprise-Desktop-App
-.\setup.bat
-```
+### Option 3: Developer Access
+* **Developer:** Rami Sharafaldin
+* **Email:** [r.sharafaldin@gmail.com](mailto:r.sharafaldin@gmail.com)
+
+> To obtain the developer repository link and setup access, please send a request via email.
 
 ---
 
