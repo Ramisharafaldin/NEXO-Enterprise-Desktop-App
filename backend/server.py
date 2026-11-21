@@ -542,8 +542,8 @@ def get_inventory_endpoint(
         include_dormant=include_dormant,
         include_periods=False
     )
-    dormant_count = get_project_dormant_count(pid, location=location)
     kpis = compute_project_kpis(pid, location=location)
+    dormant_count = kpis.get("dormantCount", 0)
     return {
         "project_id": pid,
         "page": paginated["page"],
@@ -1512,8 +1512,8 @@ def load_file_into_staging(con: duckdb.DuckDBPyConnection, file_path: str, ext: 
     """
     Loads uploaded CSV or Excel file directly into DuckDB `staging_raw` temp table.
     Returns (columns_list, total_row_count).
-    Uses DuckDB's C++ read_csv_auto for CSV with encoding normalization, and direct
-    python-calamine in-memory streaming for XLSX/XLS without temp CSV conversion.
+    Uses DuckDB's C++ read_csv_auto for CSV with encoding normalization, and pure-Python
+    openpyxl streaming for XLSX/XLSM with zero unsigned native binaries.
     """
     ext = ext.lower()
     if ext == ".csv":
@@ -1542,66 +1542,99 @@ def load_file_into_staging(con: duckdb.DuckDBPyConnection, file_path: str, ext: 
                     os.remove(norm_path)
                 except Exception:
                     pass
+    elif ext == ".xls":
+        raise HTTPException(
+            status_code=400,
+            detail="Legacy binary .xls files are not supported. Please open the file in Excel and save as modern .xlsx or export to .csv."
+        )
     else:
-        # Excel (.xlsx / .xls) via python-calamine direct in-memory ingestion with openpyxl fallback
-        rows = None
-        if CalamineWorkbook is not None:
+        # Excel (.xlsx / .xlsm) via pure-Python openpyxl streaming to temporary UTF-8-sig CSV
+        temp_csv_path = None
+        try:
+            wb = openpyxl.load_workbook(file_path, read_only=True, data_only=True)
             try:
-                wb = CalamineWorkbook.from_path(file_path)
-                sheet_names = wb.sheet_names
-                if sheet_names:
-                    sheet = wb.get_sheet_by_name(sheet_names[0])
-                    rows = sheet.to_python()
-            except Exception:
-                rows = None
-        if rows is None:
-            import openpyxl
-            wb_op = openpyxl.load_workbook(file_path, read_only=True, data_only=True)
-            ws_op = wb_op.active
-            rows = [[cell for cell in row] for row in ws_op.iter_rows(values_only=True)]
+                sheet_names = wb.sheetnames
+                if not sheet_names:
+                    con.execute("CREATE OR REPLACE TEMP TABLE staging_raw (dummy VARCHAR);")
+                    return [], 0
+                ws = wb[sheet_names[0]]
+                row_iter = ws.iter_rows(values_only=True)
+                raw_headers = next(row_iter, None)
+                if not raw_headers or not any(h is not None and str(h).strip() != "" for h in raw_headers):
+                    con.execute("CREATE OR REPLACE TEMP TABLE staging_raw (dummy VARCHAR);")
+                    return [], 0
 
-        if not rows or len(rows) <= 1:
-            con.execute("CREATE OR REPLACE TEMP TABLE staging_raw (dummy VARCHAR);")
-            return [], 0
-
-        raw_headers = rows[0]
-        col_names = []
-        seen: Dict[str, int] = {}
-        for i, h in enumerate(raw_headers):
-            name = _clean_header_name(h) if h is not None else f"col_{i}"
-            if not name:
-                name = f"col_{i}"
-            if name in seen:
-                seen[name] += 1
-                col_names.append(f"{name}_{seen[name]}")
-            else:
-                seen[name] = 0
-                col_names.append(name)
-
-        num_cols = len(col_names)
-        clean_rows = []
-        for r in rows[1:]:
-            row_len = len(r)
-            clean_row = []
-            for i in range(num_cols):
-                if i < row_len and r[i] is not None:
-                    val = r[i]
-                    if isinstance(val, float) and val.is_integer():
-                        clean_row.append(str(int(val)))
+                col_names = []
+                seen: Dict[str, int] = {}
+                for i, h in enumerate(raw_headers):
+                    name = _clean_header_name(h) if h is not None else f"col_{i}"
+                    if not name:
+                        name = f"col_{i}"
+                    if name in seen:
+                        seen[name] += 1
+                        col_names.append(f"{name}_{seen[name]}")
                     else:
-                        clean_row.append(str(val))
-                else:
-                    clean_row.append(None)
-            clean_rows.append(clean_row)
+                        seen[name] = 0
+                        col_names.append(name)
 
-        df = pd.DataFrame(clean_rows, columns=col_names)
-        con.register("staging_excel_df", df)
-        con.execute("CREATE OR REPLACE TEMP TABLE staging_raw AS SELECT * FROM staging_excel_df;")
-        con.unregister("staging_excel_df")
+                num_cols = len(col_names)
+                with tempfile.NamedTemporaryFile(mode="w", suffix=".csv", delete=False, encoding="utf-8-sig", newline="") as tf:
+                    temp_csv_path = tf.name
+                    writer = csv.writer(tf)
+                    writer.writerow(col_names)
+                    has_rows = False
+                    for r in row_iter:
+                        if not r or not any(c is not None and str(c).strip() != "" for c in r):
+                            continue
+                        clean_row = []
+                        row_len = len(r)
+                        for i in range(num_cols):
+                            if i < row_len and r[i] is not None:
+                                val = r[i]
+                                if isinstance(val, float) and val.is_integer():
+                                    clean_row.append(str(int(val)))
+                                elif isinstance(val, (datetime.date, datetime.datetime)):
+                                    clean_row.append(val.isoformat())
+                                else:
+                                    s_val = str(val).strip()
+                                    # Normalize trailing .0 if integer-like float string
+                                    s_val = re.sub(r"^(\d+)\.0+$", r"\1", s_val)
+                                    clean_row.append(s_val)
+                            else:
+                                clean_row.append("")
+                        writer.writerow(clean_row)
+                        has_rows = True
+            finally:
+                wb.close()
 
-        cols = [_clean_header_name(desc[0]) for desc in con.execute("DESCRIBE staging_raw").fetchall()]
-        count = con.execute("SELECT COUNT(*) FROM staging_raw").fetchone()[0]
-        return cols, count
+            if not has_rows:
+                con.execute("CREATE OR REPLACE TEMP TABLE staging_raw (dummy VARCHAR);")
+                return [], 0
+
+            escaped_csv = temp_csv_path.replace("\\", "/").replace("'", "''")
+            con.execute(f"""
+                CREATE OR REPLACE TEMP TABLE staging_raw AS
+                SELECT * FROM read_csv_auto('{escaped_csv}', all_varchar=true, strict_mode=false, null_padding=true, ignore_errors=true, sample_size=1000);
+            """)
+
+            raw_cols = [desc[0] for desc in con.execute("DESCRIBE staging_raw").fetchall()]
+            cols = [_clean_header_name(c) for c in raw_cols]
+            for rc, cc in zip(raw_cols, cols):
+                if rc != cc:
+                    try:
+                        esc_rc = rc.replace('"', '""')
+                        esc_cc = cc.replace('"', '""')
+                        con.execute(f'ALTER TABLE staging_raw RENAME COLUMN "{esc_rc}" TO "{esc_cc}"')
+                    except Exception:
+                        pass
+            count = con.execute("SELECT COUNT(*) FROM staging_raw").fetchone()[0]
+            return cols, count
+        finally:
+            if temp_csv_path and os.path.exists(temp_csv_path):
+                try:
+                    os.remove(temp_csv_path)
+                except Exception:
+                    pass
 
 def _resolve_lang(lang: Optional[str]) -> str:
     if lang and lang.strip().lower() in ["ar", "en"]:
@@ -3671,35 +3704,51 @@ async def inspect_file_endpoint(
                         os.remove(norm_path)
                     except Exception:
                         pass
+        elif ext == ".xls":
+            raise HTTPException(
+                status_code=400,
+                detail="Legacy binary .xls files are not supported. Please open the file in Excel and save as modern .xlsx or export to .csv."
+            )
         else:
+            # Excel (.xlsx / .xlsm) preview via pure-Python openpyxl bounded to first 1,000 rows
             sheets = []
-            rows = None
-            if CalamineWorkbook is not None:
-                try:
-                    wb = CalamineWorkbook.from_path(tmp_path)
-                    sheets = list(wb.sheet_names)
-                    if sheets:
-                        sheet = wb.get_sheet_by_name(sheets[0])
-                        rows = sheet.to_python()
-                except Exception:
-                    rows = None
-            if rows is None:
-                import openpyxl
-                wb_op = openpyxl.load_workbook(tmp_path, read_only=True, data_only=True)
-                sheets = list(wb_op.sheetnames)
-                ws_op = wb_op.active
-                rows = [[cell for cell in row] for row in ws_op.iter_rows(values_only=True)]
-
-            if rows:
-                cols = [_clean_header_name(c) if c is not None else f"col_{i}" for i, c in enumerate(rows[0])]
-                row_count = max(0, len(rows) - 1)
-                preview_rows = []
-                for r in rows[1:6]:
-                    preview_rows.append({cols[i]: (str(r[i]) if i < len(r) and r[i] is not None else "") for i in range(len(cols))})
-            else:
-                cols = []
-                row_count = 0
-                preview_rows = []
+            cols = []
+            preview_rows = []
+            row_count = 0
+            wb = openpyxl.load_workbook(tmp_path, read_only=True, data_only=True)
+            try:
+                sheets = list(wb.sheetnames)
+                if sheets:
+                    ws = wb[sheets[0]]
+                    row_iter = ws.iter_rows(values_only=True)
+                    header_row = next(row_iter, None)
+                    if header_row:
+                        cols = [_clean_header_name(c) if c is not None else f"col_{i}" for i, c in enumerate(header_row)]
+                        data_rows_read = 0
+                        for r in row_iter:
+                            if not r or not any(c is not None and str(c).strip() != "" for c in r):
+                                continue
+                            data_rows_read += 1
+                            if len(preview_rows) < 5:
+                                p_row = {}
+                                for i in range(len(cols)):
+                                    if i < len(r) and r[i] is not None:
+                                        val = r[i]
+                                        if isinstance(val, float) and val.is_integer():
+                                            p_row[cols[i]] = str(int(val))
+                                        elif isinstance(val, (datetime.date, datetime.datetime)):
+                                            p_row[cols[i]] = val.isoformat()
+                                        else:
+                                            s_val = str(val).strip()
+                                            p_row[cols[i]] = re.sub(r"^(\d+)\.0+$", r"\1", s_val)
+                                    else:
+                                        p_row[cols[i]] = ""
+                                preview_rows.append(p_row)
+                            if data_rows_read >= 1000:
+                                break
+                        row_count = data_rows_read
+            finally:
+                wb.close()
     except HTTPException as he:
         update_job_progress(job_id, 100, "حدث خطأ أثناء فحص الملف", f"Inspection failed: {he.detail}", status="error", error=he.detail)
         raise
