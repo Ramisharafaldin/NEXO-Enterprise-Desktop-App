@@ -5,6 +5,7 @@ Persists projects, items, periods, overrides, model settings, and configurations
 """
 
 import os
+import tempfile
 from pathlib import Path
 import json
 import uuid
@@ -50,6 +51,29 @@ def clean_item_code(val: Any) -> str:
     if not s or s.lower() in ("nan", "none", "null"):
         return ""
     return re.sub(r"^(\d+)\.0+$", r"\1", s)
+
+def normalize_arabic_text(val: Any) -> str:
+    """
+    Normalizes Arabic text variants for unified matching (Issue 3):
+    - Trims leading/trailing whitespace and collapses internal multiple spaces
+    - Normalizes Alef Maqsura ى (\u0649) -> ي (\u064A)
+    - Normalizes Alef variants [أإآٱ] (\u0623, \u0625, \u0622, \u0671) -> ا (\u0627)
+    - Strips Arabic Tatweel ـ (\u0640) and zero-width characters (\u200b, \u200c, \u200d, \ufeff)
+    """
+    if val is None:
+        return ""
+    s = str(val).strip()
+    if not s:
+        return ""
+    # Strip zero-width chars and tatweel
+    s = re.sub(r"[\u200b\u200c\u200d\ufeff\u0640]", "", s)
+    # Normalize Alef variants
+    s = re.sub(r"[أإآٱ]", "\u0627", s)
+    # Normalize Alef Maqsura to Yeh
+    s = s.replace("\u0649", "\u064A")
+    # Collapse multiple whitespace
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
 
 BASE_DIR = Path(__file__).resolve().parent
 DEFAULT_DB_PATH = str(BASE_DIR / "nexo_workspace.duckdb")
@@ -425,6 +449,8 @@ def init_db():
             
             # 10. Startup cleanup: safely strip trailing .0 decimal artifacts from existing projects
             cleanup_trailing_decimal_codes(con)
+            # 11. Startup migration: safely unify Arabic branch spelling (ى -> ي, أ/إ/آ -> ا) across existing projects
+            cleanup_arabic_locations(con)
 
             con.execute("CHECKPOINT;")
 
@@ -552,6 +578,51 @@ def _cleanup_trailing_decimal_codes_locked(con=None):
             """)
         except Exception:
             pass
+    finally:
+        if owns_con:
+            try:
+                con.execute("CHECKPOINT;")
+                con.close()
+            except Exception:
+                pass
+
+def cleanup_arabic_locations(con=None):
+    """
+    Safe, idempotent startup migration routine that unifies Arabic text in stored
+    `location` values across items, project_items, and daily_sales:
+    - Normalizes ى -> ي, أ/إ/آ -> ا
+    - Strips tatweel and zero-width characters
+    - Collapses internal whitespace
+    """
+    with _LOCK:
+        return _cleanup_arabic_locations_locked(con)
+
+def _cleanup_arabic_locations_locked(con=None):
+    owns_con = False
+    if con is None:
+        con = get_connection()
+        owns_con = True
+    try:
+        norm_sql = (
+            "regexp_replace("
+            "replace("
+            "regexp_replace("
+            "regexp_replace(TRIM(CAST({col} AS VARCHAR)), '[\\u200b\\u200c\\u200d\\ufeffـ]', '', 'g'), "
+            "'[أإآٱ]', 'ا', 'g'), "
+            "'ى', 'ي'), "
+            "'\\\\s+', ' ', 'g')"
+        )
+        for tbl, col in [("items", "location"), ("project_items", "location"), ("daily_sales", "location")]:
+            try:
+                sql = f"""
+                    UPDATE {tbl}
+                    SET {col} = {norm_sql.format(col=col)}
+                    WHERE {col} IS NOT NULL AND {col} != ''
+                      AND {col} != {norm_sql.format(col=col)};
+                """
+                con.execute(sql)
+            except Exception:
+                pass
     finally:
         if owns_con:
             try:
@@ -935,7 +1006,7 @@ def create_new_project(name: str, description: str = "", dataset_name: str = "")
         finally:
             con.close()
 
-def save_project_workspace(project_id: str) -> Dict[str, Any]:
+def save_project_workspace(project_id: str, con=None) -> Dict[str, Any]:
     """
     Copies active workspace rows (items, periods, in_transition) into project_items,
     project_periods, project_in_transit for project_id, updates item_count & updated_at,
@@ -943,7 +1014,10 @@ def save_project_workspace(project_id: str) -> Dict[str, Any]:
     """
     now_str = datetime.datetime.utcnow().isoformat()
     with _LOCK:
-        con = get_connection()
+        owns_con = False
+        if con is None:
+            con = get_connection()
+            owns_con = True
         try:
             # 1. Sync items into project_items
             con.execute("DELETE FROM project_items WHERE project_id = ?", (project_id,))
@@ -1019,7 +1093,194 @@ def save_project_workspace(project_id: str) -> Dict[str, Any]:
                 "message": f"Project {project_id} saved and checkpointed to DuckDB successfully."
             }
         finally:
-            con.close()
+            if owns_con:
+                con.close()
+
+def rebuild_periods_and_demand_stats_from_daily_sales(project_id: str, con=None) -> Tuple[int, int]:
+    """
+    Rebuilds periods and recalculates item-level demand & replenishment metrics
+    (mean_daily_demand, safety_stock, reorder_point, days_of_supply, order_now,
+    order_now_value, abc_class, xyz_class) directly from daily_sales.
+    Returns (periods_count, items_count).
+    """
+    with _LOCK:
+        return _rebuild_periods_and_demand_stats_locked(project_id, con)
+
+def _rebuild_periods_and_demand_stats_locked(project_id: str, con=None) -> Tuple[int, int]:
+    owns_con = False
+    if con is None:
+        con = get_connection()
+        owns_con = True
+    try:
+        # 1. Check if daily_sales has any records for this project
+        cnt_check = con.execute("SELECT COUNT(*) FROM daily_sales WHERE project_id = ? AND sale_date IS NOT NULL", (project_id,)).fetchone()
+        if not cnt_check or cnt_check[0] == 0:
+            return 0, 0
+
+        # 2. Determine granularity
+        granularity = "monthly"
+        try:
+            p_row = con.execute("SELECT granularity FROM projects WHERE id = ?", (project_id,)).fetchone()
+            if p_row and p_row[0]:
+                granularity = str(p_row[0]).strip().lower()
+            else:
+                s_row = con.execute("SELECT period_granularity FROM app_settings WHERE id = 'global_settings'").fetchone()
+                if s_row and s_row[0]:
+                    granularity = str(s_row[0]).strip().lower()
+        except Exception:
+            granularity = "monthly"
+
+        if granularity == "daily":
+            date_group_sql = "substr(ds.sale_date, 1, 10)"
+            divisor = 1.0
+        elif granularity == "weekly":
+            date_group_sql = "strftime(date_trunc('week', TRY_CAST(ds.sale_date AS DATE)), '%Y-%m-%d')"
+            divisor = 7.0
+        else: # monthly
+            date_group_sql = "substr(ds.sale_date, 1, 7)"
+            divisor = 30.0
+
+        norm_loc_ds = "regexp_replace(replace(regexp_replace(regexp_replace(TRIM(COALESCE(ds.location, 'Main Warehouse')), '[\\u200b\\u200c\\u200d\\ufeffـ]', '', 'g'), '[أإآٱ]', 'ا', 'g'), 'ى', 'ي'), '\\\\s+', ' ', 'g')"
+        norm_loc_item = "regexp_replace(replace(regexp_replace(regexp_replace(TRIM(COALESCE(i.location, 'Main Warehouse')), '[\\u200b\\u200c\\u200d\\ufeffـ]', '', 'g'), '[أإآٱ]', 'ا', 'g'), 'ى', 'ي'), '\\\\s+', ' ', 'g')"
+
+        # 3. Create temp table of sales aggregated by item_id and period date
+        con.execute(f"""
+            CREATE OR REPLACE TEMP TABLE tmp_rebuild_periods AS
+            WITH matched_sales AS (
+                SELECT 
+                    i.id as item_id,
+                    {date_group_sql} as period_date,
+                    SUM(ds.qty_sold) as actual,
+                    SUM(ds.revenue) as revenue
+                FROM daily_sales ds
+                JOIN items i 
+                  ON i.project_id = ds.project_id 
+                 AND i.code = ds.item_code 
+                 AND ({norm_loc_item} = {norm_loc_ds} OR ds.location IS NULL OR i.location IS NULL OR ds.location = '' OR i.location = '')
+                WHERE ds.project_id = ?
+                  AND ds.sale_date IS NOT NULL
+                  AND ds.sale_date != ''
+                GROUP BY i.id, {date_group_sql}
+            )
+            SELECT * FROM matched_sales WHERE period_date IS NOT NULL;
+        """, (project_id,))
+
+        # 4. Wipe and replace periods for this project from daily_sales
+        con.execute("DELETE FROM periods WHERE project_id = ?", (project_id,))
+        con.execute("""
+            INSERT INTO periods (id, project_id, item_id, date, actual, forecast, model, conf_upper, conf_lower, override, promotion, revenue)
+            SELECT 
+                uuid()::VARCHAR,
+                ?,
+                item_id,
+                period_date,
+                actual,
+                0.0, 0.0, 0.0, 0.0, NULL, 0.0,
+                revenue
+            FROM tmp_rebuild_periods;
+        """, (project_id,))
+
+        p_count = con.execute("SELECT COUNT(*) FROM tmp_rebuild_periods").fetchone()[0]
+
+        # 5. Recalculate item-level demand metrics
+        con.execute(f"""
+            UPDATE items
+            SET 
+              mean_daily_demand = COALESCE(agg.avg_daily, 0.0),
+              safety_stock = ROUND(
+                (CASE WHEN items.service_level >= 0.98 THEN 2.054 WHEN items.service_level >= 0.95 THEN 1.645 ELSE 1.282 END) * 
+                SQRT(items.lead_time_days * POWER(COALESCE(agg.avg_daily, 0.0) * 0.3, 2) + POWER(COALESCE(agg.avg_daily, 0.0), 2) * POWER(items.lead_time_variance_days, 2))
+              ),
+              reorder_point = ROUND(COALESCE(agg.avg_daily, 0.0) * items.lead_time_days + ROUND(
+                (CASE WHEN items.service_level >= 0.98 THEN 2.054 WHEN items.service_level >= 0.95 THEN 1.645 ELSE 1.282 END) * 
+                SQRT(items.lead_time_days * POWER(COALESCE(agg.avg_daily, 0.0) * 0.3, 2) + POWER(COALESCE(agg.avg_daily, 0.0), 2) * POWER(items.lead_time_variance_days, 2))
+              )),
+              days_of_supply = CASE WHEN COALESCE(agg.avg_daily, 0.0) > 0 THEN ROUND(items.on_hand / agg.avg_daily) ELSE 999.0 END
+            FROM (
+              SELECT item_id, (SUM(actual) / GREATEST(COUNT(DISTINCT date), 1)) / {divisor} as avg_daily
+              FROM periods
+              WHERE project_id = ?
+              GROUP BY item_id
+            ) agg
+            WHERE items.project_id = ? AND items.id = agg.item_id;
+        """, (project_id, project_id))
+
+        con.execute("""
+            UPDATE items
+            SET
+              order_now = GREATEST(0.0, ROUND((reorder_point + (mean_daily_demand * order_cycle_days) - (on_hand + on_order)) / NULLIF(min_batch, 0.0)) * min_batch),
+              order_now_value = ROUND(GREATEST(0.0, ROUND((reorder_point + (mean_daily_demand * order_cycle_days) - (on_hand + on_order)) / NULLIF(min_batch, 0.0)) * min_batch) * purchase_price, 2)
+            WHERE project_id = ?;
+        """, (project_id,))
+
+        # 6. Recalculate ABC/XYZ classification
+        con.execute("""
+            CREATE OR REPLACE TEMP TABLE tmp_item_stats AS
+            SELECT 
+                i.id,
+                COALESCE(SUM(p.revenue), SUM(p.actual) * i.sales_price, 0.0) as annual_revenue,
+                CASE 
+                    WHEN COUNT(p.actual) > 1 AND AVG(p.actual) > 0 
+                    THEN STDDEV_POP(p.actual) / AVG(p.actual) 
+                    ELSE 0.0 
+                END as cv
+            FROM items i
+            LEFT JOIN periods p ON p.item_id = i.id AND p.project_id = i.project_id
+            WHERE i.project_id = ?
+            GROUP BY i.id, i.sales_price;
+        """, (project_id,))
+
+        total_rev_row = con.execute("SELECT COALESCE(SUM(annual_revenue), 0.0) FROM tmp_item_stats").fetchone()
+        total_rev = total_rev_row[0] if total_rev_row else 0.0
+
+        if total_rev > 0:
+            con.execute("""
+                CREATE OR REPLACE TEMP TABLE tmp_abc_ranked AS
+                SELECT 
+                    id,
+                    annual_revenue,
+                    cv,
+                    SUM(annual_revenue) OVER (ORDER BY annual_revenue DESC) / ? as cum_share
+                FROM tmp_item_stats;
+            """, (total_rev,))
+
+            con.execute("""
+                UPDATE items
+                SET 
+                    abc_class = CASE 
+                        WHEN r.cum_share <= 0.80 THEN 'A'
+                        WHEN r.cum_share <= 0.95 THEN 'B'
+                        ELSE 'C'
+                    END,
+                    xyz_class = CASE 
+                        WHEN r.cv <= 0.50 THEN 'X'
+                        WHEN r.cv <= 1.00 THEN 'Y'
+                        ELSE 'Z'
+                    END
+                FROM tmp_abc_ranked r
+                WHERE items.project_id = ? AND items.id = r.id;
+            """, (project_id,))
+
+        item_count = con.execute("SELECT COUNT(*) FROM items WHERE project_id = ?", (project_id,)).fetchone()[0]
+
+        con.execute("DROP TABLE IF EXISTS tmp_rebuild_periods;")
+        con.execute("DROP TABLE IF EXISTS tmp_item_stats;")
+        con.execute("DROP TABLE IF EXISTS tmp_abc_ranked;")
+
+        # Save workspace
+        try:
+            save_project_workspace(project_id, con=con)
+        except Exception:
+            pass
+
+        return p_count, item_count
+    finally:
+        if owns_con:
+            try:
+                con.execute("CHECKPOINT;")
+                con.close()
+            except Exception:
+                pass
 
 def activate_project(project_id: str) -> Dict[str, Any]:
     """
@@ -1125,7 +1386,7 @@ def delete_project_by_id(project_id: str):
             con.close()
 
 def get_project_locations(project_id: str) -> List[Dict[str, Any]]:
-    """Returns sorted distinct non-empty locations for a project with SKU counts."""
+    """Returns sorted distinct normalized non-empty locations for a project with SKU counts."""
     with _LOCK:
         con = get_connection()
         try:
@@ -1138,7 +1399,12 @@ def get_project_locations(project_id: str) -> List[Dict[str, Any]]:
                 GROUP BY 1
                 ORDER BY 1 ASC
             """, (project_id,)).fetchall()
-            return [{"location": str(r[0]), "sku_count": int(r[1])} for r in rows if r[0]]
+            loc_map: Dict[str, int] = {}
+            for r in rows:
+                if r[0]:
+                    norm = normalize_arabic_text(r[0]) or "Default WH"
+                    loc_map[norm] = loc_map.get(norm, 0) + int(r[1])
+            return [{"location": loc, "sku_count": count} for loc, count in sorted(loc_map.items())]
         finally:
             con.close()
 
@@ -1187,8 +1453,9 @@ def get_project_items(project_id: str, include_dormant: bool = False, location: 
             where_sql = "project_id = ?"
             params = [project_id]
             if location and location.strip() and location.strip().upper() != "ALL":
-                where_sql += " AND LOWER(TRIM(location)) = LOWER(TRIM(?))"
-                params.append(location.strip())
+                norm_loc = normalize_arabic_text(location.strip())
+                where_sql += " AND regexp_replace(replace(regexp_replace(regexp_replace(TRIM(location), '[\\u200b\\u200c\\u200d\\ufeffـ]', '', 'g'), '[أإآٱ]', 'ا', 'g'), 'ى', 'ي'), '\\\\s+', ' ', 'g') = ?"
+                params.append(norm_loc)
 
             items_df = con.execute(f"SELECT * FROM items WHERE {where_sql} ORDER BY code ASC", params).fetchdf()
             if items_df.empty:
@@ -1322,12 +1589,12 @@ def get_project_items_paginated(
                 base_where += " AND (COALESCE(i.on_hand, 0) > 0 OR COALESCE(p.total_sales, 0) > 0)"
 
             is_loc_filter = bool(location and location.strip() and location.strip().upper() != "ALL")
-            loc_val = location.strip() if is_loc_filter else None
+            loc_val = normalize_arabic_text(location.strip()) if is_loc_filter else None
 
             summary_where = base_where
             summary_params: List[Any] = [project_id] + list(base_params)
             if is_loc_filter:
-                summary_where += " AND LOWER(TRIM(i.location)) = LOWER(TRIM(?))"
+                summary_where += " AND regexp_replace(replace(regexp_replace(regexp_replace(TRIM(i.location), '[\\u200b\\u200c\\u200d\\ufeffـ]', '', 'g'), '[أإآٱ]', 'ا', 'g'), 'ى', 'ي'), '\\\\s+', ' ', 'g') = ?"
                 summary_params.append(loc_val)
 
             # 2. Compute summary_counts across all analyzable items in project (and branch) via fast SQL
@@ -1366,7 +1633,7 @@ def get_project_items_paginated(
                 filter_params.extend([s, s, s, s])
 
             if is_loc_filter:
-                filter_clauses.append("LOWER(TRIM(i.location)) = LOWER(TRIM(?))")
+                filter_clauses.append("regexp_replace(replace(regexp_replace(regexp_replace(TRIM(i.location), '[\\u200b\\u200c\\u200d\\ufeffـ]', '', 'g'), '[أإآٱ]', 'ا', 'g'), 'ى', 'ي'), '\\\\s+', ' ', 'g') = ?")
                 filter_params.append(loc_val)
 
             if category and category.strip():
@@ -1990,12 +2257,12 @@ def compute_project_kpis(project_id: str, location: Optional[str] = None) -> Dic
         con = get_connection()
         try:
             is_loc_filter = bool(location and location.strip() and location.strip().upper() != "ALL")
-            loc_val = location.strip() if is_loc_filter else None
+            loc_val = normalize_arabic_text(location.strip()) if is_loc_filter else None
 
             base_where = "i.project_id = ?"
             params = [project_id, project_id]
             if is_loc_filter:
-                base_where += " AND LOWER(TRIM(i.location)) = LOWER(TRIM(?))"
+                base_where += " AND regexp_replace(replace(regexp_replace(regexp_replace(TRIM(i.location), '[\\u200b\\u200c\\u200d\\ufeffـ]', '', 'g'), '[أإآٱ]', 'ا', 'g'), 'ى', 'ي'), '\\\\s+', ' ', 'g') = ?"
                 params.append(loc_val)
 
             # Query all aggregates (including dormant and active orders counts) in ONE single pass

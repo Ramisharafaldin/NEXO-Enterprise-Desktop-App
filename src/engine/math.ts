@@ -863,3 +863,49 @@ export function getNextPeriodDate(
   return `${lastDate}+${step}`;
 }
 
+/**
+ * Detects the actual cadence/granularity of historical periods based on date strings and intervals.
+ */
+export function detectPeriodsGranularity(periods: TimeSeriesPeriod[]): 'daily' | 'weekly' | 'monthly' {
+  if (!periods || periods.length === 0) return 'monthly';
+
+  // Check if any dates are YYYY-MM (standard monthly)
+  const dateStrings = periods.map(p => p.date).filter(Boolean);
+  if (dateStrings.some(d => /^\d{4}-\d{2}$/.test(d))) {
+    return 'monthly';
+  }
+
+  // Parse YYYY-MM-DD dates
+  const timestamps = dateStrings
+    .map(d => new Date(d).getTime())
+    .filter(t => !isNaN(t))
+    .sort((a, b) => a - b);
+
+  if (timestamps.length < 2) {
+    return 'monthly';
+  }
+
+  const diffDays: number[] = [];
+  for (let i = 1; i < timestamps.length; i++) {
+    const diff = Math.round((timestamps[i] - timestamps[i - 1]) / (1000 * 60 * 60 * 24));
+    if (diff > 0) {
+      diffDays.push(diff);
+    }
+  }
+
+  if (diffDays.length === 0) return 'monthly';
+
+  diffDays.sort((a, b) => a - b);
+  const mid = Math.floor(diffDays.length / 2);
+  const medianDiff = diffDays.length % 2 !== 0 ? diffDays[mid] : (diffDays[mid - 1] + diffDays[mid]) / 2;
+
+  if (medianDiff >= 25) {
+    return 'monthly';
+  } else if (medianDiff >= 5 && medianDiff <= 10) {
+    return 'weekly';
+  } else {
+    return 'daily';
+  }
+}
+
+

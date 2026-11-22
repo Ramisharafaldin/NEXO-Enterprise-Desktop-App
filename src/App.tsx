@@ -12,8 +12,20 @@ import {
   classifyAbcXyz,
   resolveHorizon,
   getNextPeriodDate,
+  detectPeriodsGranularity,
   mean
 } from './engine/math';
+
+export function shouldAutoRecalculateItem(item: InventoryItem): boolean {
+  if (!item || !item.periods || item.periods.length === 0) return false;
+  const hasActuals = item.periods.some(p => (p.actual || 0) > 0);
+  if (!hasActuals) return false;
+
+  const hasFutureForecast = item.periods.some(p => (p.actual || 0) === 0 && (p.forecast || 0) > 0);
+  const allModelsZero = item.periods.every(p => (p.model || 0) === 0);
+
+  return !hasFutureForecast || allModelsZero;
+}
 import { Language, translations } from './i18n/translations';
 import { DEFAULT_APP_SETTINGS, formatCurrency, getCurrencySymbol, formatItemCode } from './utils/formatters';
 import { NavigationRail, MainTabId } from './components/NavigationRail';
@@ -115,8 +127,10 @@ export const App: React.FC = () => {
       const ws = await api.getWorkspace(projectId, effectiveLoc);
       if (ws && ws.items && ws.items.length > 0) {
         const analyzable = ws.items.filter(isAnalyzableItem);
-        setItems(analyzable.length > 0 ? analyzable : ws.items);
-        setSelectedItemId(analyzable[0]?.id || ws.items[0].id);
+        const baseItems = analyzable.length > 0 ? analyzable : ws.items;
+        const recalculated = baseItems.map(i => shouldAutoRecalculateItem(i) ? recalculateItem(i) : i);
+        setItems(recalculated);
+        setSelectedItemId(recalculated[0]?.id || ws.items[0].id);
         setActiveProjectId(projectId);
         setDormantCount(ws.dormant_count ?? ws.excluded_dormant_count ?? Math.max(0, ws.items.length - analyzable.length));
         if (ws.project) {
@@ -223,13 +237,17 @@ export const App: React.FC = () => {
 
     const actuals = item.periods.filter(p => p.actual > 0).map(p => p.actual);
 
+    // Detect the actual cadence of historical periods to prevent 30x daily-vs-monthly inflation (Issue 6)
+    const seriesGranularity = detectPeriodsGranularity(item.periods);
+    const horizonGranularity = seriesGranularity;
+
     // Resolve planning horizon based on item notes (if per-item approvalHorizon set) or global settings
     let activeHorizonRaw: string | number = settings?.forecast_horizon_periods || '12m';
     const horizonMatch = item.notes?.match(/approvalHorizon:([0-9a-zA-Z]+)/);
     if (horizonMatch && horizonMatch[1]) {
       activeHorizonRaw = horizonMatch[1];
     }
-    const horizonCfg = resolveHorizon(activeHorizonRaw, settings?.period_granularity || 'monthly');
+    const horizonCfg = resolveHorizon(activeHorizonRaw, horizonGranularity);
     const horizon = horizonCfg.forecastPeriods;
 
     let res;
@@ -272,7 +290,7 @@ export const App: React.FC = () => {
 
     for (let h = 0; h < horizon; h++) {
       const existing = existingFuturePeriods[h];
-      const futureDate = existing ? existing.date : getNextPeriodDate(lastDate, h + 1, settings?.period_granularity || 'monthly');
+      const futureDate = existing ? existing.date : getNextPeriodDate(lastDate, h + 1, horizonGranularity);
       
       let baseForecast = Math.round(res.forecast[h] || 0);
       let upper = Math.round(res.confUpper[h] || baseForecast * 1.2);
@@ -301,7 +319,8 @@ export const App: React.FC = () => {
 
     const updatedPeriods = [...updatedHistorical, ...updatedFuture];
     const forecastVals = updatedFuture.map(p => p.forecast !== undefined ? p.forecast : 0);
-    const meanDaily = actuals.length > 0 ? (mean(actuals) / 30) : 1;
+    const divisor = horizonGranularity === 'monthly' ? 30 : (horizonGranularity === 'weekly' ? 7 : 1);
+    const meanDaily = actuals.length > 0 ? (mean(actuals) / divisor) : 1;
 
     const updatedBase: InventoryItem = {
       ...item,
@@ -757,6 +776,7 @@ export const App: React.FC = () => {
                 settings={settings}
                 language={language}
                 selectedLocation={selectedLocation}
+                recalculateItem={recalculateItem}
               />
             ) : (
               <div className="flex-1 flex flex-col items-center justify-center p-8 bg-[#F8F9FA] text-[#1E293B]">

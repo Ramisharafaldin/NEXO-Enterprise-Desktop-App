@@ -119,7 +119,7 @@ def get_app_version() -> str:
                     return val.lstrip("v")
         except Exception:
             pass
-    return "0.1.2"
+    return "0.1.12"
 
 APP_VERSION = get_app_version()
 
@@ -162,7 +162,9 @@ try:
         record_daily_sales,
         upsert_items_and_periods,
         clean_item_code,
+        normalize_arabic_text,
         cleanup_trailing_decimal_codes,
+        rebuild_periods_and_demand_stats_from_daily_sales,
         get_connection,
         _LOCK
     )
@@ -205,10 +207,14 @@ except (ImportError, ModuleNotFoundError):
         record_daily_sales,
         upsert_items_and_periods,
         clean_item_code,
+        normalize_arabic_text,
         cleanup_trailing_decimal_codes,
+        rebuild_periods_and_demand_stats_from_daily_sales,
         get_connection,
         _LOCK
     )
+
+_rebuild_periods_and_demand_stats_from_daily_sales = rebuild_periods_and_demand_stats_from_daily_sales
 
 app = FastAPI(
     title="NEXO Supply Chain Backend API",
@@ -473,7 +479,20 @@ def get_settings_endpoint():
 def save_settings_endpoint(req: SettingsUpdateRequest):
     """Saves updated settings to DuckDB and returns updated settings."""
     updates = {k: v for k, v in req.dict().items() if v is not None}
-    return save_app_settings(updates)
+    res = save_app_settings(updates)
+    if "period_granularity" in updates:
+        new_gran = updates["period_granularity"]
+        with _LOCK:
+            con = get_connection()
+            try:
+                con.execute("UPDATE projects SET granularity = ?", (new_gran,))
+                pids = [r[0] for r in con.execute("SELECT DISTINCT project_id FROM daily_sales").fetchall()]
+                for pid in pids:
+                    _rebuild_periods_and_demand_stats_from_daily_sales(pid, con=con)
+                con.execute("CHECKPOINT;")
+            finally:
+                con.close()
+    return res
 
 # ==============================================================================
 # Items, Periods, Overrides & Parameters Endpoints
@@ -1220,7 +1239,7 @@ BILINGUAL_MAP: Dict[str, List[str]] = {
     "description": ["desc", "description", "item_description", "name", "item_name", "اسم الصنف", "الوصف", "بيان الصنف"],
     "category": ["category", "cat", "cati", "family", "group", "product_line", "القسم / المجموعة", "التصنيف", "الفئة", "المجموعة", "القسم"],
     "location": ["loc", "location", "loca", "warehouse", "wh", "branch", "site", "الفرع / المخزن", "المستودع", "المخزن", "الفرع", "الموقع"],
-    "on_hand": ["on_hand", "onhand", "onha", "stock", "balance", "qty_on_hand", "inventory", "الرصيد المتوفر", "الرصيد", "الرصيد الحالي", "المخزون الحالي", "المتوفر"],
+    "on_hand": ["on_hand", "onhand", "onha", "stock", "balance", "qty_on_hand", "inventory", "الرصيد المتوفر", "الرصيد", "الرصيد الحالي", "المخزون الحالي", "المتوفر", "الكمية المتوفرة", "كمية المخزون", "الكمية"],
     "on_order": ["on_order", "onorder", "onow", "onor", "in_transit", "po_qty", "قيد التوريد", "تحت الطلب", "في الطريق", "أوامر مفتوحة"],
     "lead_time_days": ["lead_time", "leadtime", "lt", "ltim", "lead_time_days", "مهلة التوريد (يوم)", "مهلة التوريد", "فترة التوريد (يوم)", "فترة التوريد"],
     "lead_time_variance_days": ["lt_var", "ltiv", "lead_time_variance", "تذبذب التوريد", "تباين التوريد", "انحراف التوريد"],
@@ -1508,6 +1527,86 @@ def normalize_csv_encoding(file_path: str) -> Tuple[str, bool]:
                 fout.write(text_chunk)
     return norm_path, True
 
+def execute_csv_sql(con: duckdb.DuckDBPyConnection, sql_with_strict: str, params=None):
+    """
+    Executes DuckDB SQL containing strict_mode=false.
+    If DuckDB 1.0 or older rejects strict_mode as an invalid named parameter,
+    gracefully falls back and retries without strict_mode.
+    """
+    try:
+        if params is not None:
+            return con.execute(sql_with_strict, params)
+        return con.execute(sql_with_strict)
+    except duckdb.BinderException as e:
+        if "strict_mode" in str(e):
+            sql_fallback = sql_with_strict.replace("strict_mode=false,", "").replace(", strict_mode=false", "").replace("strict_mode=false", "")
+            if params is not None:
+                return con.execute(sql_fallback, params)
+            return con.execute(sql_fallback)
+        raise
+
+def arabic_norm_sql(col_sql: str) -> str:
+    """Returns DuckDB SQL expression normalizing Arabic Alef, Alef Maqsura, Tatweel, and zero-width characters."""
+    return (
+        f"regexp_replace("
+        f"replace("
+        f"regexp_replace("
+        f"regexp_replace(TRIM(CAST({col_sql} AS VARCHAR)), '[\\u200b\\u200c\\u200d\\ufeffـ]', '', 'g'), "
+        f"'[أإآٱ]', 'ا', 'g'), "
+        f"'ى', 'ي'), "
+        f"'\\\\s+', ' ', 'g')"
+    )
+
+def sanitize_csv_to_rfc4180(input_path: str) -> str:
+    """
+    Pure-Python streaming line-by-line CSV sanitizer.
+    Handles malformed/dirty CSVs (e.g. unescaped inch quotes after row 2,048 on DuckDB 2.0+).
+    Detects delimiter, cleans invalid chars, parses rows safely, and outputs
+    a strict RFC-4180 CSV where every field is properly quoted (csv.QUOTE_ALL).
+    Returns the path to the sanitized temporary file.
+    """
+    delim = ","
+    try:
+        with open(input_path, "r", encoding="utf-8-sig", errors="replace") as f:
+            first_line = f.readline()
+            if first_line:
+                counts = {",": first_line.count(","), ";": first_line.count(";"), "\t": first_line.count("\t")}
+                best_delim = max(counts, key=counts.get)
+                if counts[best_delim] > 0:
+                    delim = best_delim
+    except Exception:
+        delim = ","
+
+    tmp_out = tempfile.NamedTemporaryFile(delete=False, suffix="_sanitized.csv")
+    tmp_out_path = tmp_out.name
+    tmp_out.close()
+
+    try:
+        with open(input_path, "r", encoding="utf-8-sig", errors="replace", newline="") as fin, \
+             open(tmp_out_path, "w", encoding="utf-8", newline="") as fout:
+            writer = csv.writer(fout, delimiter=",", quotechar='"', quoting=csv.QUOTE_ALL)
+            try:
+                reader = csv.reader(fin, delimiter=delim)
+                for row in reader:
+                    cleaned_row = [field.replace("\x00", "") for field in row]
+                    writer.writerow(cleaned_row)
+            except Exception:
+                fin.seek(0)
+                for line in fin:
+                    line = line.strip("\r\n").replace("\x00", "")
+                    if not line:
+                        continue
+                    writer.writerow(line.split(delim))
+    except Exception:
+        if os.path.exists(tmp_out_path):
+            try:
+                os.remove(tmp_out_path)
+            except Exception:
+                pass
+        raise
+
+    return tmp_out_path
+
 def load_file_into_staging(con: duckdb.DuckDBPyConnection, file_path: str, ext: str) -> Tuple[List[str], int]:
     """
     Loads uploaded CSV or Excel file directly into DuckDB `staging_raw` temp table.
@@ -1518,12 +1617,21 @@ def load_file_into_staging(con: duckdb.DuckDBPyConnection, file_path: str, ext: 
     ext = ext.lower()
     if ext == ".csv":
         norm_path, was_transcoded = normalize_csv_encoding(file_path)
+        sanitized_path = None
         try:
             escaped_path = norm_path.replace("\\", "/").replace("'", "''")
-            con.execute(f"""
-                CREATE OR REPLACE TEMP TABLE staging_raw AS
-                SELECT * FROM read_csv_auto('{escaped_path}', all_varchar=true, strict_mode=false, null_padding=true, ignore_errors=true, sample_size=1000);
-            """)
+            try:
+                execute_csv_sql(con, f"""
+                    CREATE OR REPLACE TEMP TABLE staging_raw AS
+                    SELECT * FROM read_csv_auto('{escaped_path}', all_varchar=true, strict_mode=false, null_padding=true, ignore_errors=true, sample_size=-1);
+                """)
+            except Exception:
+                sanitized_path = sanitize_csv_to_rfc4180(norm_path)
+                escaped_san = sanitized_path.replace("\\", "/").replace("'", "''")
+                execute_csv_sql(con, f"""
+                    CREATE OR REPLACE TEMP TABLE staging_raw AS
+                    SELECT * FROM read_csv('{escaped_san}', delim=',', quote='\"', escape='\"', header=true, all_varchar=true, strict_mode=false, null_padding=true, ignore_errors=true);
+                """)
             raw_cols = [desc[0] for desc in con.execute("DESCRIBE staging_raw").fetchall()]
             cols = [_clean_header_name(c) for c in raw_cols]
             for rc, cc in zip(raw_cols, cols):
@@ -1537,6 +1645,11 @@ def load_file_into_staging(con: duckdb.DuckDBPyConnection, file_path: str, ext: 
             count = con.execute("SELECT COUNT(*) FROM staging_raw").fetchone()[0]
             return cols, count
         finally:
+            if sanitized_path and os.path.exists(sanitized_path):
+                try:
+                    os.remove(sanitized_path)
+                except Exception:
+                    pass
             if was_transcoded and os.path.exists(norm_path):
                 try:
                     os.remove(norm_path)
@@ -1612,7 +1725,7 @@ def load_file_into_staging(con: duckdb.DuckDBPyConnection, file_path: str, ext: 
                 return [], 0
 
             escaped_csv = temp_csv_path.replace("\\", "/").replace("'", "''")
-            con.execute(f"""
+            execute_csv_sql(con, f"""
                 CREATE OR REPLACE TEMP TABLE staging_raw AS
                 SELECT * FROM read_csv_auto('{escaped_csv}', all_varchar=true, strict_mode=false, null_padding=true, ignore_errors=true, sample_size=1000);
             """)
@@ -2117,9 +2230,23 @@ def _stream_ingest_sales_csv(
             con = get_connection()
             try:
                 # 1. Strictly bounded column discovery from first 1000 rows
-                sample_res = con.execute(f"""
-                    DESCRIBE SELECT * FROM read_csv_auto('{escaped_path}', all_varchar=true, null_padding=true, ignore_errors=true, sample_size=1000) LIMIT 1;
-                """).fetchall()
+                try:
+                    sample_res = execute_csv_sql(con, f"""
+                        DESCRIBE SELECT * FROM read_csv_auto('{escaped_path}', all_varchar=true, strict_mode=false, null_padding=true, ignore_errors=true, sample_size=1000) LIMIT 1;
+                    """).fetchall()
+                except Exception:
+                    san_path = sanitize_csv_to_rfc4180(norm_path)
+                    escaped_san = san_path.replace("\\", "/").replace("'", "''")
+                    try:
+                        sample_res = execute_csv_sql(con, f"""
+                            DESCRIBE SELECT * FROM read_csv('{escaped_san}', delim=',', quote='\"', escape='\"', header=true, all_varchar=true, strict_mode=false, null_padding=true, ignore_errors=true) LIMIT 1;
+                        """).fetchall()
+                    finally:
+                        if os.path.exists(san_path):
+                            try:
+                                os.remove(san_path)
+                            except Exception:
+                                pass
                 raw_cols = [d[0] for d in sample_res]
                 cols = [_clean_header_name(d[0]) for d in sample_res]
                 if not cols:
@@ -2156,9 +2283,7 @@ def _stream_ingest_sales_csv(
                 rev_col = esc_c(raw_col_map.get(c_revenue, c_revenue)) if c_revenue else None
 
                 clean_code_sql = f"regexp_replace(TRIM(CAST(s.\"{code_col}\" AS VARCHAR)), '^([0-9]+)\\.0+$', '\\1')"
-                valid_code_cond = f's."{code_col}" IS NOT NULL AND {clean_code_sql} != \'\' AND LOWER({clean_code_sql}) NOT IN (\'nan\', \'none\', \'null\')'
-
-                loc_sql = f'COALESCE(NULLIF(TRIM(CAST(s."{loc_col}" AS VARCHAR)), \'\'), \'Main Warehouse\')' if loc_col else "'Main Warehouse'"
+                loc_sql = arabic_norm_sql(f'COALESCE(NULLIF(TRIM(CAST(s."{loc_col}" AS VARCHAR)), \'\'), \'Main Warehouse\')' if loc_col else "'Main Warehouse'")
                 qty_sql = f'COALESCE(TRY_CAST(s."{qty_col}" AS DOUBLE), 0.0)'
                 rev_sql = f'COALESCE(TRY_CAST(s."{rev_col}" AS DOUBLE), 0.0)' if rev_col else '0.0'
 
@@ -2167,7 +2292,7 @@ def _stream_ingest_sales_csv(
                 period_expr = f"""
                 CASE 
                   WHEN {raw_d} IS NULL OR TRIM(CAST({raw_d} AS VARCHAR)) = '' 
-                    THEN strftime(CURRENT_DATE, '%Y-%m')
+                    THEN NULL
                   WHEN regexp_matches(TRIM(CAST({raw_d} AS VARCHAR)), '^[0-9]{{4}}[-/][0-9]{{2}}') 
                     THEN replace(substr(TRIM(CAST({raw_d} AS VARCHAR)), 1, 7), '/', '-')
                   WHEN TRY_CAST(TRIM(CAST({raw_d} AS VARCHAR)) AS TIMESTAMP) IS NOT NULL 
@@ -2180,13 +2305,13 @@ def _stream_ingest_sales_csv(
                     THEN strftime(TRY_STRPTIME(TRIM(CAST({raw_d} AS VARCHAR)), '%m/%d/%Y'), '%Y-%m')
                   WHEN TRY_CAST(TRIM(CAST({raw_d} AS VARCHAR)) AS DOUBLE) >= 30000 AND TRY_CAST(TRIM(CAST({raw_d} AS VARCHAR)) AS DOUBLE) <= 60000 
                     THEN strftime(DATE '1899-12-30' + (TRY_CAST(TRIM(CAST({raw_d} AS VARCHAR)) AS BIGINT) * INTERVAL 1 DAY), '%Y-%m')
-                  ELSE strftime(CURRENT_DATE, '%Y-%m')
+                  ELSE NULL
                 END
                 """
                 daily_date_expr = f"""
                 CASE 
                   WHEN {raw_d} IS NULL OR TRIM(CAST({raw_d} AS VARCHAR)) = '' 
-                    THEN strftime(CURRENT_DATE, '%Y-%m-%d')
+                    THEN NULL
                   WHEN regexp_matches(TRIM(CAST({raw_d} AS VARCHAR)), '^[0-9]{{4}}[-/][0-9]{{2}}[-/][0-9]{{2}}') 
                     THEN replace(substr(TRIM(CAST({raw_d} AS VARCHAR)), 1, 10), '/', '-')
                   WHEN TRY_CAST(TRIM(CAST({raw_d} AS VARCHAR)) AS DATE) IS NOT NULL 
@@ -2201,8 +2326,20 @@ def _stream_ingest_sales_csv(
                     THEN replace(substr(trim(CAST({raw_d} AS VARCHAR)), 1, 7), '/', '-') || '-01'
                   WHEN TRY_CAST(TRIM(CAST({raw_d} AS VARCHAR)) AS DOUBLE) >= 30000 AND TRY_CAST(TRIM(CAST({raw_d} AS VARCHAR)) AS DOUBLE) <= 60000 
                     THEN strftime(DATE '1899-12-30' + (TRY_CAST(TRIM(CAST({raw_d} AS VARCHAR)) AS BIGINT) * INTERVAL 1 DAY), '%Y-%m-%d')
-                  ELSE strftime(CURRENT_DATE, '%Y-%m-%d')
+                  ELSE NULL
                 END
+                """
+
+                valid_code_cond = f"""
+                s."{code_col}" IS NOT NULL 
+                AND {clean_code_sql} != '' 
+                AND LOWER({clean_code_sql}) NOT IN ('nan', 'none', 'null', 'code', 'item_code', 'sku', 'كود الصنف', 'نوع البيانات', 'نص (text)')
+                AND {clean_code_sql} NOT LIKE '%تاريخ%'
+                AND {clean_code_sql} NOT LIKE '%نوع البيانات%'
+                AND {clean_code_sql} NOT LIKE '%نص (%'
+                AND {clean_code_sql} NOT LIKE '%رقم (%'
+                AND ({daily_date_expr}) IS NOT NULL
+                AND TRY_CAST(s."{qty_col}" AS DOUBLE) IS NOT NULL
                 """
 
                 # 2. Zero-Copy Streaming SQL Aggregation directly from read_csv_auto
@@ -2213,19 +2350,43 @@ def _stream_ingest_sales_csv(
                     con.execute("DELETE FROM daily_sales WHERE project_id = ?", (proj_id,))
                     con.execute("DELETE FROM periods WHERE project_id = ?", (proj_id,))
 
-                con.execute(f"""
-                    CREATE OR REPLACE TEMP TABLE streaming_sales_agg AS
-                    SELECT
-                      {clean_code_sql} as clean_code,
-                      {loc_sql} as branch,
-                      {period_expr} as period,
-                      SUM({qty_sql}) as qty_sold,
-                      SUM({rev_sql}) as revenue,
-                      COUNT(*) as row_count
-                    FROM read_csv_auto('{escaped_path}', all_varchar=true, null_padding=true, ignore_errors=true, sample_size=1000) s
-                    WHERE {valid_code_cond}
-                    GROUP BY 1, 2, 3;
-                """)
+                try:
+                    execute_csv_sql(con, f"""
+                        CREATE OR REPLACE TEMP TABLE streaming_sales_agg AS
+                        SELECT
+                          {clean_code_sql} as clean_code,
+                          {loc_sql} as branch,
+                          {period_expr} as period,
+                          SUM({qty_sql}) as qty_sold,
+                          SUM({rev_sql}) as revenue,
+                          COUNT(*) as row_count
+                        FROM read_csv_auto('{escaped_path}', all_varchar=true, strict_mode=false, null_padding=true, ignore_errors=true, sample_size=1000) s
+                        WHERE {valid_code_cond}
+                        GROUP BY 1, 2, 3;
+                    """)
+                except Exception:
+                    san_path = sanitize_csv_to_rfc4180(norm_path)
+                    escaped_san = san_path.replace("\\", "/").replace("'", "''")
+                    try:
+                        execute_csv_sql(con, f"""
+                            CREATE OR REPLACE TEMP TABLE streaming_sales_agg AS
+                            SELECT
+                              {clean_code_sql} as clean_code,
+                              {loc_sql} as branch,
+                              {period_expr} as period,
+                              SUM({qty_sql}) as qty_sold,
+                              SUM({rev_sql}) as revenue,
+                              COUNT(*) as row_count
+                            FROM read_csv('{escaped_san}', delim=',', quote='\"', escape='\"', header=true, all_varchar=true, strict_mode=false, null_padding=true, ignore_errors=true) s
+                            WHERE {valid_code_cond}
+                            GROUP BY 1, 2, 3;
+                        """)
+                    finally:
+                        if os.path.exists(san_path):
+                            try:
+                                os.remove(san_path)
+                            except Exception:
+                                pass
 
                 cnt_row = con.execute("SELECT COALESCE(SUM(row_count), 0) FROM streaming_sales_agg").fetchone()
                 total_rows = cnt_row[0] if cnt_row else 0
@@ -2233,20 +2394,45 @@ def _stream_ingest_sales_csv(
                     raise HTTPException(status_code=400, detail="The uploaded file contains no data rows.")
 
                 # Stream into daily_sales using row_number() over()
-                con.execute(f"""
-                    INSERT INTO daily_sales (id, project_id, item_code, location, sale_date, qty_sold, revenue, created_at)
-                    SELECT
-                      ? || '_ds_' || substr(md5(random()::VARCHAR || row_number() over ()), 1, 10) || '_' || row_number() over (),
-                      ?,
-                      {clean_code_sql},
-                      {loc_sql},
-                      {daily_date_expr},
-                      {qty_sql},
-                      {rev_sql},
-                      strftime(CURRENT_TIMESTAMP, '%Y-%m-%dT%H:%M:%SZ')
-                    FROM read_csv_auto('{escaped_path}', all_varchar=true, null_padding=true, ignore_errors=true, sample_size=1000) s
-                    WHERE {valid_code_cond};
-                """, (proj_id, proj_id))
+                try:
+                    execute_csv_sql(con, f"""
+                        INSERT INTO daily_sales (id, project_id, item_code, location, sale_date, qty_sold, revenue, created_at)
+                        SELECT
+                          ? || '_ds_' || substr(md5(random()::VARCHAR || row_number() over ()), 1, 10) || '_' || row_number() over (),
+                          ?,
+                          {clean_code_sql},
+                          {loc_sql},
+                          {daily_date_expr},
+                          {qty_sql},
+                          {rev_sql},
+                          strftime(CURRENT_TIMESTAMP, '%Y-%m-%dT%H:%M:%SZ')
+                        FROM read_csv_auto('{escaped_path}', all_varchar=true, strict_mode=false, null_padding=true, ignore_errors=true, sample_size=1000) s
+                        WHERE {valid_code_cond};
+                    """, (proj_id, proj_id))
+                except Exception:
+                    san_path = sanitize_csv_to_rfc4180(norm_path)
+                    escaped_san = san_path.replace("\\", "/").replace("'", "''")
+                    try:
+                        execute_csv_sql(con, f"""
+                            INSERT INTO daily_sales (id, project_id, item_code, location, sale_date, qty_sold, revenue, created_at)
+                            SELECT
+                              ? || '_ds_' || substr(md5(random()::VARCHAR || row_number() over ()), 1, 10) || '_' || row_number() over (),
+                              ?,
+                              {clean_code_sql},
+                              {loc_sql},
+                              {daily_date_expr},
+                              {qty_sql},
+                              {rev_sql},
+                              strftime(CURRENT_TIMESTAMP, '%Y-%m-%dT%H:%M:%SZ')
+                            FROM read_csv('{escaped_san}', delim=',', quote='\"', escape='\"', header=true, all_varchar=true, strict_mode=false, null_padding=true, ignore_errors=true) s
+                            WHERE {valid_code_cond};
+                        """, (proj_id, proj_id))
+                    finally:
+                        if os.path.exists(san_path):
+                            try:
+                                os.remove(san_path)
+                            except Exception:
+                                pass
 
                 # 3. Committing to project items & periods
                 log_ingest_milestone(f"committing: aggregated {total_rows} raw records into periods, syncing workspace...")
@@ -2264,7 +2450,7 @@ def _stream_ingest_sales_csv(
                       accuracy, mean_daily_demand, updated_at
                     )
                     SELECT
-                      ? || '_' || substr(md5(random()::VARCHAR || TRIM(sub.code)), 1, 8),
+                      ? || '_' || substr(md5(random()::VARCHAR || TRIM(sub.code) || '_' || TRIM(COALESCE(sub.loc, ''))), 1, 8),
                       ?,
                       sub.code,
                       'Item ' || sub.code,
@@ -2281,13 +2467,14 @@ def _stream_ingest_sales_csv(
                       92.0, 0.0,
                       strftime(CURRENT_TIMESTAMP, '%Y-%m-%dT%H:%M:%SZ')
                     FROM (
-                      SELECT clean_code as code, MIN(branch) as loc
+                      SELECT clean_code as code, branch as loc
                       FROM streaming_sales_agg
-                      GROUP BY clean_code
+                      GROUP BY clean_code, branch
                     ) sub
                     LEFT JOIN items i 
                       ON i.project_id = ? 
                       AND i.code = sub.code
+                      AND (i.location = sub.loc OR i.location IS NULL)
                     WHERE i.code IS NULL;
                 """, (proj_id, proj_id, proj_id))
 
@@ -2315,7 +2502,10 @@ def _stream_ingest_sales_csv(
                     FROM (
                       SELECT i.id as item_id, inc_agg.period as norm_period, SUM(inc_agg.qty_sold) as qty_sold, SUM(inc_agg.revenue) as revenue
                       FROM streaming_sales_agg inc_agg
-                      JOIN items i ON i.project_id = ? AND i.code = inc_agg.clean_code
+                      JOIN items i 
+                        ON i.project_id = ? 
+                       AND i.code = inc_agg.clean_code
+                       AND (i.location = inc_agg.branch OR i.location IS NULL OR inc_agg.branch IS NULL OR i.location = '' OR inc_agg.branch = '')
                       GROUP BY i.id, inc_agg.period
                     ) inc
                     WHERE periods.project_id = ?
@@ -2337,7 +2527,10 @@ def _stream_ingest_sales_csv(
                     FROM (
                       SELECT i.id as item_id, inc_agg.period as norm_period, SUM(inc_agg.qty_sold) as qty_sold, SUM(inc_agg.revenue) as revenue
                       FROM streaming_sales_agg inc_agg
-                      JOIN items i ON i.project_id = ? AND i.code = inc_agg.clean_code
+                      JOIN items i 
+                        ON i.project_id = ? 
+                       AND i.code = inc_agg.clean_code
+                       AND (i.location = inc_agg.branch OR i.location IS NULL OR inc_agg.branch IS NULL OR i.location = '' OR inc_agg.branch = '')
                       GROUP BY i.id, inc_agg.period
                     ) inc
                     LEFT JOIN periods p 
@@ -2529,7 +2722,15 @@ async def import_typed_file(
 
                     code_col = esc_c(c_code)
                     clean_code_sql = f"regexp_replace(TRIM(s.\"{code_col}\"), '^([0-9]+)\\.0+$', '\\1')"
-                    valid_code_cond = f's."{code_col}" IS NOT NULL AND {clean_code_sql} != \'\' AND LOWER({clean_code_sql}) NOT IN (\'nan\', \'none\', \'null\')'
+                    valid_code_cond = f"""
+                    s."{code_col}" IS NOT NULL 
+                    AND {clean_code_sql} != '' 
+                    AND LOWER({clean_code_sql}) NOT IN ('nan', 'none', 'null', 'code', 'item_code', 'sku', 'كود الصنف', 'نوع البيانات', 'نص (text)')
+                    AND {clean_code_sql} NOT LIKE '%تاريخ%'
+                    AND {clean_code_sql} NOT LIKE '%نوع البيانات%'
+                    AND {clean_code_sql} NOT LIKE '%نص (%'
+                    AND {clean_code_sql} NOT LIKE '%رقم (%'
+                    """
 
                     update_job_progress(job_id, 88, "تجميع الحركات وتصفية الأصناف...", "Aggregating transactions & filtering SKUs...", rows_processed=total_rows, total_rows=total_rows)
 
@@ -2538,7 +2739,7 @@ async def import_typed_file(
                             con.execute("DELETE FROM daily_sales WHERE project_id = ?", (proj_id,))
                             con.execute("DELETE FROM periods WHERE project_id = ?", (proj_id,))
 
-                        loc_sql = f'COALESCE(NULLIF(TRIM(s."{esc_c(c_loc)}"), \'\'), \'Main Warehouse\')' if c_loc else "'Main Warehouse'"
+                        loc_sql = arabic_norm_sql(f'COALESCE(NULLIF(TRIM(s."{esc_c(c_loc)}"), \'\'), \'Main Warehouse\')' if c_loc else "'Main Warehouse'")
                         qty_sql = f'COALESCE(TRY_CAST(s."{esc_c(c_qty_sold)}" AS DOUBLE), 0.0)' if c_qty_sold else '0.0'
                         rev_sql = f'COALESCE(TRY_CAST(s."{esc_c(c_revenue)}" AS DOUBLE), 0.0)' if c_revenue else '0.0'
 
@@ -2559,11 +2760,11 @@ async def import_typed_file(
                                 THEN replace(substr(trim({raw_d}), 1, 7), '/', '-') || '-01'
                               WHEN TRY_CAST({raw_d} AS DOUBLE) >= 30000 AND TRY_CAST({raw_d} AS DOUBLE) <= 60000 
                                 THEN strftime(DATE '1899-12-30' + (TRY_CAST({raw_d} AS BIGINT)) * INTERVAL 1 DAY, '%Y-%m-%d')
-                              ELSE strftime(CURRENT_DATE, '%Y-%m-%d')
+                              ELSE NULL
                             END
                             """
                         else:
-                            daily_date_sql = "strftime(CURRENT_DATE, '%Y-%m-%d')"
+                            daily_date_sql = "NULL"
 
                         norm_period_sql = f"substr({daily_date_sql}, 1, 7)"
 
@@ -2580,7 +2781,7 @@ async def import_typed_file(
                               {rev_sql},
                               strftime(CURRENT_TIMESTAMP, '%Y-%m-%dT%H:%M:%SZ')
                             FROM staging_raw s
-                            WHERE {valid_code_cond};
+                            WHERE {valid_code_cond} AND ({daily_date_sql}) IS NOT NULL AND TRY_CAST(s."{esc_c(c_qty_sold)}" AS DOUBLE) IS NOT NULL;
                         """, (proj_id,))
 
                         # 2. Auto-create missing items in items
@@ -2595,7 +2796,7 @@ async def import_typed_file(
                               accuracy, mean_daily_demand, updated_at
                             )
                             SELECT
-                              ? || '_' || substr(md5(random()::VARCHAR || TRIM(sub.code)), 1, 8),
+                              ? || '_' || substr(md5(random()::VARCHAR || TRIM(sub.code) || '_' || TRIM(COALESCE(sub.loc, ''))), 1, 8),
                               ?,
                               sub.code,
                               'Item ' || sub.code,
@@ -2612,14 +2813,15 @@ async def import_typed_file(
                               92.0, 0.0,
                               strftime(CURRENT_TIMESTAMP, '%Y-%m-%dT%H:%M:%SZ')
                             FROM (
-                              SELECT {clean_code_sql} as code, MIN({loc_sql}) as loc
+                              SELECT {clean_code_sql} as code, {loc_sql} as loc
                               FROM staging_raw s
-                              WHERE {valid_code_cond}
-                              GROUP BY {clean_code_sql}
+                              WHERE {valid_code_cond} AND ({daily_date_sql}) IS NOT NULL
+                              GROUP BY {clean_code_sql}, {loc_sql}
                             ) sub
                             LEFT JOIN items i 
                               ON i.project_id = ? 
                               AND i.code = sub.code
+                              AND (i.location = sub.loc OR i.location IS NULL)
                             WHERE i.code IS NULL;
                         """, (proj_id, proj_id, proj_id))
 
@@ -2630,7 +2832,7 @@ async def import_typed_file(
                             FROM (
                               SELECT {clean_code_sql} as code, MIN({loc_sql}) as loc
                               FROM staging_raw s
-                              WHERE {valid_code_cond} AND {loc_sql} IS NOT NULL AND {loc_sql} != 'Main Warehouse' AND {loc_sql} != ''
+                              WHERE {valid_code_cond} AND {loc_sql} IS NOT NULL AND {loc_sql} != 'Main Warehouse' AND {loc_sql} != '' AND ({daily_date_sql}) IS NOT NULL
                               GROUP BY {clean_code_sql}
                             ) sub
                             WHERE items.project_id = ? 
@@ -2647,8 +2849,11 @@ async def import_typed_file(
                               SUM({qty_sql}) as actual,
                               SUM({rev_sql}) as revenue
                             FROM staging_raw s
-                            JOIN items i ON i.project_id = ? AND i.code = {clean_code_sql}
-                            WHERE {valid_code_cond}
+                            JOIN items i 
+                              ON i.project_id = ? 
+                             AND i.code = {clean_code_sql}
+                             AND (i.location = {loc_sql} OR i.location IS NULL OR i.location = '' OR {loc_sql} IS NULL OR {loc_sql} = '')
+                            WHERE {valid_code_cond} AND ({daily_date_sql}) IS NOT NULL
                             GROUP BY i.id, {norm_period_sql};
                         """, (proj_id,))
 
@@ -2799,7 +3004,7 @@ async def import_typed_file(
 
                         desc_sql = f'COALESCE(NULLIF(TRIM(s."{esc_c(c_desc)}"), \'\'), \'Item \' || {clean_code_sql})' if c_desc else f"'Item ' || {clean_code_sql}"
                         cat_sql = f'COALESCE(NULLIF(TRIM(s."{esc_c(c_cat)}"), \'\'), \'General\')' if c_cat else "'General'"
-                        loc_sql = f'COALESCE(NULLIF(TRIM(s."{esc_c(c_loc)}"), \'\'), \'Main Warehouse\')' if c_loc else "'Main Warehouse'"
+                        loc_sql = arabic_norm_sql(f'COALESCE(NULLIF(TRIM(s."{esc_c(c_loc)}"), \'\'), \'Main Warehouse\')' if c_loc else "'Main Warehouse'")
                         onhand_sql = f'COALESCE(TRY_CAST(s."{esc_c(c_onhand)}" AS DOUBLE), 0.0)' if c_onhand else '0.0'
                         cost_sql = f'TRY_CAST(s."{esc_c(c_cost)}" AS DOUBLE)' if c_cost else 'NULL'
                         price_sql = f'TRY_CAST(s."{esc_c(c_price)}" AS DOUBLE)' if c_price else 'NULL'
@@ -2829,17 +3034,21 @@ async def import_typed_file(
                               {brou_sql} as raw_brou,
                               {supp_sql} as supplier
                             FROM staging_raw s
-                            WHERE {valid_code_cond};
+                            WHERE {valid_code_cond}
+                              AND LOWER({clean_code_sql}) NOT LIKE '%تاريخ%'
+                              AND LOWER({clean_code_sql}) NOT LIKE '%نوع البيانات%'
+                              AND LOWER({clean_code_sql}) NOT LIKE '%نص (%'
+                              AND LOWER({clean_code_sql}) NOT LIKE '%رقم (%';
                         """)
 
-                        # Deduplicate staging_inv if file has multiple rows for same SKU
+                        # Deduplicate staging_inv by (code, location) for multi-branch support
                         con.execute("""
                             CREATE OR REPLACE TEMP TABLE staging_inv_dedup AS
                             SELECT 
                               code,
+                              location,
                               FIRST(description) as description,
                               FIRST(category) as category,
-                              FIRST(location) as location,
                               SUM(on_hand) as on_hand,
                               FIRST(raw_cost) as raw_cost,
                               FIRST(raw_price) as raw_price,
@@ -2851,7 +3060,9 @@ async def import_typed_file(
                               FIRST(raw_brou) as raw_brou,
                               FIRST(supplier) as supplier
                             FROM staging_inv
-                            GROUP BY code;
+                            WHERE code IS NOT NULL AND code != ''
+                              AND location NOT IN ('نص (Text)', 'نوع البيانات')
+                            GROUP BY code, location;
                         """)
 
                         con.execute("""
@@ -2904,7 +3115,7 @@ async def import_typed_file(
                             FROM staging_inv_dedup stg
                             LEFT JOIN sku_transit tr ON tr.item_code = stg.code
                             LEFT JOIN sku_avg_price prc ON prc.code = stg.code
-                            WHERE items.project_id = ? AND items.code = stg.code;
+                            WHERE items.project_id = ? AND items.code = stg.code AND items.location = stg.location;
                         """, (def_lt, def_lt_var, def_sl, def_sl, def_sl, def_moq, def_brou, proj_id))
 
                         # Insert new items
@@ -2919,7 +3130,7 @@ async def import_typed_file(
                               accuracy, mean_daily_demand, updated_at
                             )
                             SELECT
-                              ? || '_' || substr(md5(random()::VARCHAR || stg.code), 1, 8),
+                              ? || '_' || substr(md5(random()::VARCHAR || stg.code || '_' || stg.location), 1, 8),
                               ?,
                               stg.code,
                               stg.description,
@@ -2947,7 +3158,7 @@ async def import_typed_file(
                             FROM staging_inv_dedup stg
                             LEFT JOIN sku_transit tr ON tr.item_code = stg.code
                             LEFT JOIN sku_avg_price prc ON prc.code = stg.code
-                            LEFT JOIN items i ON i.project_id = ? AND i.code = stg.code
+                            LEFT JOIN items i ON i.project_id = ? AND i.code = stg.code AND i.location = stg.location
                             WHERE i.id IS NULL;
                         """, (
                             proj_id, proj_id,
@@ -3052,8 +3263,12 @@ async def import_typed_file(
 
                     update_job_progress(job_id, 96, "حفظ البيانات وتأمين قاعدة البيانات...", "Saving workspace & running CHECKPOINT...", rows_processed=total_rows, total_rows=total_rows)
 
+                    # If daily_sales exists for this project, automatically rebuild periods and recalculate demand stats
+                    if con.execute("SELECT COUNT(*) FROM daily_sales WHERE project_id = ? AND sale_date IS NOT NULL", (proj_id,)).fetchone()[0] > 0:
+                        _rebuild_periods_and_demand_stats_from_daily_sales(proj_id, con=con)
+
                     # Mirror to persistent project tables & flush checkpoint
-                    save_project_workspace(proj_id)
+                    save_project_workspace(proj_id, con=con)
 
                     # Drop temp tables
                     con.execute("DROP TABLE IF EXISTS staging_raw;")
@@ -3669,11 +3884,27 @@ async def inspect_file_endpoint(
                     con = get_connection()
                     try:
                         # Strictly bounded inspection: sample up to 1,000 rows to discover columns and preview
-                        con.execute(f"""
-                            CREATE OR REPLACE TEMP TABLE staging_inspect AS 
-                            SELECT * FROM read_csv_auto('{escaped}', all_varchar=true, null_padding=true, ignore_errors=true, sample_size=1000)
-                            LIMIT 1000;
-                        """)
+                        try:
+                            execute_csv_sql(con, f"""
+                                CREATE OR REPLACE TEMP TABLE staging_inspect AS 
+                                SELECT * FROM read_csv_auto('{escaped}', all_varchar=true, strict_mode=false, null_padding=true, ignore_errors=true, sample_size=1000)
+                                LIMIT 1000;
+                            """)
+                        except Exception:
+                            san_path = sanitize_csv_to_rfc4180(norm_path)
+                            escaped_san = san_path.replace("\\", "/").replace("'", "''")
+                            try:
+                                execute_csv_sql(con, f"""
+                                    CREATE OR REPLACE TEMP TABLE staging_inspect AS 
+                                    SELECT * FROM read_csv('{escaped_san}', delim=',', quote='\"', escape='\"', header=true, all_varchar=true, strict_mode=false, null_padding=true, ignore_errors=true)
+                                    LIMIT 1000;
+                                """)
+                            finally:
+                                if os.path.exists(san_path):
+                                    try:
+                                        os.remove(san_path)
+                                    except Exception:
+                                        pass
                         cols = [_clean_header_name(d[0]) for d in con.execute("DESCRIBE staging_inspect").fetchall()]
                         sample_count = con.execute("SELECT COUNT(*) FROM staging_inspect").fetchone()[0]
                         preview_data = con.execute("SELECT * FROM staging_inspect LIMIT 5").fetchall()

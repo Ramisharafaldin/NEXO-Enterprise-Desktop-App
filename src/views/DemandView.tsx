@@ -1,6 +1,7 @@
 import React, { useState, useMemo, useRef, useEffect, useCallback } from 'react';
 import { InventoryItem, ModelType, ReplenishmentStrategy, AppSettings, isAnalyzableItem } from '../engine/types';
 import { normalizeHorizonKey } from '../engine/math';
+import { shouldAutoRecalculateItem } from '../App';
 import { translations, Language } from '../i18n/translations';
 import { formatItemCode } from '../utils/formatters';
 import { api } from '../api/client';
@@ -48,11 +49,12 @@ interface DemandViewProps {
   language: Language;
   projectId?: string;
   selectedLocation?: string;
+  recalculateItem?: (item: InventoryItem, newModel?: ModelType, newStrategy?: ReplenishmentStrategy) => InventoryItem;
 }
 
 export const DemandView: React.FC<DemandViewProps> = ({
   items,
-  selectedItem,
+  selectedItem: rawSelectedItem,
   onSelectItem,
   onModelChange,
   onOverrideChange,
@@ -64,7 +66,16 @@ export const DemandView: React.FC<DemandViewProps> = ({
   language,
   projectId = 'proj_default_retail',
   selectedLocation,
+  recalculateItem,
 }) => {
+  const selectedItem = useMemo(() => {
+    if (!rawSelectedItem) return undefined;
+    if (recalculateItem && shouldAutoRecalculateItem(rawSelectedItem)) {
+      return recalculateItem(rawSelectedItem);
+    }
+    return rawSelectedItem;
+  }, [rawSelectedItem, recalculateItem]);
+
   const t = translations[language];
   const isAr = language === 'ar';
 
@@ -159,18 +170,29 @@ export const DemandView: React.FC<DemandViewProps> = ({
         location: selectedLocation,
         includeDormant: false
       });
-      setPaginatedItems(res.items || []);
-      setTotalCount(res.total_count ?? (res.items || []).length);
+      const hydrated = (res.items || []).map(i => {
+        if (recalculateItem && shouldAutoRecalculateItem(i)) {
+          return recalculateItem(i);
+        }
+        return i;
+      });
+      setPaginatedItems(hydrated);
+      setTotalCount(res.total_count ?? hydrated.length);
       setTotalPages(res.total_pages ?? Math.max(1, Math.ceil((res.total_count || 1) / pageSize)));
-      if (res.items && res.items.length > 0 && !selectedItem) {
-        onSelectItem(res.items[0]);
+      if (hydrated.length > 0 && !rawSelectedItem) {
+        onSelectItem(hydrated[0]);
+      } else if (rawSelectedItem && shouldAutoRecalculateItem(rawSelectedItem) && recalculateItem) {
+        const found = hydrated.find(x => x.id === rawSelectedItem.id);
+        if (found) {
+          onSelectItem(found);
+        }
       }
     } catch (err) {
       console.warn('Failed to load server-side demand page:', err);
     } finally {
       setIsLoadingList(false);
     }
-  }, [projectId, page, pageSize, debouncedSearch, selectedItem, onSelectItem, selectedLocation]);
+  }, [projectId, page, pageSize, debouncedSearch, rawSelectedItem, onSelectItem, selectedLocation, recalculateItem]);
 
   useEffect(() => {
     fetchDemandPage();
@@ -471,11 +493,17 @@ export const DemandView: React.FC<DemandViewProps> = ({
                 {(isExpanded || hideCategories) && (
                   <div className={!hideCategories ? 'pl-4 space-y-0.5' : 'space-y-0.5'}>
                     {catItems.map(item => {
-                      const isSelected = selectedItem.id === item.id;
+                      const isSelected = selectedItem?.id === item.id;
                       return (
                         <button
                           key={item.id}
-                          onClick={() => onSelectItem(item)}
+                          onClick={() => {
+                            if (recalculateItem && shouldAutoRecalculateItem(item)) {
+                              onSelectItem(recalculateItem(item));
+                            } else {
+                              onSelectItem(item);
+                            }
+                          }}
                           className={`w-full flex items-center gap-1.5 px-2 py-1 rounded text-left text-[11px] transition cursor-pointer ${
                             isSelected
                               ? 'bg-[#2196F3] text-white font-semibold'
