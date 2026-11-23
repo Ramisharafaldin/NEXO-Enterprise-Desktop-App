@@ -120,7 +120,7 @@ def get_app_version() -> str:
                     return val.lstrip("v")
         except Exception:
             pass
-    return "0.1.13"
+    return "0.1.14"
 
 APP_VERSION = get_app_version()
 
@@ -143,9 +143,14 @@ try:
         get_project_items_paginated,
         get_project_dashboard_summary,
         get_project_categories,
+        get_category_demand_series,
         get_workspace,
         save_period_override,
         update_item_parameters,
+        update_project_forecast_settings,
+        get_project_forecast_defaults,
+        normalize_seasonality_period,
+        normalize_forecast_approach,
         get_saved_filters_for_project,
         add_saved_filter,
         delete_filter_by_id,
@@ -188,9 +193,14 @@ except (ImportError, ModuleNotFoundError):
         get_project_items_paginated,
         get_project_dashboard_summary,
         get_project_categories,
+        get_category_demand_series,
         get_workspace,
         save_period_override,
         update_item_parameters,
+        update_project_forecast_settings,
+        get_project_forecast_defaults,
+        normalize_seasonality_period,
+        normalize_forecast_approach,
         get_saved_filters_for_project,
         add_saved_filter,
         delete_filter_by_id,
@@ -602,6 +612,7 @@ def get_demand_endpoint(
     )
     dormant_count = get_project_dormant_count(pid, location=location)
     categories = get_project_categories(pid)
+    defaults = get_project_forecast_defaults(pid)
     return {
         "project_id": pid,
         "page": paginated["page"],
@@ -614,8 +625,19 @@ def get_demand_endpoint(
         "location": location or "ALL",
         "categories": categories,
         "series": paginated["items"],
-        "items": paginated["items"]
+        "items": paginated["items"],
+        "project_defaults": defaults
     }
+
+@app.get("/api/projects/{project_id}/forecast/category-series")
+@app.get("/api/demand/category-series")
+def get_category_series_endpoint(
+    project_id: str = "proj_default_retail",
+    category: str = Query("General"),
+    location: Optional[str] = Query(None)
+):
+    pid = _resolve_project_id(project_id)
+    return get_category_demand_series(pid, category, location=location)
 
 @app.get("/api/dashboard")
 def get_dashboard_endpoint(
@@ -730,6 +752,72 @@ def save_parameters_endpoint(project_id: str, req: SaveParametersRequest):
             update_item_parameters(project_id, item["id"], updates)
 
     return {"success": True, "project_id": project_id, "item_id": target_id, "updated": updates}
+
+class ForecastSettingsUpdate(BaseModel):
+    scope: str = "all"  # "all" or "item"
+    seasonality_period: Optional[str] = None
+    seasonality_pattern: Optional[str] = None
+    forecast_approach: Optional[str] = None
+    model_type: Optional[str] = None
+    approval_horizon: Optional[str] = None
+    approvalHorizon: Optional[str] = None
+    item_id: Optional[str] = None
+    itemId: Optional[str] = None
+
+@app.patch("/api/projects/{project_id}/forecast-settings")
+@app.post("/api/projects/{project_id}/forecast-settings")
+def update_forecast_settings_endpoint(
+    project_id: str,
+    req: ForecastSettingsUpdate
+):
+    """
+    Lightweight, high-performance endpoint to update forecast parameters.
+    When scope is 'all', runs a fast single-SQL UPDATE across all 197k+ items in DuckDB (<15ms)
+    and saves project defaults without stalling in Python loops.
+    When scope is 'item', updates only the target item.
+    """
+    pid = _resolve_project_id(project_id)
+    scope = (req.scope or "all").lower().strip()
+    target_id = req.item_id or req.itemId
+    target_horizon = req.approval_horizon or req.approvalHorizon
+
+    if scope == "item" and target_id:
+        updates = {}
+        if req.seasonality_period is not None:
+            updates["seasonality_period"] = normalize_seasonality_period(req.seasonality_period)
+        elif req.seasonality_pattern is not None:
+            updates["seasonality_period"] = normalize_seasonality_period(req.seasonality_pattern)
+        if req.forecast_approach is not None:
+            updates["forecast_approach"] = normalize_forecast_approach(req.forecast_approach)
+        if req.model_type is not None:
+            updates["model_type"] = req.model_type
+        if target_horizon is not None:
+            updates["approval_horizon"] = str(target_horizon).strip()
+
+        update_item_parameters(pid, target_id, updates)
+        return {
+            "project_id": pid,
+            "status": "success",
+            "scope": "item",
+            "item_id": target_id,
+            "updates": updates
+        }
+    else:
+        settings_dict = {}
+        if req.seasonality_period is not None:
+            settings_dict["seasonality_period"] = normalize_seasonality_period(req.seasonality_period)
+        elif req.seasonality_pattern is not None:
+            settings_dict["seasonality_period"] = normalize_seasonality_period(req.seasonality_pattern)
+        if req.forecast_approach is not None:
+            settings_dict["forecast_approach"] = normalize_forecast_approach(req.forecast_approach)
+        if req.model_type is not None:
+            settings_dict["model_type"] = req.model_type
+        if target_horizon is not None:
+            settings_dict["approval_horizon"] = str(target_horizon).strip()
+
+        res = update_project_forecast_settings(pid, settings_dict, current_item_id=target_id)
+        res["scope"] = "all"
+        return res
 
 class OverrideRequest(BaseModel):
     item_id: Optional[str] = None

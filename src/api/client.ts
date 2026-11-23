@@ -272,6 +272,15 @@ export interface PaginatedInventoryResponse {
   kpis?: DashboardKpis;
 }
 
+export interface ProjectForecastDefaults {
+  seasonalityPattern: string;
+  seasonalityPeriod: number;
+  forecastApproach: 'item' | 'category';
+  approvalHorizon?: string;
+  minActualDate?: string | null;
+  maxActualDate?: string | null;
+}
+
 export interface PaginatedDemandResponse {
   project_id: string;
   page: number;
@@ -284,6 +293,7 @@ export interface PaginatedDemandResponse {
   categories: string[];
   series: InventoryItem[];
   items: InventoryItem[];
+  project_defaults?: ProjectForecastDefaults;
 }
 
 export interface DashboardSummaryResponse {
@@ -502,6 +512,7 @@ export const api = {
     kpis: DashboardKpis;
     dormant_count?: number;
     excluded_dormant_count?: number;
+    project_defaults?: ProjectForecastDefaults;
   }> {
     const locQuery = location && location !== 'ALL' ? `?location=${encodeURIComponent(location)}` : '';
     const res = await fetch(`${API_BASE}/projects/${projectId}/workspace${locQuery}`);
@@ -579,6 +590,25 @@ export const api = {
     return res.json();
   },
 
+  async getCategorySeries(projectId: string, category: string, location?: string): Promise<{
+    project_id: string;
+    category: string;
+    location: string;
+    sku_count: number;
+    total_sales: number;
+    periods: Array<{ date: string; actual: number; revenue: number }>;
+  }> {
+    const q = new URLSearchParams({
+      category: category || 'General'
+    });
+    if (location && location !== 'ALL') {
+      q.append('location', location);
+    }
+    const res = await fetch(`${API_BASE}/projects/${projectId}/forecast/category-series?${q.toString()}`);
+    if (!res.ok) throw new Error(`Failed to load category series: ${res.statusText}`);
+    return res.json();
+  },
+
   async getDashboard(projectId?: string, location?: string): Promise<DashboardSummaryResponse> {
     const q = new URLSearchParams();
     if (projectId) q.append('project_id', projectId);
@@ -604,6 +634,33 @@ export const api = {
         body: JSON.stringify(updates),
       });
     }
+  },
+
+  async updateForecastSettings(projectId: string, params: {
+    scope: 'all' | 'item';
+    seasonality_period?: string;
+    seasonality_pattern?: string;
+    forecast_approach?: string;
+    model_type?: string;
+    approval_horizon?: string;
+    item_id?: string;
+  }): Promise<{
+    project_id: string;
+    status: string;
+    scope: string;
+    seasonality_period?: string;
+    forecast_approach?: string;
+    approval_horizon?: string;
+    project_defaults?: ProjectForecastDefaults;
+    updated_item?: any;
+  }> {
+    const res = await fetch(`${API_BASE}/projects/${projectId}/forecast-settings`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(params)
+    });
+    if (!res.ok) throw new Error(`Failed to update forecast settings: ${res.statusText}`);
+    return res.json();
   },
 
   async bulkSaveItems(

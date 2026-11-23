@@ -13,18 +13,13 @@ import {
   resolveHorizon,
   getNextPeriodDate,
   detectPeriodsGranularity,
-  mean
+  mean,
+  normalizeHorizonKey
 } from './engine/math';
 
 export function shouldAutoRecalculateItem(item: InventoryItem): boolean {
   if (!item || !item.periods || item.periods.length === 0) return false;
-  const hasActuals = item.periods.some(p => (p.actual || 0) > 0);
-  if (!hasActuals) return false;
-
-  const hasFutureForecast = item.periods.some(p => (p.actual || 0) === 0 && (p.forecast || 0) > 0);
-  const allModelsZero = item.periods.every(p => (p.model || 0) === 0);
-
-  return !hasFutureForecast || allModelsZero;
+  return item.periods.some(p => (p.actual || 0) > 0);
 }
 import { Language, translations } from './i18n/translations';
 import { DEFAULT_APP_SETTINGS, formatCurrency, getCurrencySymbol, formatItemCode } from './utils/formatters';
@@ -125,10 +120,31 @@ export const App: React.FC = () => {
       }
 
       const ws = await api.getWorkspace(projectId, effectiveLoc);
+      const pd = (ws as any)?.project_defaults;
+      let effectiveHorizon = settings.forecast_horizon_periods;
+      let effectiveMaxDate = settings.max_actual_date;
+      let effectiveMinDate = settings.min_actual_date;
+      if (pd) {
+        if (pd.approvalHorizon) effectiveHorizon = normalizeHorizonKey(pd.approvalHorizon);
+        if (pd.maxActualDate) {
+          effectiveMaxDate = pd.maxActualDate;
+          effectiveMinDate = pd.minActualDate;
+        }
+        setSettings(prev => ({
+          ...prev,
+          forecast_horizon_periods: effectiveHorizon,
+          max_actual_date: effectiveMaxDate,
+          min_actual_date: effectiveMinDate,
+        }));
+      }
       if (ws && ws.items && ws.items.length > 0) {
         const analyzable = ws.items.filter(isAnalyzableItem);
         const baseItems = analyzable.length > 0 ? analyzable : ws.items;
-        const recalculated = baseItems.map(i => shouldAutoRecalculateItem(i) ? recalculateItem(i) : i);
+        const dateBounds = { minActualDate: effectiveMinDate, maxActualDate: effectiveMaxDate };
+        const recalculated = baseItems.map(i => shouldAutoRecalculateItem(i)
+          ? recalculateItem(i, undefined, undefined, effectiveHorizon, pd?.seasonalityPeriod, dateBounds)
+          : i
+        );
         setItems(recalculated);
         setSelectedItemId(recalculated[0]?.id || ws.items[0].id);
         setActiveProjectId(projectId);
@@ -231,66 +247,138 @@ export const App: React.FC = () => {
   const selectedItem = items.find(i => i.id === selectedItemId) || items[0];
 
   // Recalculate item forecast and replenishment using the verified math engine
-  const recalculateItem = (item: InventoryItem, newModel?: ModelType, newStrategy?: ReplenishmentStrategy): InventoryItem => {
+  const recalculateItem = (
+    item: InventoryItem,
+    newModel?: ModelType,
+    newStrategy?: ReplenishmentStrategy,
+    horizonOverride?: string | number,
+    seasonalityOverride?: string | number,
+    dateBoundsOverride?: { minActualDate?: string | null; maxActualDate?: string | null }
+  ): InventoryItem => {
     const modelToUse = newModel || item.modelType;
     const strategyToUse = newStrategy || item.replenishmentStrategy;
-
-    const actuals = item.periods.filter(p => p.actual > 0).map(p => p.actual);
 
     // Detect the actual cadence of historical periods to prevent 30x daily-vs-monthly inflation (Issue 6)
     const seriesGranularity = detectPeriodsGranularity(item.periods);
     const horizonGranularity = seriesGranularity;
 
-    // Resolve planning horizon based on item notes (if per-item approvalHorizon set) or global settings
-    let activeHorizonRaw: string | number = settings?.forecast_horizon_periods || '12m';
-    const horizonMatch = item.notes?.match(/approvalHorizon:([0-9a-zA-Z]+)/);
-    if (horizonMatch && horizonMatch[1]) {
-      activeHorizonRaw = horizonMatch[1];
-    }
+    // Resolve planning horizon strictly from active project-level settings (Single Source of Truth, never per-item notes)
+    const activeHorizonRaw: string | number = horizonOverride || settings?.forecast_horizon_periods || '12m';
     const horizonCfg = resolveHorizon(activeHorizonRaw, horizonGranularity);
     const horizon = horizonCfg.forecastPeriods;
 
-    let res;
-    if (modelToUse === 'constant') res = fitConstantModel(actuals, horizon);
-    else if (modelToUse === 'linear') res = fitLinearTrendModel(actuals, horizon);
-    else if (modelToUse === 'seasonal') res = fitSeasonalModel(actuals, horizon, 12);
-    else if (modelToUse === 'intermittent') res = fitIntermittentModel(actuals, horizon);
-    else if (modelToUse === 'zero') res = {
-      modelType: 'zero' as ModelType,
-      fitted: actuals.map(() => 0),
-      forecast: Array(horizon).fill(0),
-      confUpper: Array(horizon).fill(0),
-      confLower: Array(horizon).fill(0),
-      mape: 0,
-      wmape: 0,
-      accuracy: 100
-    };
-    else res = autoSelectModel(actuals, horizon);
-
-    // Separate historical periods and existing future periods
-    const historicalPeriods: TimeSeriesPeriod[] = [];
-    const existingFuturePeriods: TimeSeriesPeriod[] = [];
-    item.periods.forEach(p => {
-      if ((p.actual || 0) > 0) {
-        historicalPeriods.push(p);
-      } else {
-        existingFuturePeriods.push(p);
+    // Resolve seasonality period: 12 (annual), 4 (quarterly), 0 (no seasonality)
+    let seasonLength = 12;
+    if (seasonalityOverride !== undefined && seasonalityOverride !== null) {
+      const rawSeason = String(seasonalityOverride).trim();
+      seasonLength = (rawSeason === '0' || rawSeason === 'none') ? 0 : (Number(rawSeason) || 12);
+    } else if (item.seasonalityPeriod !== undefined) {
+      seasonLength = Number(item.seasonalityPeriod);
+    } else if (item.seasonalityPattern !== undefined) {
+      seasonLength = (item.seasonalityPattern === '0' || item.seasonalityPattern === 'none') ? 0 : (Number(item.seasonalityPattern) || 12);
+    } else {
+      const seasonMatch = item.notes?.match(/seasonality:([0-9]+)/);
+      if (seasonMatch && seasonMatch[1]) {
+        seasonLength = parseInt(seasonMatch[1], 10);
       }
+    }
+
+    // Resolve project-wide calendar boundaries: latest and earliest historical actual months
+    const maxActualDate = dateBoundsOverride?.maxActualDate
+      || settings?.max_actual_date
+      || item.periods.filter(p => (p.actual || 0) > 0).map(p => p.date).sort().pop()
+      || '2026-10';
+    const minActualDate = dateBoundsOverride?.minActualDate
+      || settings?.min_actual_date
+      || item.periods.find(p => (p.actual || 0) > 0)?.date
+      || item.periods[0]?.date
+      || '2026-01';
+
+    // Build unbroken continuous historical calendar timeline from minActualDate up to maxActualDate
+    const continuousDates: string[] = [];
+    let curDate = minActualDate;
+    let guard = 0;
+    while (curDate <= maxActualDate && guard < 600) {
+      continuousDates.push(curDate);
+      curDate = getNextPeriodDate(curDate, 1, horizonGranularity);
+      guard++;
+    }
+
+    // Map existing periods (both historical and future overrides) by date
+    const existingPeriodMap = new Map<string, TimeSeriesPeriod>();
+    (item.periods || []).forEach(p => {
+      existingPeriodMap.set(p.date, p);
     });
 
-    // Update fitted values for historical periods
+    // Construct clean, zero-filled historical periods ending precisely on maxActualDate
+    const historicalPeriods: TimeSeriesPeriod[] = continuousDates.map(d => {
+      const existing = existingPeriodMap.get(d);
+      if (existing) {
+        return {
+          ...existing,
+          actual: existing.actual || 0,
+        };
+      }
+      return {
+        date: d,
+        actual: 0,
+        model: 0,
+        revenue: 0,
+        promotion: 0
+      };
+    });
+
+    // Actuals array for model fitting
+    const ignoreZeroSales = !item.notes?.includes('ignoreZeroSales:false');
+    const actuals = historicalPeriods.map(p => p.actual || 0);
+
+    let res;
+    if (modelToUse === 'constant') {
+      const constantActuals = ignoreZeroSales ? actuals.filter(a => a > 0) : actuals;
+      res = fitConstantModel(constantActuals.length > 0 ? constantActuals : actuals, horizon);
+    } else if (modelToUse === 'intermittent') {
+      res = fitIntermittentModel(actuals, horizon);
+    } else if (modelToUse === 'zero') {
+      res = {
+        modelType: 'zero' as ModelType,
+        fitted: actuals.map(() => 0),
+        forecast: Array(horizon).fill(0),
+        confUpper: Array(horizon).fill(0),
+        confLower: Array(horizon).fill(0),
+        mape: 0,
+        wmape: 0,
+        accuracy: 100
+      };
+    } else if (seasonLength > 0 && actuals.length >= seasonLength && (modelToUse === 'seasonal' || modelToUse === 'linear' || modelToUse === 'auto')) {
+      res = fitSeasonalModel(actuals, horizon, seasonLength);
+    } else if (modelToUse === 'linear') {
+      res = fitLinearTrendModel(actuals, horizon);
+    } else if (modelToUse === 'seasonal') {
+      res = seasonLength > 0 && actuals.length >= seasonLength 
+        ? fitSeasonalModel(actuals, horizon, seasonLength) 
+        : fitLinearTrendModel(actuals, horizon);
+    } else {
+      res = autoSelectModel(actuals, horizon, seasonLength);
+    }
+
+    // Update fitted values for historical periods and strictly clear any stale forecast/override/confidence fields
     const updatedHistorical = historicalPeriods.map((p, i) => ({
       ...p,
-      model: res.fitted[i] !== undefined ? Math.round(res.fitted[i]) : p.actual
+      actual: p.actual || 0,
+      model: res.fitted[i] !== undefined ? Math.round(res.fitted[i]) : (p.actual || 0),
+      forecast: 0,
+      confUpper: undefined,
+      confLower: undefined,
+      override: undefined,
     }));
 
-    // Build updated future periods matching horizon
-    const lastDate = historicalPeriods.length > 0 ? historicalPeriods[historicalPeriods.length - 1].date : '2026-09';
+    // Build updated future periods matching horizon starting immediately after maxActualDate
+    const lastDate = maxActualDate;
     const updatedFuture: TimeSeriesPeriod[] = [];
 
     for (let h = 0; h < horizon; h++) {
-      const existing = existingFuturePeriods[h];
-      const futureDate = existing ? existing.date : getNextPeriodDate(lastDate, h + 1, horizonGranularity);
+      const futureDate = getNextPeriodDate(lastDate, h + 1, horizonGranularity);
+      const existing = existingPeriodMap.get(futureDate);
       
       let baseForecast = Math.round(res.forecast[h] || 0);
       let upper = Math.round(res.confUpper[h] || baseForecast * 1.2);
@@ -324,7 +412,7 @@ export const App: React.FC = () => {
 
     const updatedBase: InventoryItem = {
       ...item,
-      modelType: modelToUse,
+      modelType: (seasonLength > 0 && actuals.length >= seasonLength && (modelToUse === 'seasonal' || modelToUse === 'linear')) ? 'seasonal' : (modelToUse || res.modelType),
       replenishmentStrategy: strategyToUse,
       fittedModelType: res.modelType,
       periods: updatedPeriods,
@@ -438,18 +526,7 @@ export const App: React.FC = () => {
     setItems(prev => prev.map(item => {
       if (item.id === itemId) {
         const mergedItem: InventoryItem = { ...item, ...updates };
-        let activeHorizonRaw: string | number = settings?.forecast_horizon_periods || '12m';
-        const horizonMatch = mergedItem.notes?.match(/approvalHorizon:([0-9a-zA-Z]+)/);
-        if (horizonMatch && horizonMatch[1]) {
-          activeHorizonRaw = horizonMatch[1];
-        }
-        const horizonCfg = resolveHorizon(activeHorizonRaw, settings?.period_granularity || 'monthly');
-        const forecastVals = mergedItem.periods.filter(p => p.forecast !== undefined).map(p => p.forecast!);
-        const metrics = calculateItemReplenishment(mergedItem, forecastVals, horizonCfg.periodDays);
-        const fullyUpdated: InventoryItem = {
-          ...mergedItem,
-          ...metrics,
-        };
+        const fullyUpdated = recalculateItem(mergedItem);
 
         // Persist to DuckDB backend in background
         api.updateItemParameters(activeProjectId, itemId, {
@@ -683,6 +760,30 @@ export const App: React.FC = () => {
     });
   };
 
+  const handleApprovalHorizonChange = (horizon: string) => {
+    const norm = normalizeHorizonKey(horizon);
+    setSettings(prev => ({ ...prev, forecast_horizon_periods: norm }));
+  };
+
+  const handleProjectDefaultsLoaded = useCallback((defaults: any) => {
+    if (defaults) {
+      setSettings(prev => {
+        const normHorizon = defaults.approvalHorizon ? normalizeHorizonKey(defaults.approvalHorizon) : prev.forecast_horizon_periods;
+        const newMax = defaults.maxActualDate || prev.max_actual_date;
+        const newMin = defaults.minActualDate || prev.min_actual_date;
+        if (prev.forecast_horizon_periods === normHorizon && prev.max_actual_date === newMax && prev.min_actual_date === newMin) {
+          return prev;
+        }
+        return {
+          ...prev,
+          forecast_horizon_periods: normHorizon,
+          max_actual_date: newMax,
+          min_actual_date: newMin,
+        };
+      });
+    }
+  }, []);
+
   return (
     <div className={`h-screen w-screen flex flex-col bg-[#F8F9FA] text-[#1E293B] overflow-hidden ${language === 'ar' ? 'font-arabic' : 'font-sans'}`}>
       {/* 0. Top GitHub Auto-Update Notification Banner */}
@@ -716,7 +817,7 @@ export const App: React.FC = () => {
         selectedLocation={selectedLocation}
         availableLocations={availableLocations}
         onLocationChange={handleLocationChange}
-        totalSkus={items.length}
+        totalSkus={availableLocations.length > 0 ? availableLocations.reduce((acc, l) => acc + (l.sku_count || 0), 0) : items.length}
       />
 
       {/* 2. Main Workspace Body with Slim Navigation Rail */}
@@ -772,11 +873,14 @@ export const App: React.FC = () => {
                 onOverrideChange={handleOverrideChange}
                 onExplainCalculation={i => setExplainingItem(i)}
                 onParameterChange={handleItemParameterChange}
+                onOpenSettings={() => setActiveTab('settings')}
                 onNavigateToDataHub={() => setActiveTab('data-hub')}
                 settings={settings}
                 language={language}
                 selectedLocation={selectedLocation}
                 recalculateItem={recalculateItem}
+                onApprovalHorizonChange={handleApprovalHorizonChange}
+                onProjectDefaultsLoaded={handleProjectDefaultsLoaded}
               />
             ) : (
               <div className="flex-1 flex flex-col items-center justify-center p-8 bg-[#F8F9FA] text-[#1E293B]">
@@ -855,7 +959,7 @@ export const App: React.FC = () => {
               selectedLocation={selectedLocation}
               availableLocations={availableLocations}
               onLocationChange={handleLocationChange}
-              totalSkus={items.length}
+              totalSkus={availableLocations.length > 0 ? availableLocations.reduce((acc, l) => acc + (l.sku_count || 0), 0) : items.length}
             />
           )}
 

@@ -32,6 +32,7 @@ export interface TimeSeriesPeriod {
   confLower?: number;
   override?: number;
   promotion?: number; // % promo discount / lift
+  revenue?: number;   // period sales revenue
   label?: string;     // display label (e.g. for sub-monthly periods)
 }
 
@@ -70,6 +71,12 @@ export interface InventoryItem {
   // Model Settings
   modelType: ModelType;
   replenishmentStrategy: ReplenishmentStrategy;
+  forecastApproach?: 'item' | 'category';
+  seasonalityPattern?: string; // '12' | '4' | '0'
+  seasonalityPeriod?: number;
+  approvalHorizon?: string;
+  modelStatus?: 'active' | 'inactive';
+  status?: 'active' | 'inactive';
   
   // Calculated Demand Metrics
   periods: TimeSeriesPeriod[];
@@ -176,5 +183,7 @@ export interface AppSettings {
   abc_b_cutoff: number;
   xyz_x_cv: number;
   xyz_y_cv: number;
+  min_actual_date?: string | null;
+  max_actual_date?: string | null;
   updated_at?: string;
 }

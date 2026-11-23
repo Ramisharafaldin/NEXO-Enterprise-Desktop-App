@@ -397,7 +397,7 @@ export const TopMenuBar: React.FC<TopMenuBarProps> = ({
               title={isAr ? 'اختر نطاق تحليل الفرع أو جميع الفروع معاً' : 'Select branch scope or all branches combined'}
             >
               <option value="ALL">
-                {isAr ? 'جميع الفروع (الكل)' : 'All Branches (Combined)'} ({totalSkus || availableLocations?.reduce((acc, l) => acc + l.sku_count, 0) || 0})
+                {isAr ? 'جميع الفروع (الكل)' : 'All Branches (Combined)'} ({((availableLocations && availableLocations.length > 0) ? availableLocations.reduce((acc, l) => acc + (l.sku_count || 0), 0) : (totalSkus || 0)).toLocaleString()})
               </option>
               {availableLocations?.map(loc => (
                 <option key={loc.location} value={loc.location}>

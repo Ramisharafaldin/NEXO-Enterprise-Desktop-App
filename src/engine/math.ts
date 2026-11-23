@@ -174,9 +174,11 @@ export function fitLinearTrendModel(actuals: number[], horizon: number): Forecas
 
   const fitted = actuals.map((_, t) => Math.max(0, intercept + slope * t));
   const forecast: number[] = [];
+  const phi = 0.85; // Trend damping factor (Gardner & McKenzie) to prevent linear extrapolation explosion
+  let cumulativeTrend = 0;
   for (let h = 0; h < horizon; h++) {
-    const t = n + h;
-    forecast.push(Math.max(0, intercept + slope * t));
+    cumulativeTrend += Math.pow(phi, h + 1);
+    forecast.push(Math.max(0, intercept + slope * (n - 1) + slope * cumulativeTrend));
   }
 
   const residuals = actuals.map((y, t) => y - fitted[t]);
@@ -240,7 +242,7 @@ export function fitSeasonalModel(actuals: number[], horizon: number, seasonLengt
   const slope = den !== 0 ? num / den : 0;
   const intercept = dMean - slope * tMean;
 
-  // 3. Generate fitted and forecast
+  // 3. Generate fitted and forecast with damped linear trend
   const fitted = actuals.map((_, t) => {
     const trend = Math.max(0, intercept + slope * t);
     const season = normIndices[t % seasonLength];
@@ -248,10 +250,12 @@ export function fitSeasonalModel(actuals: number[], horizon: number, seasonLengt
   });
 
   const forecast: number[] = [];
+  const phi = 0.85; // Trend damping factor
+  let cumulativeTrend = 0;
   for (let h = 0; h < horizon; h++) {
-    const t = n + h;
-    const trend = Math.max(0, intercept + slope * t);
-    const season = normIndices[t % seasonLength];
+    cumulativeTrend += Math.pow(phi, h + 1);
+    const trend = Math.max(0, intercept + slope * (n - 1) + slope * cumulativeTrend);
+    const season = normIndices[(n + h) % seasonLength];
     forecast.push(Math.max(0, trend * season));
   }
 
@@ -365,9 +369,9 @@ export function autoSelectModel(actuals: number[], horizon: number, seasonLength
     return { ...intermittent, modelType: 'intermittent' };
   }
 
-  // 3. Test Seasonality Autocorrelation
+  // 3. Test Seasonality Autocorrelation (skip if seasonLength <= 0 or user requested no seasonality)
   let hasSeasonality = false;
-  if (n >= seasonLength * 1.5) {
+  if (seasonLength > 0 && n >= seasonLength * 1.5) {
     const r12 = autocorrelation(actuals, seasonLength);
     if (r12 >= 0.25) {
       hasSeasonality = true;
@@ -380,7 +384,7 @@ export function autoSelectModel(actuals: number[], horizon: number, seasonLength
     fitLinearTrendModel(actuals, horizon)
   ];
 
-  if (hasSeasonality) {
+  if (hasSeasonality && seasonLength > 0) {
     candidates.push(fitSeasonalModel(actuals, horizon, seasonLength));
   }
 

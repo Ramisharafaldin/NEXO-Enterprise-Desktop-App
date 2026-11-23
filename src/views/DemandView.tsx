@@ -1,6 +1,15 @@
 import React, { useState, useMemo, useRef, useEffect, useCallback } from 'react';
-import { InventoryItem, ModelType, ReplenishmentStrategy, AppSettings, isAnalyzableItem } from '../engine/types';
-import { normalizeHorizonKey } from '../engine/math';
+import { InventoryItem, ModelType, ReplenishmentStrategy, AppSettings, TimeSeriesPeriod, isAnalyzableItem } from '../engine/types';
+import { 
+  normalizeHorizonKey, 
+  fitConstantModel, 
+  fitLinearTrendModel, 
+  fitSeasonalModel, 
+  fitIntermittentModel, 
+  autoSelectModel, 
+  resolveHorizon, 
+  getNextPeriodDate 
+} from '../engine/math';
 import { shouldAutoRecalculateItem } from '../App';
 import { translations, Language } from '../i18n/translations';
 import { formatItemCode } from '../utils/formatters';
@@ -22,7 +31,6 @@ import {
   FileText, 
   Sliders, 
   Eye, 
-  Layers, 
   ChevronRight, 
   ChevronDown, 
   Folder, 
@@ -33,7 +41,10 @@ import {
   RotateCcw,
   X,
   Upload,
-  Filter
+  Filter,
+  Loader2,
+  Check,
+  MapPin
 } from 'lucide-react';
 
 interface DemandViewProps {
@@ -50,7 +61,16 @@ interface DemandViewProps {
   language: Language;
   projectId?: string;
   selectedLocation?: string;
-  recalculateItem?: (item: InventoryItem, newModel?: ModelType, newStrategy?: ReplenishmentStrategy) => InventoryItem;
+  recalculateItem?: (
+    item: InventoryItem,
+    newModel?: ModelType,
+    newStrategy?: ReplenishmentStrategy,
+    horizonOverride?: string | number,
+    seasonalityOverride?: string | number,
+    dateBoundsOverride?: { minActualDate?: string | null; maxActualDate?: string | null }
+  ) => InventoryItem;
+  onApprovalHorizonChange?: (horizon: string) => void;
+  onProjectDefaultsLoaded?: (defaults: any) => void;
 }
 
 export const DemandView: React.FC<DemandViewProps> = ({
@@ -68,17 +88,45 @@ export const DemandView: React.FC<DemandViewProps> = ({
   projectId = 'proj_default_retail',
   selectedLocation,
   recalculateItem,
+  onApprovalHorizonChange,
+  onProjectDefaultsLoaded,
 }) => {
+  const t = translations[language];
+  const isAr = language === 'ar';
+  const isAllLocations = !selectedLocation || selectedLocation.toUpperCase() === 'ALL';
+
+  // Single Source of Truth: Project-level defaults inherited by all SKUs without overrides
+  const [projectDefaults, setProjectDefaults] = useState<{
+    seasonalityPattern: string;
+    seasonalityPeriod: number;
+    forecastApproach: 'item' | 'category';
+    approvalHorizon?: string;
+    minActualDate?: string | null;
+    maxActualDate?: string | null;
+  }>({
+    seasonalityPattern: '12',
+    seasonalityPeriod: 12,
+    forecastApproach: 'item',
+    approvalHorizon: '12m',
+    minActualDate: null,
+    maxActualDate: null,
+  });
+
+  const [approvalHorizon, setApprovalHorizon] = useState<string>(
+    settings?.forecast_horizon_periods ? normalizeHorizonKey(settings.forecast_horizon_periods) : '12m'
+  );
+  const [seasonalityPattern, setSeasonalityPattern] = useState<string>('12');
+
   const selectedItem = useMemo(() => {
     if (!rawSelectedItem) return undefined;
     if (recalculateItem && shouldAutoRecalculateItem(rawSelectedItem)) {
-      return recalculateItem(rawSelectedItem);
+      const effHorizon = approvalHorizon || projectDefaults.approvalHorizon || '12m';
+      const effSeason = seasonalityPattern || projectDefaults.seasonalityPattern || '12';
+      const dateBounds = { minActualDate: projectDefaults.minActualDate, maxActualDate: projectDefaults.maxActualDate };
+      return recalculateItem(rawSelectedItem, undefined, undefined, effHorizon, effSeason, dateBounds);
     }
     return rawSelectedItem;
-  }, [rawSelectedItem, recalculateItem]);
-
-  const t = translations[language];
-  const isAr = language === 'ar';
+  }, [rawSelectedItem, recalculateItem, approvalHorizon, seasonalityPattern, projectDefaults]);
 
   // Pane 1 State
   const treeSearchRef = useRef<HTMLInputElement>(null);
@@ -101,20 +149,195 @@ export const DemandView: React.FC<DemandViewProps> = ({
   const [ignoreZeroSales, setIgnoreZeroSales] = useState(true);
   const [ignoreStockoutDays, setIgnoreStockoutDays] = useState(true);
   const [useHolidays, setUseHolidays] = useState(true);
-  const [approvalHorizon, setApprovalHorizon] = useState<string>('6m');
   const [adjustLevel, setAdjustLevel] = useState(1.0);
 
+  // Quick Full-DB Search State
+  const [isQuickSearchOpen, setIsQuickSearchOpen] = useState(false);
+  const [quickSearchTerm, setQuickSearchTerm] = useState('');
+  const [quickSearchResults, setQuickSearchResults] = useState<InventoryItem[]>([]);
+  const [isQuickSearching, setIsQuickSearching] = useState(false);
+
+  // Demand & Forecast Settings Modal State
+  const [isSettingsModalOpen, setIsSettingsModalOpen] = useState(false);
+  const [modalHorizon, setModalHorizon] = useState<string>('12m');
+  const [modalModel, setModalModel] = useState<ModelType>('auto');
+  const [modalSeasonality, setModalSeasonality] = useState<string>('12');
+  const [isRecalculatingAll, setIsRecalculatingAll] = useState(false);
+
+  // Forecast Level & Category Aggregation State
+  const [forecastApproach, setForecastApproach] = useState<'item' | 'category'>('item');
+  const [categorySeriesData, setCategorySeriesData] = useState<{
+    category: string;
+    sku_count: number;
+    total_sales: number;
+    periods: TimeSeriesPeriod[];
+  } | null>(null);
+  const [isLoadingCategorySeries, setIsLoadingCategorySeries] = useState(false);
+
+  // Model Status State
+  const [modelStatus, setModelStatus] = useState<'active' | 'inactive'>('active');
+
+  const [toastMessage, setToastMessage] = useState<string | null>(null);
+  const toastTimeoutRef = useRef<NodeJS.Timeout | null>(null);
+
+  const firstFutureColRef = useRef<HTMLTableCellElement>(null);
+  const rawSelectedItemRef = useRef(rawSelectedItem);
+  useEffect(() => {
+    rawSelectedItemRef.current = rawSelectedItem;
+  }, [rawSelectedItem]);
+
+  const showToast = useCallback((msg: string) => {
+    if (toastTimeoutRef.current) clearTimeout(toastTimeoutRef.current);
+    setToastMessage(msg);
+    toastTimeoutRef.current = setTimeout(() => {
+      setToastMessage(null);
+      toastTimeoutRef.current = null;
+    }, 3500);
+  }, []);
+
+  // Synchronize state when selected item, projectDefaults, or settings change
   useEffect(() => {
     if (selectedItem) {
       setCurrentNote(selectedItem.notes || '');
-      const m = selectedItem.notes?.match(/approvalHorizon:([0-9a-zA-Z]+)/);
-      if (m && m[1]) {
-        setApprovalHorizon(normalizeHorizonKey(m[1]));
-      } else if (settings?.forecast_horizon_periods) {
-        setApprovalHorizon(normalizeHorizonKey(settings.forecast_horizon_periods));
-      }
+
+      // Single Source of Truth: Approval Horizon is strictly project-wide and immutable across SKU clicks
+      const projectHorizon = projectDefaults.approvalHorizon 
+        ? normalizeHorizonKey(projectDefaults.approvalHorizon) 
+        : (settings?.forecast_horizon_periods ? normalizeHorizonKey(settings.forecast_horizon_periods) : '12m');
+      setApprovalHorizon(projectHorizon);
+
+      // Forecast approach (Single Source of Truth: projectDefaults, falling back to item)
+      const fAppr = projectDefaults.forecastApproach || selectedItem.forecastApproach || 'item';
+      setForecastApproach(fAppr === 'category' ? 'category' : 'item');
+
+      // Seasonality pattern (Single Source of Truth: projectDefaults, falling back to item)
+      const sPat = projectDefaults.seasonalityPattern 
+        || selectedItem.seasonalityPattern 
+        || '12';
+      setSeasonalityPattern(sPat);
+      setModalSeasonality(sPat);
+
+      // Model status (strictly scoped to this selected item only)
+      setModelStatus(selectedItem.modelStatus === 'inactive' ? 'inactive' : 'active');
+
+      // Model type & horizon modal defaults
+      setModalModel(selectedItem.modelType || 'auto');
+      setModalHorizon(projectHorizon);
+
+      // Outlier / sales flags
+      setIgnoreZeroSales(!selectedItem.notes?.includes('ignoreZeroSales:false'));
+      setIgnoreStockoutDays(!selectedItem.notes?.includes('ignoreStockoutDays:false'));
+      setUseHolidays(!selectedItem.notes?.includes('useHolidays:false'));
     }
-  }, [selectedItem?.id, selectedItem?.notes, settings?.forecast_horizon_periods]);
+  }, [selectedItem?.id, selectedItem?.modelStatus, settings?.forecast_horizon_periods, projectDefaults]);
+
+  // Debounced Full-DB Quick Search against DuckDB
+  useEffect(() => {
+    if (!isQuickSearchOpen) return;
+    if (!quickSearchTerm.trim()) {
+      setQuickSearchResults([]);
+      return;
+    }
+    const timer = setTimeout(async () => {
+      setIsQuickSearching(true);
+      try {
+        const res = await api.getDemand({
+          projectId,
+          search: quickSearchTerm.trim(),
+          location: selectedLocation,
+          pageSize: 25,
+          includeDormant: false
+        });
+        setQuickSearchResults(res.items || []);
+      } catch (err) {
+        console.warn('Quick search error:', err);
+      } finally {
+        setIsQuickSearching(false);
+      }
+    }, 250);
+    return () => clearTimeout(timer);
+  }, [quickSearchTerm, isQuickSearchOpen, projectId, selectedLocation]);
+
+  // Category Aggregate Forecast computation
+  const loadCategorySeries = useCallback(async (catName: string) => {
+    if (!projectId || !catName) return;
+    setIsLoadingCategorySeries(true);
+    try {
+      const res = await api.getCategorySeries(projectId, catName, selectedLocation);
+      const rawPeriods = res.periods || [];
+      if (rawPeriods.length === 0) {
+        setCategorySeriesData({
+          category: catName,
+          sku_count: res.sku_count || 0,
+          total_sales: res.total_sales || 0,
+          periods: []
+        });
+        return;
+      }
+
+      // Run forecast model on category aggregated actuals
+      const actuals = rawPeriods.map(p => p.actual || 0);
+      const horizonCfg = resolveHorizon(approvalHorizon, 'monthly');
+      const horizon = horizonCfg.forecastPeriods;
+      const seasonLen = (seasonalityPattern === '0' || seasonalityPattern === 'none') ? 0 : (Number(seasonalityPattern) || 12);
+
+      const mType = selectedItem?.modelType || 'auto';
+      let fResult;
+      if (mType === 'constant') fResult = fitConstantModel(actuals, horizon);
+      else if (mType === 'linear') fResult = fitLinearTrendModel(actuals, horizon);
+      else if (mType === 'seasonal') {
+        fResult = seasonLen > 0 ? fitSeasonalModel(actuals, horizon, seasonLen) : fitLinearTrendModel(actuals, horizon);
+      } else if (mType === 'intermittent') {
+        fResult = fitIntermittentModel(actuals, horizon);
+      } else {
+        fResult = autoSelectModel(actuals, horizon, seasonLen);
+      }
+
+      // Build historical fitted periods
+      const histPeriods: TimeSeriesPeriod[] = rawPeriods.map((p, i) => ({
+        date: p.date,
+        actual: Math.round(p.actual),
+        model: fResult.fitted[i] !== undefined ? Math.round(fResult.fitted[i]) : Math.round(p.actual),
+        revenue: Math.round(p.revenue || 0)
+      }));
+
+      // Build future forecast periods
+      const lastDate = histPeriods.length > 0 ? histPeriods[histPeriods.length - 1].date : '2026-10';
+      const futureList: TimeSeriesPeriod[] = [];
+      for (let h = 0; h < horizon; h++) {
+        const futureDate = getNextPeriodDate(lastDate, h + 1, 'monthly');
+        const fVal = Math.round(fResult.forecast[h] || 0);
+        const up = Math.round(fResult.confUpper[h] || fVal * 1.2);
+        const low = Math.round(fResult.confLower[h] || fVal * 0.8);
+        futureList.push({
+          date: futureDate,
+          actual: 0,
+          forecast: fVal,
+          model: undefined,
+          confUpper: up,
+          confLower: low
+        });
+      }
+
+      setCategorySeriesData({
+        category: catName,
+        sku_count: res.sku_count || 0,
+        total_sales: res.total_sales || 0,
+        periods: [...histPeriods, ...futureList]
+      });
+    } catch (err) {
+      console.warn('Failed to load category series:', err);
+    } finally {
+      setIsLoadingCategorySeries(false);
+    }
+  }, [projectId, selectedLocation, approvalHorizon, seasonalityPattern, selectedItem?.modelType]);
+
+  // Load category series whenever category mode is active and category is present
+  useEffect(() => {
+    if (forecastApproach === 'category' && selectedItem?.category) {
+      loadCategorySeries(selectedItem.category);
+    }
+  }, [forecastApproach, selectedItem?.category, loadCategorySeries]);
 
   // Pane 2 State
   const [chartMetric, setChartMetric] = useState<'quantity' | 'revenue'>('quantity');
@@ -193,21 +416,57 @@ export const DemandView: React.FC<DemandViewProps> = ({
         location: selectedLocation,
         includeDormant: false
       });
+
+      let effectiveHorizon = approvalHorizon || '12m';
+      let effectiveSeasonality: string | number = seasonalityPattern || '12';
+      let effectiveMinDate = projectDefaults.minActualDate;
+      let effectiveMaxDate = projectDefaults.maxActualDate;
+
+      if (res.project_defaults) {
+        const normHorizon = res.project_defaults.approvalHorizon
+          ? normalizeHorizonKey(res.project_defaults.approvalHorizon)
+          : '12m';
+        effectiveHorizon = normHorizon;
+        effectiveSeasonality = res.project_defaults.seasonalityPeriod ?? res.project_defaults.seasonalityPattern ?? 12;
+        effectiveMinDate = res.project_defaults.minActualDate || null;
+        effectiveMaxDate = res.project_defaults.maxActualDate || null;
+
+        const pd = {
+          seasonalityPattern: String(res.project_defaults.seasonalityPattern || effectiveSeasonality),
+          seasonalityPeriod: Number(res.project_defaults.seasonalityPeriod) || 12,
+          forecastApproach: (res.project_defaults.forecastApproach === 'category' ? 'category' : 'item') as 'item' | 'category',
+          approvalHorizon: normHorizon,
+          minActualDate: effectiveMinDate,
+          maxActualDate: effectiveMaxDate,
+        };
+        setProjectDefaults(pd);
+        setApprovalHorizon(normHorizon);
+        onProjectDefaultsLoaded?.(pd);
+        if (onApprovalHorizonChange && settings?.forecast_horizon_periods !== normHorizon) {
+          onApprovalHorizonChange(normHorizon);
+        }
+      }
+
+      const dateBounds = { minActualDate: effectiveMinDate, maxActualDate: effectiveMaxDate };
       const hydrated = (res.items || []).map(i => {
         if (recalculateItem && shouldAutoRecalculateItem(i)) {
-          return recalculateItem(i);
+          return recalculateItem(i, undefined, undefined, effectiveHorizon, effectiveSeasonality, dateBounds);
         }
         return i;
       });
       setPaginatedItems(hydrated);
       setTotalCount(res.total_count ?? hydrated.length);
       setTotalPages(res.total_pages ?? Math.max(1, Math.ceil((res.total_count || 1) / pageSize)));
-      if (hydrated.length > 0 && !rawSelectedItem) {
+      const currentSelected = rawSelectedItemRef.current;
+      if (hydrated.length > 0 && !currentSelected) {
         onSelectItem(hydrated[0]);
-      } else if (rawSelectedItem && shouldAutoRecalculateItem(rawSelectedItem) && recalculateItem) {
-        const found = hydrated.find(x => x.id === rawSelectedItem.id);
+      } else if (currentSelected && recalculateItem) {
+        const found = hydrated.find(x => x.id === currentSelected.id);
         if (found) {
-          onSelectItem(found);
+          onSelectItem(shouldAutoRecalculateItem(found)
+            ? recalculateItem(found, undefined, undefined, effectiveHorizon, effectiveSeasonality, dateBounds)
+            : found
+          );
         }
       }
     } catch (err) {
@@ -215,7 +474,7 @@ export const DemandView: React.FC<DemandViewProps> = ({
     } finally {
       setIsLoadingList(false);
     }
-  }, [projectId, page, pageSize, debouncedSearch, selectedCategory, rawSelectedItem, onSelectItem, selectedLocation, recalculateItem]);
+  }, [projectId, page, pageSize, debouncedSearch, selectedCategory, onSelectItem, selectedLocation, recalculateItem, onProjectDefaultsLoaded, approvalHorizon, seasonalityPattern, projectDefaults.minActualDate, projectDefaults.maxActualDate, onApprovalHorizonChange, settings?.forecast_horizon_periods]);
 
   useEffect(() => {
     fetchDemandPage();
@@ -261,22 +520,42 @@ export const DemandView: React.FC<DemandViewProps> = ({
     setExpandedCategories(next);
   };
 
-  // Periods formatting
-  const periods = selectedItem?.periods || [];
-  const historicalPeriods = periods.filter(p => (p.actual || 0) > 0);
-  const futurePeriods = periods.filter(p => (p.actual || 0) === 0);
+  // Periods formatting (supports both SKU level and Category Aggregate level)
+  const isCategoryMode = forecastApproach === 'category' && Boolean(categorySeriesData?.periods?.length);
+  const periods = isCategoryMode ? (categorySeriesData?.periods || []) : (selectedItem?.periods || []);
+  const maxActualDate = projectDefaults.maxActualDate 
+    || settings?.max_actual_date 
+    || periods.filter(p => (p.actual || 0) > 0).map(p => p.date).sort().pop() 
+    || '2026-10';
+  const isFuturePeriod = (p: TimeSeriesPeriod) => p.date > maxActualDate;
+  const historicalPeriods = periods.filter(p => !isFuturePeriod(p));
+  const futurePeriods = periods.filter(p => isFuturePeriod(p));
+
+  // Auto-scroll horizontal demand table so recent actuals and upcoming forecast periods are centered on load
+  useEffect(() => {
+    if (firstFutureColRef.current) {
+      firstFutureColRef.current.scrollIntoView({ behavior: 'auto', block: 'nearest', inline: 'center' });
+    }
+  }, [selectedItem?.id, periods.length]);
 
   // Chart data calculation
-  const multiplier = chartMetric === 'revenue' ? (selectedItem?.salesPrice || 1) : 1;
-  const chartData = periods.map(p => ({
-    date: p.label || p.date,
-    actual: (p.actual || 0) > 0 ? Math.round((p.actual || 0) * multiplier) : undefined,
-    model: visibleRows.model && p.model ? Math.round(p.model * multiplier) : undefined,
-    forecast: visibleRows.forecast && p.forecast ? Math.round(p.forecast * multiplier) : undefined,
-    override: p.override ? Math.round(p.override * multiplier) : undefined,
-    confUpper: visibleRows.upperConf && p.confUpper ? Math.round(p.confUpper * multiplier) : undefined,
-    confLower: visibleRows.lowerConf && p.confLower ? Math.round(p.confLower * multiplier) : undefined,
-  }));
+  const multiplier = chartMetric === 'revenue' ? (isCategoryMode ? 1 : (selectedItem?.salesPrice || 1)) : 1;
+  const chartData = periods.map(p => {
+    const isFuture = p.date > maxActualDate;
+    const rawActual = p.actual ?? 0;
+    const rawModel = p.model ?? 0;
+    const rawForecast = p.override ?? p.forecast ?? 0;
+
+    return {
+      date: p.label || p.date,
+      actual: !isFuture ? Math.round(rawActual * multiplier) : null,
+      model: (!isFuture && visibleRows.model) ? Math.round(rawModel * multiplier) : null,
+      forecast: (isFuture && visibleRows.forecast) ? Math.round(rawForecast * multiplier) : null,
+      override: (isFuture && p.override !== undefined && p.override !== null) ? Math.round(p.override * multiplier) : null,
+      confUpper: (isFuture && visibleRows.upperConf && p.confUpper !== undefined && p.confUpper !== null) ? Math.round(p.confUpper * multiplier) : null,
+      confLower: (isFuture && visibleRows.lowerConf && p.confLower !== undefined && p.confLower !== null) ? Math.round(p.confLower * multiplier) : null,
+    };
+  });
 
   // Identify valid Actual Sales data points for dynamic trend gradient
   const validActualPoints = useMemo(() => {
@@ -424,9 +703,252 @@ export const DemandView: React.FC<DemandViewProps> = ({
     setEditingPeriod(null);
   };
 
+  const handleForecastApproachChange = (val: 'item' | 'category') => {
+    setForecastApproach(val);
+    const label = val === 'item' ? (isAr ? 'مستوى الصنف' : 'Item level') : (isAr ? 'مستوى الفئة' : 'Category aggregate');
+
+    setProjectDefaults(prev => ({ ...prev, forecastApproach: val }));
+    setPaginatedItems(prev => prev.map(item => ({
+      ...item,
+      forecastApproach: val
+    })));
+    if (selectedItem) {
+      const updated = { ...selectedItem, forecastApproach: val };
+      onSelectItem(updated);
+      onParameterChange && onParameterChange(selectedItem.id, { forecastApproach: val });
+    }
+    if (projectId) {
+      api.updateForecastSettings(projectId, {
+        scope: 'all',
+        forecast_approach: val,
+        item_id: selectedItem?.id
+      }).catch(err => console.error('Failed to update global forecast approach:', err));
+    }
+    showToast(
+      isAr 
+        ? `تم تطبيق مستوى التنبؤ (${label}) على جميع أصناف المشروع`
+        : `Forecast level (${label}) applied to all project items`
+    );
+  };
+
+  const handleSeasonalityPatternChange = (val: string) => {
+    setSeasonalityPattern(val);
+    const numVal = Number(val);
+    const newModelType: ModelType = (val === '4' || val === '12') ? 'seasonal' : 'auto';
+    const label = val === '12' 
+      ? (isAr ? '12 فترة (سنوي)' : '12 periods (Annual)') 
+      : val === '4' 
+      ? (isAr ? '4 فترات (ربعي)' : '4 periods (Quarterly)') 
+      : (isAr ? 'بدون موسمية' : 'No seasonality');
+
+    // 1. Update projectDefaults immediately
+    setProjectDefaults(prev => ({ ...prev, seasonalityPattern: val, seasonalityPeriod: numVal }));
+
+    const effHorizon = approvalHorizon || projectDefaults.approvalHorizon || '12m';
+    const dateBounds = { minActualDate: projectDefaults.minActualDate, maxActualDate: projectDefaults.maxActualDate };
+
+    // 2. Fast project-wide memory update across all loaded items
+    setPaginatedItems(prev => prev.map(item => {
+      const oldNotes = (item.notes || '').replace(/seasonality:[0-9]+\s*/g, '').trim();
+      const updatedNotes = oldNotes ? `${oldNotes} seasonality:${val}` : `seasonality:${val}`;
+      const updated: InventoryItem = {
+        ...item,
+        modelType: newModelType,
+        seasonalityPattern: val,
+        seasonalityPeriod: numVal,
+        notes: updatedNotes
+      };
+      return recalculateItem ? recalculateItem(updated, undefined, undefined, effHorizon, val, dateBounds) : updated;
+    }));
+
+    if (selectedItem) {
+      const oldNotes = (selectedItem.notes || '').replace(/seasonality:[0-9]+\s*/g, '').trim();
+      const updatedNotes = oldNotes ? `${oldNotes} seasonality:${val}` : `seasonality:${val}`;
+      const updatedSelected: InventoryItem = {
+        ...selectedItem,
+        modelType: newModelType,
+        seasonalityPattern: val,
+        seasonalityPeriod: numVal,
+        notes: updatedNotes
+      };
+      const fullyRecalculated = recalculateItem ? recalculateItem(updatedSelected, undefined, undefined, effHorizon, val, dateBounds) : updatedSelected;
+      onSelectItem(fullyRecalculated);
+      onParameterChange && onParameterChange(selectedItem.id, {
+        modelType: newModelType,
+        seasonalityPattern: val,
+        seasonalityPeriod: numVal,
+        notes: updatedNotes
+      });
+    }
+
+    if (projectId) {
+      api.updateForecastSettings(projectId, {
+        scope: 'all',
+        seasonality_period: val,
+        model_type: newModelType,
+        item_id: selectedItem?.id
+      }).catch(err => console.error('Failed to update global seasonality in DuckDB:', err));
+    }
+
+    showToast(
+      isAr 
+        ? `تم تطبيق نمط الموسمية (${label}) على جميع أصناف المشروع بنجاح`
+        : `Seasonality pattern (${label}) applied to all project items successfully`
+    );
+  };
+
+  const handleApprovalHorizonChange = (val: string) => {
+    const normVal = normalizeHorizonKey(val);
+    setApprovalHorizon(normVal);
+
+    // 1. Update projectDefaults immediately
+    setProjectDefaults(prev => ({ ...prev, approvalHorizon: normVal }));
+
+    // 2. Update settings in App.tsx if listener provided
+    onApprovalHorizonChange && onApprovalHorizonChange(normVal);
+
+    const effSeason = seasonalityPattern || projectDefaults.seasonalityPattern || '12';
+    const dateBounds = { minActualDate: projectDefaults.minActualDate, maxActualDate: projectDefaults.maxActualDate };
+
+    // 3. Fast project-wide memory update across all loaded items
+    setPaginatedItems(prev => prev.map(item => {
+      const oldNotes = (item.notes || '').replace(/approvalHorizon:[0-9a-zA-Z]+\s*/g, '').trim();
+      const updatedNotes = oldNotes ? `${oldNotes} approvalHorizon:${normVal}` : `approvalHorizon:${normVal}`;
+      const updated: InventoryItem = {
+        ...item,
+        approvalHorizon: normVal,
+        notes: updatedNotes
+      };
+      return recalculateItem ? recalculateItem(updated, undefined, undefined, normVal, effSeason, dateBounds) : updated;
+    }));
+
+    if (selectedItem) {
+      const oldNotes = (selectedItem.notes || '').replace(/approvalHorizon:[0-9a-zA-Z]+\s*/g, '').trim();
+      const updatedNotes = oldNotes ? `${oldNotes} approvalHorizon:${normVal}` : `approvalHorizon:${normVal}`;
+      const updatedSelected: InventoryItem = {
+        ...selectedItem,
+        approvalHorizon: normVal,
+        notes: updatedNotes
+      };
+      const fullyRecalculated = recalculateItem ? recalculateItem(updatedSelected, undefined, undefined, normVal, effSeason, dateBounds) : updatedSelected;
+      onSelectItem(fullyRecalculated);
+      onParameterChange && onParameterChange(selectedItem.id, {
+        approvalHorizon: normVal,
+        notes: updatedNotes
+      });
+    }
+
+    if (projectId) {
+      api.updateForecastSettings(projectId, {
+        scope: 'all',
+        approval_horizon: normVal,
+        item_id: selectedItem?.id
+      }).catch(err => console.error('Failed to update global approval horizon in DuckDB:', err));
+    }
+
+    showToast(
+      isAr 
+        ? 'تم تطبيق أفق الاعتماد لكافة الأصناف وحفظه كإعداد افتراضي للمشروع' 
+        : 'Approval horizon applied to all project items and saved as default'
+    );
+  };
+
+  const handleToggleIgnoreZeroSales = () => {
+    const next = !ignoreZeroSales;
+    setIgnoreZeroSales(next);
+
+    const effHorizon = approvalHorizon || projectDefaults.approvalHorizon || '12m';
+    const effSeason = seasonalityPattern || projectDefaults.seasonalityPattern || '12';
+    const dateBounds = { minActualDate: projectDefaults.minActualDate, maxActualDate: projectDefaults.maxActualDate };
+
+    setPaginatedItems(prev => prev.map(item => {
+      const oldNotes = (item.notes || '').replace(/ignoreZeroSales:(true|false)\s*/g, '').trim();
+      const updatedNotes = oldNotes ? `${oldNotes} ignoreZeroSales:${next}` : `ignoreZeroSales:${next}`;
+      const updated: InventoryItem = { ...item, notes: updatedNotes };
+      return recalculateItem ? recalculateItem(updated, undefined, undefined, effHorizon, effSeason, dateBounds) : updated;
+    }));
+
+    if (selectedItem) {
+      const oldNotes = (selectedItem.notes || '').replace(/ignoreZeroSales:(true|false)\s*/g, '').trim();
+      const updatedNotes = oldNotes ? `${oldNotes} ignoreZeroSales:${next}` : `ignoreZeroSales:${next}`;
+      const updatedSelected: InventoryItem = { ...selectedItem, notes: updatedNotes };
+      const fullyRecalculated = recalculateItem ? recalculateItem(updatedSelected, undefined, undefined, effHorizon, effSeason, dateBounds) : updatedSelected;
+      onSelectItem(fullyRecalculated);
+      onParameterChange && onParameterChange(selectedItem.id, { notes: updatedNotes });
+    }
+
+    showToast(
+      isAr
+        ? `تم ${next ? 'تفعيل' : 'تعطيل'} تجاهل المبيعات الصفرية لكافة الأصناف`
+        : `Ignore zero sales ${next ? 'enabled' : 'disabled'} for all project items`
+    );
+  };
+
+  const handleToggleIgnoreStockoutDays = () => {
+    const next = !ignoreStockoutDays;
+    setIgnoreStockoutDays(next);
+
+    const effHorizon = approvalHorizon || projectDefaults.approvalHorizon || '12m';
+    const effSeason = seasonalityPattern || projectDefaults.seasonalityPattern || '12';
+    const dateBounds = { minActualDate: projectDefaults.minActualDate, maxActualDate: projectDefaults.maxActualDate };
+
+    setPaginatedItems(prev => prev.map(item => {
+      const oldNotes = (item.notes || '').replace(/ignoreStockoutDays:(true|false)\s*/g, '').trim();
+      const updatedNotes = oldNotes ? `${oldNotes} ignoreStockoutDays:${next}` : `ignoreStockoutDays:${next}`;
+      const updated: InventoryItem = { ...item, notes: updatedNotes };
+      return recalculateItem ? recalculateItem(updated, undefined, undefined, effHorizon, effSeason, dateBounds) : updated;
+    }));
+
+    if (selectedItem) {
+      const oldNotes = (selectedItem.notes || '').replace(/ignoreStockoutDays:(true|false)\s*/g, '').trim();
+      const updatedNotes = oldNotes ? `${oldNotes} ignoreStockoutDays:${next}` : `ignoreStockoutDays:${next}`;
+      const updatedSelected: InventoryItem = { ...selectedItem, notes: updatedNotes };
+      const fullyRecalculated = recalculateItem ? recalculateItem(updatedSelected, undefined, undefined, effHorizon, effSeason, dateBounds) : updatedSelected;
+      onSelectItem(fullyRecalculated);
+      onParameterChange && onParameterChange(selectedItem.id, { notes: updatedNotes });
+    }
+
+    showToast(
+      isAr
+        ? `تم ${next ? 'تفعيل' : 'تعطيل'} تجاهل أيام النفاد لكافة الأصناف`
+        : `Ignore stockout days ${next ? 'enabled' : 'disabled'} for all project items`
+    );
+  };
+
+  const handleToggleUseHolidays = () => {
+    const next = !useHolidays;
+    setUseHolidays(next);
+
+    const effHorizon = approvalHorizon || projectDefaults.approvalHorizon || '12m';
+    const effSeason = seasonalityPattern || projectDefaults.seasonalityPattern || '12';
+    const dateBounds = { minActualDate: projectDefaults.minActualDate, maxActualDate: projectDefaults.maxActualDate };
+
+    setPaginatedItems(prev => prev.map(item => {
+      const oldNotes = (item.notes || '').replace(/useHolidays:(true|false)\s*/g, '').trim();
+      const updatedNotes = oldNotes ? `${oldNotes} useHolidays:${next}` : `useHolidays:${next}`;
+      const updated: InventoryItem = { ...item, notes: updatedNotes };
+      return recalculateItem ? recalculateItem(updated, undefined, undefined, effHorizon, effSeason, dateBounds) : updated;
+    }));
+
+    if (selectedItem) {
+      const oldNotes = (selectedItem.notes || '').replace(/useHolidays:(true|false)\s*/g, '').trim();
+      const updatedNotes = oldNotes ? `${oldNotes} useHolidays:${next}` : `useHolidays:${next}`;
+      const updatedSelected: InventoryItem = { ...selectedItem, notes: updatedNotes };
+      const fullyRecalculated = recalculateItem ? recalculateItem(updatedSelected, undefined, undefined, effHorizon, effSeason, dateBounds) : updatedSelected;
+      onSelectItem(fullyRecalculated);
+      onParameterChange && onParameterChange(selectedItem.id, { notes: updatedNotes });
+    }
+
+    showToast(
+      isAr
+        ? `تم ${next ? 'تفعيل' : 'تعطيل'} مراعاة العطلات الرسمية لكافة الأصناف`
+        : `Account for official holidays ${next ? 'enabled' : 'disabled'} for all project items`
+    );
+  };
+
   const stickyColClass = isAr 
-    ? 'sticky right-0 bg-inherit border-l border-[#CBD5E1] text-right' 
-    : 'sticky left-0 bg-inherit border-r border-[#CBD5E1] text-left';
+    ? 'sticky right-0 z-20 border-l border-slate-200 text-right shadow-[1px_0_3px_rgba(0,0,0,0.05)]' 
+    : 'sticky left-0 z-20 border-r border-slate-200 text-left shadow-[-1px_0_3px_rgba(0,0,0,0.05)]';
 
   if (!items || items.length === 0 || !selectedItem) {
     return (
@@ -559,11 +1081,13 @@ export const DemandView: React.FC<DemandViewProps> = ({
                         <button
                           key={item.id}
                           onClick={() => {
-                            if (recalculateItem && shouldAutoRecalculateItem(item)) {
-                              onSelectItem(recalculateItem(item));
-                            } else {
-                              onSelectItem(item);
-                            }
+                            const effHorizon = approvalHorizon || projectDefaults.approvalHorizon || '12m';
+                            const effSeason = seasonalityPattern || projectDefaults.seasonalityPattern || '12';
+                            const dateBounds = { minActualDate: projectDefaults.minActualDate, maxActualDate: projectDefaults.maxActualDate };
+                            const recalculated = (recalculateItem && shouldAutoRecalculateItem(item))
+                              ? recalculateItem(item, undefined, undefined, effHorizon, effSeason, dateBounds)
+                              : item;
+                            onSelectItem(recalculated);
                           }}
                           className={`w-full flex items-center gap-1.5 px-2 py-1 rounded text-left text-[11px] transition cursor-pointer ${
                             isSelected
@@ -576,6 +1100,18 @@ export const DemandView: React.FC<DemandViewProps> = ({
                           }`} />
                           <span className="font-mono text-[10px] shrink-0">{formatItemCode(item.code)}</span>
                           <span className="truncate flex-1">{item.description}</span>
+                          {isAllLocations && groupBy !== 'location' && item.location && (
+                            <span 
+                              title={item.location}
+                              className={`text-[9.5px] font-medium px-1.5 py-0.5 rounded shrink-0 max-w-[68px] truncate ${
+                                isSelected
+                                  ? 'bg-white/20 text-white border border-white/30'
+                                  : 'bg-slate-100 text-slate-600 border border-slate-200/80'
+                              }`}
+                            >
+                              {item.location}
+                            </span>
+                          )}
                           {showAbc && (
                             <span className={`text-[9px] px-1 rounded font-bold uppercase shrink-0 ${
                               isSelected ? 'bg-white/20 text-white' : 'bg-slate-200 text-slate-600'
@@ -692,21 +1228,47 @@ export const DemandView: React.FC<DemandViewProps> = ({
               <span>-</span>
               <span className="truncate max-w-xs">{selectedItem.description}</span>
             </span>
+            {selectedItem.location && (
+              <span 
+                title={selectedItem.location}
+                className="inline-flex items-center gap-1 text-[11px] font-semibold px-2 py-0.5 rounded-full bg-slate-100 text-slate-700 border border-slate-200 shrink-0"
+              >
+                <MapPin className="w-3 h-3 text-slate-500 shrink-0" />
+                <span className="truncate max-w-[150px]">{selectedItem.location}</span>
+              </span>
+            )}
+            {isCategoryMode && categorySeriesData && (
+              <span className="inline-flex items-center gap-1.5 px-2 py-0.5 rounded text-[10px] bg-amber-100 text-amber-900 font-bold border border-amber-300">
+                <span className="w-1.5 h-1.5 rounded-full bg-amber-500 animate-pulse" />
+                <span>
+                  {isAr 
+                    ? `تنبؤ مجمع للفئة: ${selectedItem.category} (${categorySeriesData.sku_count} صنف)` 
+                    : `Category Forecast: ${selectedItem.category} (${categorySeriesData.sku_count} SKUs)`}
+                </span>
+                <button
+                  onClick={() => handleForecastApproachChange('item')}
+                  className="ml-1 text-[9px] text-amber-800 hover:text-black underline cursor-pointer"
+                  title={isAr ? 'العودة لمستوى الصنف' : 'Return to item level'}
+                >
+                  ({isAr ? 'إلغاء' : 'Reset'})
+                </button>
+              </span>
+            )}
           </div>
 
           <div className="flex items-center gap-2">
             <button 
-              onClick={() => treeSearchRef.current?.focus()}
+              onClick={() => setIsQuickSearchOpen(true)}
               title={t.demand.centerToolbar.search}
-              className="flex items-center gap-1 px-2 py-0.5 rounded hover:bg-[#E2E8F0] text-slate-600 cursor-pointer transition"
+              className="flex items-center gap-1 px-2 py-0.5 rounded hover:bg-[#E2E8F0] text-slate-600 cursor-pointer transition active:scale-95"
             >
               <Search className="w-3 h-3 text-slate-400" />
               <span>{t.demand.centerToolbar.search}</span>
             </button>
             <button 
-              onClick={() => onOpenSettings?.()}
+              onClick={() => setIsSettingsModalOpen(true)}
               title={t.demand.centerToolbar.settings}
-              className="flex items-center gap-1 px-2 py-0.5 rounded hover:bg-[#E2E8F0] text-slate-600 cursor-pointer transition"
+              className="flex items-center gap-1 px-2 py-0.5 rounded hover:bg-[#E2E8F0] text-slate-600 cursor-pointer transition active:scale-95"
             >
               <Settings className="w-3 h-3 text-slate-400" />
               <span>{t.demand.centerToolbar.settings}</span>
@@ -730,14 +1292,16 @@ export const DemandView: React.FC<DemandViewProps> = ({
           <table className="nexo-grid w-full text-right">
             <thead>
               <tr className="bg-[#ECEFF1] text-slate-700 font-semibold sticky top-0 z-10 text-[12px]">
-                <th className={`w-44 ${stickyColClass} z-20 bg-[#ECEFF1]`}>
+                <th className={`w-44 ${stickyColClass} z-30 bg-[#ECEFF1]`}>
                   {isAr ? 'نوع البيانات / الفترة' : 'Series / Period'}
                 </th>
                 {periods.map((p, idx) => {
-                  const isFuture = (p.actual || 0) === 0;
+                  const isFuture = p.date > maxActualDate;
+                  const isFirstFuture = idx === historicalPeriods.length;
                   return (
                     <th 
                       key={p.date} 
+                      ref={isFirstFuture ? firstFutureColRef : undefined}
                       className={`min-w-[62px] px-2 py-1 text-center font-mono ${
                         isFuture ? 'bg-blue-50/70 text-blue-900 border-b-2 border-b-[#2196F3]' : ''
                       }`}
@@ -760,11 +1324,14 @@ export const DemandView: React.FC<DemandViewProps> = ({
                   <td className={`font-semibold text-slate-800 ${stickyColClass} bg-white`}>
                     {t.demand.gridRows.actual}
                   </td>
-                  {periods.map(p => (
-                    <td key={p.date} className="font-mono text-slate-700">
-                      {(p.actual || 0) > 0 ? (p.actual || 0).toLocaleString() : '-'}
-                    </td>
-                  ))}
+                  {periods.map(p => {
+                    const isFuture = p.date > maxActualDate;
+                    return (
+                      <td key={p.date} className="font-mono text-slate-700">
+                        {isFuture ? '-' : (p.actual || 0).toLocaleString()}
+                      </td>
+                    );
+                  })}
                 </tr>
               )}
 
@@ -785,25 +1352,35 @@ export const DemandView: React.FC<DemandViewProps> = ({
               {/* Row 3: Final forecast */}
               {visibleRows.forecast && (
                 <tr className="hover:bg-blue-50/40 bg-blue-50/20 font-bold text-[#2196F3]">
-                  <td className={`font-bold ${stickyColClass} bg-blue-50/30`}>
+                  <td className={`font-bold ${stickyColClass} bg-[#EFF6FF]`}>
                     {t.demand.gridRows.forecast}
                   </td>
-                  {periods.map(p => (
-                    <td key={p.date} className="font-mono">
-                      {p.forecast !== undefined && p.forecast !== null ? p.forecast.toLocaleString() : '-'}
-                    </td>
-                  ))}
+                  {periods.map(p => {
+                    const isHistorical = p.date <= maxActualDate;
+                    if (isHistorical) {
+                      return (
+                        <td key={p.date} className="font-mono text-slate-300 font-normal">
+                          —
+                        </td>
+                      );
+                    }
+                    return (
+                      <td key={p.date} className="font-mono">
+                        {p.forecast !== undefined && p.forecast !== null ? p.forecast.toLocaleString() : '—'}
+                      </td>
+                    );
+                  })}
                 </tr>
               )}
 
               {/* Row 4: Forecast override (INLINE EDITABLE + DuckDB PERSISTENCE) */}
               {visibleRows.override && (
                 <tr className="bg-amber-50/30 text-amber-900 hover:bg-amber-50/60">
-                  <td className={`font-semibold ${stickyColClass} bg-amber-50/40`}>
+                  <td className={`font-semibold ${stickyColClass} bg-[#FFFBEB]`}>
                     {t.demand.gridRows.override}
                   </td>
                   {periods.map(p => {
-                    const isFuture = (p.actual || 0) === 0;
+                    const isFuture = p.date > maxActualDate;
                     if (!isFuture) {
                       return <td key={p.date} className="font-mono text-slate-300">-</td>;
                     }
@@ -944,7 +1521,7 @@ export const DemandView: React.FC<DemandViewProps> = ({
                 <YAxis 
                   tick={{ fontSize: 10, fill: '#64748B' }} 
                   stroke="#CBD5E1"
-                  domain={['auto', 'auto']}
+                  domain={[0, 'auto']}
                 />
                 <Tooltip 
                   contentStyle={{ 
@@ -1066,21 +1643,30 @@ export const DemandView: React.FC<DemandViewProps> = ({
               <div className="flex items-center justify-between py-1 border-b border-[#F1F5F9]">
                 <span className="text-slate-500">{t.demand.inspector.active}</span>
                 <button
-                  onClick={() => onParameterChange && onParameterChange(selectedItem.id, { checkState: selectedItem.checkState === 'checked' ? 'attention' : 'checked' })}
-                  className={`font-semibold px-2 py-0.5 rounded text-[10px] cursor-pointer ${
-                    selectedItem.checkState === 'checked' ? 'bg-emerald-100 text-emerald-800' : 'bg-slate-200 text-slate-700'
+                  onClick={() => {
+                    const nextStatus = modelStatus === 'active' ? 'inactive' : 'active';
+                    setModelStatus(nextStatus);
+                    const nextCheck = nextStatus === 'active' ? 'checked' : 'undecided';
+                    onParameterChange && onParameterChange(selectedItem.id, { 
+                      modelStatus: nextStatus, 
+                      status: nextStatus, 
+                      checkState: nextCheck 
+                    });
+                  }}
+                  className={`font-semibold px-2 py-0.5 rounded text-[10px] cursor-pointer transition ${
+                    modelStatus === 'active' ? 'bg-emerald-100 text-emerald-800' : 'bg-slate-200 text-slate-700'
                   }`}
                 >
-                  {selectedItem.checkState === 'checked' ? t.demand.inspector.yes : t.demand.inspector.no}
+                  {modelStatus === 'active' ? t.demand.inspector.yes : t.demand.inspector.no}
                 </button>
               </div>
 
               <div className="flex items-center justify-between py-1 border-b border-[#F1F5F9]">
                 <span className="text-slate-500">{t.demand.inspector.forecastApproach}</span>
                 <select
-                  value="item"
-                  onChange={e => onParameterChange && onParameterChange(selectedItem.id, { notes: `Approach: ${e.target.value}` })}
-                  className="px-1.5 py-0.5 border border-slate-300 rounded font-semibold text-slate-800 text-[10px] bg-white"
+                  value={forecastApproach}
+                  onChange={e => handleForecastApproachChange(e.target.value as 'item' | 'category')}
+                  className="px-1.5 py-0.5 border border-slate-300 rounded font-semibold text-slate-800 text-[10px] bg-white cursor-pointer"
                 >
                   <option value="item">{isAr ? 'مستوى الصنف' : 'Item level'}</option>
                   <option value="category">{isAr ? 'مستوى الفئة' : 'Category aggregate'}</option>
@@ -1090,9 +1676,9 @@ export const DemandView: React.FC<DemandViewProps> = ({
               <div className="flex items-center justify-between py-1 border-b border-[#F1F5F9]">
                 <span className="text-slate-500">{t.demand.inspector.seasonalityPattern}</span>
                 <select
-                  value="12"
-                  onChange={e => onParameterChange && onParameterChange(selectedItem.id, { notes: `Seasonality: ${e.target.value}` })}
-                  className="px-1.5 py-0.5 border border-slate-300 rounded font-semibold text-slate-800 text-[10px] bg-white"
+                  value={seasonalityPattern}
+                  onChange={e => handleSeasonalityPatternChange(e.target.value)}
+                  className="px-1.5 py-0.5 border border-slate-300 rounded font-semibold text-slate-800 text-[10px] bg-white cursor-pointer"
                 >
                   <option value="12">{isAr ? '12 فترة (سنوي)' : '12 periods (Annual)'}</option>
                   <option value="4">{isAr ? '4 فترات (ربعي)' : '4 periods (Quarterly)'}</option>
@@ -1103,11 +1689,7 @@ export const DemandView: React.FC<DemandViewProps> = ({
               <div className="flex items-center justify-between py-1 border-b border-[#F1F5F9]">
                 <span className="text-slate-500">{t.demand.inspector.ignoreZeroSales}</span>
                 <button
-                  onClick={() => {
-                    const next = !ignoreZeroSales;
-                    setIgnoreZeroSales(next);
-                    onParameterChange && onParameterChange(selectedItem.id, { notes: `ignoreZeroSales:${next}` });
-                  }}
+                  onClick={handleToggleIgnoreZeroSales}
                   className={`font-semibold px-2 py-0.5 rounded text-[10px] cursor-pointer transition ${
                     ignoreZeroSales ? 'bg-emerald-100 text-emerald-800' : 'bg-slate-200 text-slate-700'
                   }`}
@@ -1118,11 +1700,7 @@ export const DemandView: React.FC<DemandViewProps> = ({
               <div className="flex items-center justify-between py-1 border-b border-[#F1F5F9]">
                 <span className="text-slate-500">{t.demand.inspector.ignoreStockoutDays}</span>
                 <button
-                  onClick={() => {
-                    const next = !ignoreStockoutDays;
-                    setIgnoreStockoutDays(next);
-                    onParameterChange && onParameterChange(selectedItem.id, { notes: `ignoreStockoutDays:${next}` });
-                  }}
+                  onClick={handleToggleIgnoreStockoutDays}
                   className={`font-semibold px-2 py-0.5 rounded text-[10px] cursor-pointer transition ${
                     ignoreStockoutDays ? 'bg-emerald-100 text-emerald-800' : 'bg-slate-200 text-slate-700'
                   }`}
@@ -1133,11 +1711,7 @@ export const DemandView: React.FC<DemandViewProps> = ({
               <div className="flex items-center justify-between py-1 border-b border-[#F1F5F9]">
                 <span className="text-slate-500">{t.demand.inspector.useHolidays}</span>
                 <button
-                  onClick={() => {
-                    const next = !useHolidays;
-                    setUseHolidays(next);
-                    onParameterChange && onParameterChange(selectedItem.id, { notes: `useHolidays:${next}` });
-                  }}
+                  onClick={handleToggleUseHolidays}
                   className={`font-semibold px-2 py-0.5 rounded text-[10px] cursor-pointer transition ${
                     useHolidays ? 'bg-emerald-100 text-emerald-800' : 'bg-slate-200 text-slate-700'
                   }`}
@@ -1149,13 +1723,7 @@ export const DemandView: React.FC<DemandViewProps> = ({
                 <span className="text-slate-500">{t.demand.inspector.approvalHorizon}</span>
                 <select
                   value={approvalHorizon}
-                  onChange={e => {
-                    const val = e.target.value;
-                    setApprovalHorizon(val);
-                    const oldNotes = (selectedItem?.notes || '').replace(/approvalHorizon:[0-9a-zA-Z]+\s*/g, '').trim();
-                    const updatedNotes = oldNotes ? `${oldNotes} approvalHorizon:${val}` : `approvalHorizon:${val}`;
-                    onParameterChange && onParameterChange(selectedItem.id, { notes: updatedNotes });
-                  }}
+                  onChange={e => handleApprovalHorizonChange(e.target.value)}
                   className="px-1.5 py-0.5 border border-slate-300 rounded font-semibold text-slate-800 text-[10px] bg-white cursor-pointer"
                 >
                   <option value="1w">{isAr ? 'أسبوع واحد (7 أيام)' : '1 Week (7 Days)'}</option>
@@ -1368,6 +1936,308 @@ export const DemandView: React.FC<DemandViewProps> = ({
               </div>
             </div>
           </div>
+        </div>
+      )}
+
+      {/* Quick Full-DB SKU / Category Search Modal */}
+      {isQuickSearchOpen && (
+        <div className="fixed inset-0 z-50 bg-black/50 backdrop-blur-xs flex items-center justify-center p-4">
+          <div className="bg-white border border-[#CBD5E1] rounded-xl max-w-2xl w-full shadow-2xl overflow-hidden flex flex-col text-[#1E293B] max-h-[85vh]">
+            <div className="p-3 border-b border-[#E2E8F0] flex items-center justify-between bg-[#F8F9FA]">
+              <div className="flex items-center gap-2">
+                <Search className="w-4 h-4 text-[#2196F3]" />
+                <span className="font-bold text-xs text-slate-800">
+                  {isAr ? 'بحث سريع عن الأصناف والفئات (DuckDB)' : 'Quick SKU & Category Search (DuckDB)'}
+                </span>
+                <span className="text-[10px] bg-blue-50 text-blue-700 px-2 py-0.5 rounded border border-blue-200 font-mono">
+                  {isAr ? 'بحث مباشر عبر كامل المشروع' : 'Full-Database Search'}
+                </span>
+              </div>
+              <button 
+                onClick={() => setIsQuickSearchOpen(false)}
+                className="text-slate-400 hover:text-slate-700 p-1 rounded hover:bg-[#E2E8F0] cursor-pointer"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            <div className="p-3 border-b border-[#E2E8F0] bg-white">
+              <div className="relative">
+                <Search className="w-4 h-4 absolute top-2.5 left-2.5 text-slate-400" />
+                <input
+                  type="text"
+                  autoFocus
+                  value={quickSearchTerm}
+                  onChange={e => setQuickSearchTerm(e.target.value)}
+                  placeholder={isAr ? 'اكتب كود الصنف أو الوصف أو الفئة للبحث المباشر في قاعدة البيانات...' : 'Type SKU code, description, or category to query DuckDB directly...'}
+                  className="w-full pl-9 pr-3 py-2 text-xs border border-slate-300 rounded-lg focus:border-[#2196F3] focus:outline-none focus:ring-1 focus:ring-[#2196F3] bg-slate-50/50"
+                />
+                {isQuickSearching && (
+                  <div className="absolute top-2.5 right-3 text-[10px] text-blue-600 font-medium animate-pulse">
+                    {isAr ? 'جاري البحث في DuckDB...' : 'Searching DuckDB...'}
+                  </div>
+                )}
+              </div>
+            </div>
+
+            <div className="flex-1 overflow-y-auto p-2 min-h-[260px] max-h-[380px]">
+              {quickSearchResults.length > 0 ? (
+                <div className="space-y-1">
+                  {quickSearchResults.map(item => (
+                    <div
+                      key={item.id}
+                      onClick={() => {
+                        const effHorizon = approvalHorizon || projectDefaults.approvalHorizon || '12m';
+                        const effSeason = seasonalityPattern || projectDefaults.seasonalityPattern || '12';
+                        const dateBounds = { minActualDate: projectDefaults.minActualDate, maxActualDate: projectDefaults.maxActualDate };
+                        const recalculated = (recalculateItem && shouldAutoRecalculateItem(item))
+                          ? recalculateItem(item, undefined, undefined, effHorizon, effSeason, dateBounds)
+                          : item;
+                        onSelectItem(recalculated);
+                        if (item.category) setSelectedCategory(item.category);
+                        setIsQuickSearchOpen(false);
+                      }}
+                      className="flex items-center justify-between p-2 rounded-lg border border-slate-100 hover:border-blue-300 hover:bg-blue-50/50 cursor-pointer transition"
+                    >
+                      <div className="flex items-center gap-2.5 min-w-0 flex-1">
+                        <span className="font-mono text-xs font-bold text-[#2196F3] bg-blue-50 px-1.5 py-0.5 rounded border border-blue-200">
+                          {formatItemCode(item.code)}
+                        </span>
+                        <div className="min-w-0 flex-1">
+                          <div className="font-semibold text-xs text-slate-800 truncate flex items-center gap-1.5">
+                            <span className="truncate">{item.description}</span>
+                            {isAllLocations && item.location && (
+                              <span 
+                                title={item.location}
+                                className="text-[9.5px] font-medium px-1.5 py-0.5 rounded shrink-0 max-w-[80px] truncate bg-slate-100 text-slate-600 border border-slate-200/80"
+                              >
+                                {item.location}
+                              </span>
+                            )}
+                          </div>
+                          <div className="text-[10px] text-slate-500 flex items-center gap-2 mt-0.5">
+                            <span>{item.category}</span>
+                            {item.location && !isAllLocations && (
+                              <>
+                                <span>•</span>
+                                <span>{item.location}</span>
+                              </>
+                            )}
+                          </div>
+                        </div>
+                      </div>
+                      <div className="text-right text-[11px] font-mono shrink-0 pl-3">
+                        <div className="text-slate-700 font-semibold">{isAr ? `مخزون: ${item.onHand.toLocaleString()}` : `Stock: ${item.onHand.toLocaleString()}`}</div>
+                        <div className="text-slate-400 text-[10px]">{item.abcClass}{item.xyzClass}</div>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              ) : quickSearchTerm.trim() ? (
+                <div className="flex flex-col items-center justify-center h-48 text-slate-400 text-xs">
+                  <p>{isAr ? 'لم يتم العثور على نتائج مطابقة' : 'No matching items found'}</p>
+                </div>
+              ) : (
+                <div className="flex flex-col items-center justify-center h-48 text-slate-400 text-xs text-center space-y-2">
+                  <Search className="w-8 h-8 text-slate-300 stroke-[1.5]" />
+                  <p>{isAr ? 'اكتب كلمة البحث للوصول المباشر إلى أي صنف في المشروع' : 'Start typing to search across all SKUs in this project'}</p>
+                  <button
+                    onClick={() => {
+                      setIsQuickSearchOpen(false);
+                      treeSearchRef.current?.focus();
+                    }}
+                    className="mt-2 text-xs text-[#2196F3] hover:underline cursor-pointer"
+                  >
+                    {isAr ? 'أو التركيز على شجرة التصنيفات الجانبية' : 'Or focus sidebar category tree'}
+                  </button>
+                </div>
+              )}
+            </div>
+
+            <div className="p-3 bg-[#F8F9FA] border-t border-[#E2E8F0] flex items-center justify-between text-xs">
+              <button
+                onClick={() => {
+                  setIsQuickSearchOpen(false);
+                  treeSearchRef.current?.focus();
+                  if (quickSearchTerm) setTreeSearch(quickSearchTerm);
+                }}
+                className="text-[#2196F3] hover:underline cursor-pointer font-medium"
+              >
+                {isAr ? 'تطبيق البحث على الشجرة الجانبية' : 'Apply to sidebar tree'}
+              </button>
+              <button
+                onClick={() => setIsQuickSearchOpen(false)}
+                className="px-3 py-1 bg-slate-200 hover:bg-slate-300 text-slate-700 rounded cursor-pointer font-medium text-xs"
+              >
+                {t.common.cancel}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Demand & Forecast Settings Modal */}
+      {isSettingsModalOpen && (
+        <div className="fixed inset-0 z-50 bg-black/50 backdrop-blur-xs flex items-center justify-center p-4">
+          <div className="bg-white border border-[#CBD5E1] rounded-xl max-w-lg w-full shadow-2xl overflow-hidden flex flex-col text-[#1E293B]">
+            <div className="p-3 border-b border-[#E2E8F0] flex items-center justify-between bg-[#F8F9FA]">
+              <div className="flex items-center gap-2">
+                <Settings className="w-4 h-4 text-[#2196F3]" />
+                <span className="font-bold text-xs text-slate-800">
+                  {isAr ? 'إعدادات التنبؤ والطلب' : 'Demand & Forecast Settings'}
+                </span>
+              </div>
+              <button 
+                onClick={() => setIsSettingsModalOpen(false)}
+                className="text-slate-400 hover:text-slate-700 p-1 rounded hover:bg-[#E2E8F0] cursor-pointer"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            <div className="p-4 space-y-3.5 text-xs">
+              <div>
+                <label className="block text-slate-600 font-semibold mb-1">
+                  {isAr ? 'أفق التنبؤ الافتراضي' : 'Default Forecast Horizon'}
+                </label>
+                <select
+                  value={modalHorizon}
+                  onChange={e => setModalHorizon(e.target.value)}
+                  className="w-full px-2.5 py-1.5 border border-slate-300 rounded-lg text-xs bg-white font-medium"
+                >
+                  <option value="1m">{isAr ? 'شهر واحد (1M)' : '1 Month (1M)'}</option>
+                  <option value="3m">{isAr ? '3 أشهر (ربع سنوي)' : '3 Months (Quarterly)'}</option>
+                  <option value="6m">{isAr ? '6 أشهر (نصف سنوي)' : '6 Months (Bi-Annual)'}</option>
+                  <option value="12m">{isAr ? '12 شهر (سنة كاملة)' : '12 Months (Annual)'}</option>
+                  <option value="24m">{isAr ? '24 شهر (سنتان)' : '24 Months (2 Years)'}</option>
+                </select>
+              </div>
+
+              <div>
+                <label className="block text-slate-600 font-semibold mb-1">
+                  {isAr ? 'النموذج الإحصائي الافتراضي' : 'Default Statistical Model'}
+                </label>
+                <select
+                  value={modalModel}
+                  onChange={e => setModalModel(e.target.value as ModelType)}
+                  className="w-full px-2.5 py-1.5 border border-slate-300 rounded-lg text-xs bg-white font-medium"
+                >
+                  <option value="auto">{isAr ? 'اختيار آلي ذكي (Auto Model Selection)' : 'Auto Model Selection'}</option>
+                  <option value="seasonal">{isAr ? 'هولت-وينترز الموسمي (Holt-Winters Seasonal)' : 'Holt-Winters Seasonal'}</option>
+                  <option value="linear">{isAr ? 'انحدار خطي واتجاه (Linear Trend OLS)' : 'Linear Trend'}</option>
+                  <option value="constant">{isAr ? 'مستوى ثابت ومتوسط متحرك (Constant Level)' : 'Constant Level'}</option>
+                  <option value="intermittent">{isAr ? 'طلب متقطع كروستون (Croston SBA)' : 'Croston Intermittent'}</option>
+                </select>
+              </div>
+
+              <div>
+                <label className="block text-slate-600 font-semibold mb-1">
+                  {isAr ? 'نمط الموسمية الافتراضي' : 'Default Seasonality Pattern'}
+                </label>
+                <select
+                  value={modalSeasonality}
+                  onChange={e => setModalSeasonality(e.target.value)}
+                  className="w-full px-2.5 py-1.5 border border-slate-300 rounded-lg text-xs bg-white font-medium"
+                >
+                  <option value="12">{isAr ? '12 فترة (دورة سنوية)' : '12 Periods (Annual Cycle)'}</option>
+                  <option value="4">{isAr ? '4 فترات (دورة ربع سنوية)' : '4 Periods (Quarterly Cycle)'}</option>
+                  <option value="0">{isAr ? 'بدون موسمية (تعطيل المؤشرات الموسمية)' : 'No Seasonality'}</option>
+                </select>
+              </div>
+
+              <div className="pt-2 border-t border-slate-100 flex flex-col gap-2">
+                <button
+                  disabled={isRecalculatingAll}
+                  onClick={async () => {
+                    setIsRecalculatingAll(true);
+                    try {
+                      // Apply horizon / seasonality to active item & reload
+                      if (selectedItem) {
+                        const notes = `${selectedItem.notes || ''} approvalHorizon:${modalHorizon} seasonality:${modalSeasonality}`.trim();
+                        onParameterChange && onParameterChange(selectedItem.id, {
+                          modelType: modalModel,
+                          seasonalityPattern: modalSeasonality,
+                          seasonalityPeriod: Number(modalSeasonality),
+                          notes
+                        });
+                      }
+                      if (projectId) {
+                        setProjectDefaults(prev => ({
+                          ...prev,
+                          seasonalityPattern: modalSeasonality,
+                          seasonalityPeriod: Number(modalSeasonality),
+                          approvalHorizon: modalHorizon
+                        }));
+                        setApprovalHorizon(modalHorizon);
+                        setSeasonalityPattern(modalSeasonality);
+                        onApprovalHorizonChange && onApprovalHorizonChange(modalHorizon);
+                        await api.updateForecastSettings(projectId, {
+                          scope: 'all',
+                          seasonality_period: modalSeasonality,
+                          approval_horizon: modalHorizon,
+                          model_type: modalModel,
+                          item_id: selectedItem?.id
+                        }).catch(err => console.error('Failed to update project forecast settings:', err));
+                      }
+                      await fetchDemandPage();
+                      setIsSettingsModalOpen(false);
+                      showToast(
+                        isAr 
+                          ? 'تم حفظ معلمات التنبؤ وتطبيقها على جميع أصناف المشروع' 
+                          : 'Forecast parameters saved and applied to all project SKUs'
+                      );
+                    } finally {
+                      setIsRecalculatingAll(false);
+                    }
+                  }}
+                  className="w-full py-2 px-3 bg-[#2196F3] hover:bg-blue-600 text-white font-bold rounded-lg text-xs transition flex items-center justify-center gap-2 cursor-pointer shadow-xs disabled:opacity-50"
+                >
+                  {isRecalculatingAll ? (
+                    <RotateCcw className="w-3.5 h-3.5 animate-spin" />
+                  ) : (
+                    <TrendingUp className="w-3.5 h-3.5" />
+                  )}
+                  <span>{isAr ? 'تطبيق وإعادة حساب التنبؤ' : 'Apply & Recalculate Forecast'}</span>
+                </button>
+
+                {onOpenSettings && (
+                  <button
+                    onClick={() => {
+                      setIsSettingsModalOpen(false);
+                      onOpenSettings();
+                    }}
+                    className="w-full py-2 px-3 bg-slate-100 hover:bg-slate-200 text-slate-700 font-semibold rounded-lg text-xs transition cursor-pointer"
+                  >
+                    {isAr ? 'فتح إعدادات النظام الشاملة...' : 'Open Full System Settings...'}
+                  </button>
+                )}
+              </div>
+            </div>
+
+            <div className="p-3 bg-[#F8F9FA] border-t border-[#E2E8F0] flex justify-end">
+              <button
+                onClick={() => setIsSettingsModalOpen(false)}
+                className="px-4 py-1.5 bg-slate-200 hover:bg-slate-300 text-slate-700 rounded-lg text-xs font-semibold cursor-pointer"
+              >
+                {t.common.cancel}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Scope Synchronization Toast Notification */}
+      {toastMessage && (
+        <div className="fixed bottom-6 left-1/2 -translate-x-1/2 z-50 flex items-center gap-2 px-4 py-2.5 bg-slate-900/90 backdrop-blur-md text-white text-xs font-medium rounded-xl shadow-xl border border-slate-700 animate-in fade-in slide-in-from-bottom-3 duration-200">
+          <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0" />
+          <span>{toastMessage}</span>
+          <button 
+            type="button"
+            onClick={() => setToastMessage(null)}
+            className="ml-2 p-0.5 hover:bg-slate-800 rounded text-slate-400 hover:text-white transition cursor-pointer"
+          >
+            <X className="w-3.5 h-3.5" />
+          </button>
         </div>
       )}
     </div>
