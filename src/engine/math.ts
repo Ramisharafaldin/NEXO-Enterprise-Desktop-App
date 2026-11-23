@@ -423,9 +423,11 @@ export function calculateSafetyStock(
 ): number {
   if (dailyDemand <= 0) return 0;
   const z = normalInverseCdf(serviceLevel);
-  // Variance over protection lead time
-  const leadTimeVariance = leadTimeVarianceDays > 0 ? Math.pow(leadTimeVarianceDays, 2) : 0;
-  const combinedVariance = leadTimeDays * demandVariance + Math.pow(dailyDemand, 2) * leadTimeVariance;
+  // Workstream 3: Clamp lead time variance so std dev never exceeds lead time itself
+  const effectiveLt = Math.max(1, leadTimeDays || 3);
+  const effectiveLtVar = Math.min(Math.max(0, leadTimeVarianceDays ?? 1), effectiveLt);
+  const leadTimeVariance = effectiveLtVar > 0 ? Math.pow(effectiveLtVar, 2) : 0;
+  const combinedVariance = effectiveLt * demandVariance + Math.pow(dailyDemand, 2) * leadTimeVariance;
   const ss = z * Math.sqrt(Math.max(0, combinedVariance));
   return Math.max(0, Math.round(ss));
 }
@@ -475,20 +477,25 @@ export function calculateItemReplenishment(
   const maxInventory = Math.round(reviewDemand + safetyStock);
 
   // 3. Current Inventory Position
-  // Net Position = OnHand + OnOrder - Backorders
-  const netInventoryPosition = item.onHand + item.onOrder - item.backorders;
+  // Workstream 3: Clamp negative onHand to 0.0
+  const effectiveOnHand = Math.max(0, item.onHand || 0);
+  const netInventoryPosition = effectiveOnHand + (item.onOrder || 0) - (item.backorders || 0);
 
-  // 4. Order Now Calculation
+  // 4. Order Now Calculation (Workstream 5: Order-Up-To with Anti-Dead-SKU trigger guard)
   let orderNow = 0;
   if (item.replenishmentStrategy === 'min_max') {
-    if (netInventoryPosition <= reorderPoint) {
-      orderNow = maxInventory - netInventoryPosition;
+    if (dailyDemand > 0 && netInventoryPosition <= reorderPoint) {
+      const rawNeed = maxInventory - netInventoryPosition;
+      if (rawNeed >= 0.5) {
+        orderNow = rawNeed;
+      }
     }
   } else {
     // Periodic (JIT) strategy: Target Stock = Demand during (Lead Time + Order Cycle) + Safety Stock
     const targetStock = reviewDemand + safetyStock;
-    if (netInventoryPosition < targetStock) {
-      orderNow = targetStock - netInventoryPosition;
+    const rawNeed = targetStock - netInventoryPosition;
+    if (dailyDemand > 0 && rawNeed >= 0.5) {
+      orderNow = rawNeed;
     }
   }
 

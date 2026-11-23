@@ -559,6 +559,7 @@ def _cleanup_trailing_decimal_codes_locked(con=None):
                 JOIN items can 
                   ON dup.project_id = can.project_id
                  AND regexp_replace(dup.code, '^([0-9]+)\\.0+$', '\\1') = can.code
+                 AND dup.location = can.location
                  AND dup.id != can.id
                 WHERE regexp_matches(dup.code, '^[0-9]+\\.0+$');
             """).fetchall()
@@ -623,6 +624,16 @@ def _cleanup_arabic_locations_locked(con=None):
                 con.execute(sql)
             except Exception:
                 pass
+
+        # Purge template legend/guidance rows leaking into data tables
+        legend_vals = ("'نص (Text)'", "'رقم (>= 0)'", "'نوع البيانات'", "'تاريخ يومي / شهري'", "'Example'", "'Data Type'", "'نص'", "'رقم'")
+        in_legend = f"({', '.join(legend_vals)})"
+        try:
+            con.execute(f"DELETE FROM items WHERE code IN {in_legend} OR location IN {in_legend};")
+            con.execute(f"DELETE FROM daily_sales WHERE item_code IN {in_legend} OR location IN {in_legend};")
+            con.execute(f"DELETE FROM project_items WHERE code IN {in_legend} OR location IN {in_legend};")
+        except Exception:
+            pass
     finally:
         if owns_con:
             try:
@@ -1112,9 +1123,22 @@ def _rebuild_periods_and_demand_stats_locked(project_id: str, con=None) -> Tuple
         con = get_connection()
         owns_con = True
     try:
+        # Workstream 3: Explicitly reset ALL items in project_id to clean 0.0 defaults (never 5.0)
+        con.execute("""
+            UPDATE items
+            SET mean_daily_demand = 0.0,
+                safety_stock = 0.0,
+                reorder_point = 0.0,
+                order_now = 0.0,
+                order_now_value = 0.0,
+                days_of_supply = 999.0
+            WHERE project_id = ?;
+        """, (project_id,))
+
         # 1. Check if daily_sales has any records for this project
         cnt_check = con.execute("SELECT COUNT(*) FROM daily_sales WHERE project_id = ? AND sale_date IS NOT NULL", (project_id,)).fetchone()
         if not cnt_check or cnt_check[0] == 0:
+            con.execute("CHECKPOINT;")
             return 0, 0
 
         # 2. Determine granularity
@@ -1144,6 +1168,13 @@ def _rebuild_periods_and_demand_stats_locked(project_id: str, con=None) -> Tuple
         norm_loc_item = "regexp_replace(replace(regexp_replace(regexp_replace(TRIM(COALESCE(i.location, 'Main Warehouse')), '[\\u200b\\u200c\\u200d\\ufeffـ]', '', 'g'), '[أإآٱ]', 'ا', 'g'), 'ى', 'ي'), '\\\\s+', ' ', 'g')"
 
         # 3. Create temp table of sales aggregated by item_id and period date
+        legend_vals = ("'نص (Text)'", "'رقم (>= 0)'", "'نوع البيانات'", "'تاريخ يومي / شهري'", "'Example'", "'Data Type'", "'نص'", "'رقم'")
+        in_legend = f"({', '.join(legend_vals)})"
+        try:
+            con.execute(f"DELETE FROM daily_sales WHERE project_id = ? AND (item_code IN {in_legend} OR location IN {in_legend});", (project_id,))
+        except Exception:
+            pass
+
         con.execute(f"""
             CREATE OR REPLACE TEMP TABLE tmp_rebuild_periods AS
             WITH matched_sales AS (
@@ -1156,7 +1187,7 @@ def _rebuild_periods_and_demand_stats_locked(project_id: str, con=None) -> Tuple
                 JOIN items i 
                   ON i.project_id = ds.project_id 
                  AND i.code = ds.item_code 
-                 AND ({norm_loc_item} = {norm_loc_ds} OR ds.location IS NULL OR i.location IS NULL OR ds.location = '' OR i.location = '')
+                 AND ({norm_loc_item} = {norm_loc_ds} OR (COALESCE(ds.location, '') = '' AND (i.location IS NULL OR i.location = '' OR {norm_loc_item} = 'Main Warehouse')))
                 WHERE ds.project_id = ?
                   AND ds.sale_date IS NOT NULL
                   AND ds.sale_date != ''
@@ -1170,7 +1201,7 @@ def _rebuild_periods_and_demand_stats_locked(project_id: str, con=None) -> Tuple
         con.execute("""
             INSERT INTO periods (id, project_id, item_id, date, actual, forecast, model, conf_upper, conf_lower, override, promotion, revenue)
             SELECT 
-                uuid()::VARCHAR,
+                ? || '_per_' || replace(uuid()::VARCHAR, '-', ''),
                 ?,
                 item_id,
                 period_date,
@@ -1178,38 +1209,97 @@ def _rebuild_periods_and_demand_stats_locked(project_id: str, con=None) -> Tuple
                 0.0, 0.0, 0.0, 0.0, NULL, 0.0,
                 revenue
             FROM tmp_rebuild_periods;
-        """, (project_id,))
+        """, (project_id, project_id))
 
         p_count = con.execute("SELECT COUNT(*) FROM tmp_rebuild_periods").fetchone()[0]
 
-        # 5. Recalculate item-level demand metrics
-        con.execute(f"""
+        # 5. Workstream 5: Recalculate item-level demand metrics using Recent Activity Velocity Window (default 60 days)
+        max_date_row = con.execute("SELECT MAX(sale_date) FROM daily_sales WHERE project_id = ? AND sale_date IS NOT NULL AND sale_date != ''", (project_id,)).fetchone()
+        max_date = max_date_row[0] if max_date_row and max_date_row[0] else None
+
+        if max_date:
+            con.execute(f"""
+                CREATE OR REPLACE TEMP TABLE tmp_agg_stats AS
+                SELECT 
+                    i.id as item_id,
+                    COALESCE(SUM(ds.qty_sold) / 60.0, 0.0) as avg_daily
+                FROM items i
+                JOIN daily_sales ds
+                  ON ds.project_id = i.project_id
+                 AND ds.item_code = i.code
+                 AND ({norm_loc_item} = {norm_loc_ds} OR (COALESCE(ds.location, '') = '' AND (i.location IS NULL OR i.location = '' OR {norm_loc_item} = 'Main Warehouse')))
+                 AND TRY_CAST(ds.sale_date AS DATE) >= (TRY_CAST(? AS DATE) - INTERVAL 60 DAY)
+                WHERE i.project_id = ?
+                GROUP BY i.id;
+            """, (max_date, project_id))
+        else:
+            con.execute(f"""
+                CREATE OR REPLACE TEMP TABLE tmp_agg_stats AS
+                SELECT 
+                    item_id, 
+                    COALESCE((SUM(actual) / GREATEST(COUNT(DISTINCT date), 1)) / {divisor}, 0.0) as avg_daily
+                FROM periods
+                WHERE project_id = ?
+                GROUP BY item_id;
+            """, (project_id,))
+
+        # DuckDB 2.0-safe correlated scalar subqueries without multi-table UPDATE ... FROM
+        con.execute("""
             UPDATE items
             SET 
-              mean_daily_demand = COALESCE(agg.avg_daily, 0.0),
+              mean_daily_demand = COALESCE((SELECT avg_daily FROM tmp_agg_stats WHERE tmp_agg_stats.item_id = items.id), 0.0),
               safety_stock = ROUND(
                 (CASE WHEN items.service_level >= 0.98 THEN 2.054 WHEN items.service_level >= 0.95 THEN 1.645 ELSE 1.282 END) * 
-                SQRT(items.lead_time_days * POWER(COALESCE(agg.avg_daily, 0.0) * 0.3, 2) + POWER(COALESCE(agg.avg_daily, 0.0), 2) * POWER(items.lead_time_variance_days, 2))
+                SQRT(
+                  GREATEST(1.0, items.lead_time_days) * POWER(COALESCE((SELECT avg_daily FROM tmp_agg_stats WHERE tmp_agg_stats.item_id = items.id), 0.0) * 0.3, 2) + 
+                  POWER(COALESCE((SELECT avg_daily FROM tmp_agg_stats WHERE tmp_agg_stats.item_id = items.id), 0.0), 2) * 
+                  POWER(LEAST(COALESCE(items.lead_time_variance_days, 1.0), GREATEST(COALESCE(items.lead_time_days, 3.0), 1.0)), 2)
+                )
               ),
-              reorder_point = ROUND(COALESCE(agg.avg_daily, 0.0) * items.lead_time_days + ROUND(
-                (CASE WHEN items.service_level >= 0.98 THEN 2.054 WHEN items.service_level >= 0.95 THEN 1.645 ELSE 1.282 END) * 
-                SQRT(items.lead_time_days * POWER(COALESCE(agg.avg_daily, 0.0) * 0.3, 2) + POWER(COALESCE(agg.avg_daily, 0.0), 2) * POWER(items.lead_time_variance_days, 2))
-              )),
-              days_of_supply = CASE WHEN COALESCE(agg.avg_daily, 0.0) > 0 THEN ROUND(items.on_hand / agg.avg_daily) ELSE 999.0 END
-            FROM (
-              SELECT item_id, (SUM(actual) / GREATEST(COUNT(DISTINCT date), 1)) / {divisor} as avg_daily
-              FROM periods
-              WHERE project_id = ?
-              GROUP BY item_id
-            ) agg
-            WHERE items.project_id = ? AND items.id = agg.item_id;
-        """, (project_id, project_id))
+              reorder_point = ROUND(
+                COALESCE((SELECT avg_daily FROM tmp_agg_stats WHERE tmp_agg_stats.item_id = items.id), 0.0) * GREATEST(1.0, items.lead_time_days) + 
+                ROUND(
+                  (CASE WHEN items.service_level >= 0.98 THEN 2.054 WHEN items.service_level >= 0.95 THEN 1.645 ELSE 1.282 END) * 
+                  SQRT(
+                    GREATEST(1.0, items.lead_time_days) * POWER(COALESCE((SELECT avg_daily FROM tmp_agg_stats WHERE tmp_agg_stats.item_id = items.id), 0.0) * 0.3, 2) + 
+                    POWER(COALESCE((SELECT avg_daily FROM tmp_agg_stats WHERE tmp_agg_stats.item_id = items.id), 0.0), 2) * 
+                    POWER(LEAST(COALESCE(items.lead_time_variance_days, 1.0), GREATEST(COALESCE(items.lead_time_days, 3.0), 1.0)), 2)
+                  )
+                )
+              ),
+              days_of_supply = CASE 
+                WHEN COALESCE((SELECT avg_daily FROM tmp_agg_stats WHERE tmp_agg_stats.item_id = items.id), 0.0) > 0.0 
+                THEN ROUND(GREATEST(0.0, COALESCE(items.on_hand, 0.0)) / (SELECT avg_daily FROM tmp_agg_stats WHERE tmp_agg_stats.item_id = items.id)) 
+                ELSE 999.0 
+              END
+            WHERE items.project_id = ?;
+        """, (project_id,))
 
+        # Periodic-Review Order-Up-To replenishment with Anti-Dead-SKU trigger guard
         con.execute("""
             UPDATE items
             SET
-              order_now = GREATEST(0.0, ROUND((reorder_point + (mean_daily_demand * order_cycle_days) - (on_hand + on_order)) / NULLIF(min_batch, 0.0)) * min_batch),
-              order_now_value = ROUND(GREATEST(0.0, ROUND((reorder_point + (mean_daily_demand * order_cycle_days) - (on_hand + on_order)) / NULLIF(min_batch, 0.0)) * min_batch) * purchase_price, 2)
+              order_now = CASE 
+                WHEN mean_daily_demand > 0.0 AND (
+                  (reorder_point + (mean_daily_demand * GREATEST(1.0, COALESCE(order_cycle_days, 14.0)))) - 
+                  (GREATEST(0.0, COALESCE(on_hand, 0.0)) + COALESCE(on_order, 0.0) - COALESCE(backorders, 0.0))
+                ) >= 0.5 THEN
+                  GREATEST(
+                    COALESCE(min_batch, 1.0),
+                    CEIL(
+                      ((reorder_point + (mean_daily_demand * GREATEST(1.0, COALESCE(order_cycle_days, 14.0)))) - 
+                       (GREATEST(0.0, COALESCE(on_hand, 0.0)) + COALESCE(on_order, 0.0) - COALESCE(backorders, 0.0))) / 
+                      GREATEST(1.0, COALESCE(batch_rounding, 1.0))
+                    ) * GREATEST(1.0, COALESCE(batch_rounding, 1.0))
+                  )
+                ELSE 0.0
+              END
+            WHERE project_id = ?;
+        """, (project_id,))
+
+        con.execute("""
+            UPDATE items
+            SET order_now_value = ROUND(order_now * COALESCE(purchase_price, 0.0), 2)
             WHERE project_id = ?;
         """, (project_id,))
 
@@ -1247,18 +1337,23 @@ def _rebuild_periods_and_demand_stats_locked(project_id: str, con=None) -> Tuple
             con.execute("""
                 UPDATE items
                 SET 
-                    abc_class = CASE 
-                        WHEN r.cum_share <= 0.80 THEN 'A'
-                        WHEN r.cum_share <= 0.95 THEN 'B'
-                        ELSE 'C'
-                    END,
-                    xyz_class = CASE 
-                        WHEN r.cv <= 0.50 THEN 'X'
-                        WHEN r.cv <= 1.00 THEN 'Y'
-                        ELSE 'Z'
-                    END
-                FROM tmp_abc_ranked r
-                WHERE items.project_id = ? AND items.id = r.id;
+                    abc_class = COALESCE((
+                        SELECT CASE 
+                            WHEN r.cum_share <= 0.80 THEN 'A'
+                            WHEN r.cum_share <= 0.95 THEN 'B'
+                            ELSE 'C'
+                        END
+                        FROM tmp_abc_ranked r WHERE r.id = items.id
+                    ), 'C'),
+                    xyz_class = COALESCE((
+                        SELECT CASE 
+                            WHEN r.cv <= 0.50 THEN 'X'
+                            WHEN r.cv <= 1.00 THEN 'Y'
+                            ELSE 'Z'
+                        END
+                        FROM tmp_abc_ranked r WHERE r.id = items.id
+                    ), 'Y')
+                WHERE items.project_id = ?;
             """, (project_id,))
 
         item_count = con.execute("SELECT COUNT(*) FROM items WHERE project_id = ?", (project_id,)).fetchone()[0]
@@ -1327,8 +1422,8 @@ def activate_project(project_id: str) -> Dict[str, Any]:
                             lead_time, lt_variability, 30.0, service_level,
                             moq, batch_rounding, 'auto', 'periodic',
                             'checked', 'unapproved', 'C', 'Y',
-                            0.0, 0.0, 0.0, 0.0, 0.0,
-                            95.0, 5.0, ?
+                            0.0, 0.0, 0.0, 0.0, 999.0,
+                            95.0, 0.0, ?
                         FROM project_items
                         WHERE project_id = ?
                     """, (now_str, project_id))
@@ -2129,7 +2224,7 @@ def get_saved_filters_for_project(project_id: str) -> List[Dict[str, Any]]:
 
 def add_saved_filter(project_id: str, name: str, col: str, op: str, val: str) -> Dict[str, Any]:
     """Adds a new filter to DuckDB."""
-    fid = f"filt_{uuid.uuid4().hex[:8]}"
+    fid = f"filt_{uuid.uuid4().hex}"
     now_str = datetime.datetime.utcnow().isoformat()
     with _LOCK:
         con = get_connection()
@@ -2171,7 +2266,7 @@ def get_in_transition_for_project(project_id: str) -> List[Dict[str, Any]]:
 
 def add_in_transition_record(project_id: str, record: Dict[str, Any]) -> Dict[str, Any]:
     """Adds a shipment to in_transition."""
-    tid = f"tr_{uuid.uuid4().hex[:8]}"
+    tid = f"tr_{uuid.uuid4().hex}"
     with _LOCK:
         con = get_connection()
         try:
@@ -3131,7 +3226,7 @@ def upsert_items_and_periods(
                         item_id
                     ))
                 else:
-                    item_id = f"{project_id}_{uuid.uuid4().hex[:8]}"
+                    item_id = f"{project_id}_{uuid.uuid4().hex}"
                     con.execute("""
                         INSERT INTO items (
                             id, project_id, code, description, category, location, channel, supplier,
@@ -3184,7 +3279,7 @@ def upsert_items_and_periods(
                     if not item_id:
                         # Auto-create minimal item for this SKU if missing
                         if code:
-                            item_id = f"{project_id}_{uuid.uuid4().hex[:8]}"
+                            item_id = f"{project_id}_{uuid.uuid4().hex}"
                             con.execute("""
                                 INSERT INTO items (
                                     id, project_id, code, description, category, location,
@@ -3215,7 +3310,7 @@ def upsert_items_and_periods(
                             WHERE id = ?
                         """, (actual, rev_val, forecast, override, promotion, existing_p[0]))
                     else:
-                        pid = f"per_{uuid.uuid4().hex[:10]}"
+                        pid = f"per_{uuid.uuid4().hex}"
                         con.execute("""
                             INSERT INTO periods (
                                 id, project_id, item_id, date, actual, forecast, model,

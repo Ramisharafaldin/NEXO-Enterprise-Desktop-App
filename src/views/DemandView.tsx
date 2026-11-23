@@ -32,7 +32,8 @@ import {
   TrendingUp,
   RotateCcw,
   X,
-  Upload
+  Upload,
+  Filter
 } from 'lucide-react';
 
 interface DemandViewProps {
@@ -138,6 +139,8 @@ export const DemandView: React.FC<DemandViewProps> = ({
   const [totalPages, setTotalPages] = useState(1);
   const [paginatedItems, setPaginatedItems] = useState<InventoryItem[]>([]);
   const [debouncedSearch, setDebouncedSearch] = useState('');
+  const [selectedCategory, setSelectedCategory] = useState<string | null>(null);
+  const [treeSummaryMap, setTreeSummaryMap] = useState<Record<string, number>>({});
   const [isLoadingList, setIsLoadingList] = useState(false);
 
   // Reset on project or branch switch
@@ -145,6 +148,7 @@ export const DemandView: React.FC<DemandViewProps> = ({
     setPage(1);
     setTreeSearch('');
     setDebouncedSearch('');
+    setSelectedCategory(null);
     setPaginatedItems([]);
     setTotalCount(0);
   }, [projectId, selectedLocation]);
@@ -158,6 +162,24 @@ export const DemandView: React.FC<DemandViewProps> = ({
     return () => clearTimeout(handler);
   }, [treeSearch]);
 
+  // Workstream 6: Fetch true full-database SKU counts per Category / Location
+  useEffect(() => {
+    if (!projectId) return;
+    api.getTreeSummary(projectId, {
+      group_by: groupBy === 'item' ? 'category' : 'location',
+      location: selectedLocation,
+      search: debouncedSearch || undefined,
+    }).then(res => {
+      const map: Record<string, number> = {};
+      (res.nodes || []).forEach(n => {
+        if (n.name) map[n.name] = n.sku_count;
+      });
+      setTreeSummaryMap(map);
+    }).catch(err => {
+      console.warn('Failed to load tree summary:', err);
+    });
+  }, [projectId, groupBy, selectedLocation, debouncedSearch]);
+
   const fetchDemandPage = useCallback(async () => {
     if (!projectId) return;
     setIsLoadingList(true);
@@ -167,6 +189,7 @@ export const DemandView: React.FC<DemandViewProps> = ({
         page,
         pageSize,
         search: debouncedSearch,
+        category: selectedCategory || undefined,
         location: selectedLocation,
         includeDormant: false
       });
@@ -192,7 +215,7 @@ export const DemandView: React.FC<DemandViewProps> = ({
     } finally {
       setIsLoadingList(false);
     }
-  }, [projectId, page, pageSize, debouncedSearch, rawSelectedItem, onSelectItem, selectedLocation, recalculateItem]);
+  }, [projectId, page, pageSize, debouncedSearch, selectedCategory, rawSelectedItem, onSelectItem, selectedLocation, recalculateItem]);
 
   useEffect(() => {
     fetchDemandPage();
@@ -465,28 +488,66 @@ export const DemandView: React.FC<DemandViewProps> = ({
               {t.demand.collapseAll}
             </button>
           </div>
+
+          {selectedCategory && (
+            <div className="flex items-center justify-between px-2 py-1 bg-blue-50 text-blue-800 text-[10px] font-medium rounded border border-blue-200">
+              <span className="truncate">{isAr ? `تصفية: ${selectedCategory}` : `Filter: ${selectedCategory}`}</span>
+              <button 
+                onClick={() => { setSelectedCategory(null); setPage(1); }} 
+                className="font-bold text-rose-600 hover:text-rose-800 cursor-pointer ml-1 text-xs"
+                title={isAr ? 'إلغاء التصفية' : 'Clear filter'}
+              >
+                ×
+              </button>
+            </div>
+          )}
         </div>
 
         {/* Middle: Hierarchical Item/Category Tree */}
         <div className="flex-1 overflow-y-auto p-1.5 space-y-1">
           {Object.entries(categories).map(([catName, catItems]) => {
             const isExpanded = expandedCategories[catName] !== false;
+            const fullCount = treeSummaryMap[catName] ?? catItems.length;
+            const isCategorySelected = selectedCategory === catName;
+
             return (
               <div key={catName} className="space-y-0.5">
                 {!hideCategories && (
-                  <button
-                    onClick={() => toggleCategory(catName)}
-                    className="w-full flex items-center gap-1.5 px-1.5 py-1 text-[11px] font-bold text-slate-700 hover:bg-[#E2E8F0] rounded text-left cursor-pointer"
-                  >
-                    {isExpanded ? (
-                      <ChevronDown className="w-3.5 h-3.5 text-slate-500 shrink-0" />
-                    ) : (
-                      <ChevronRight className="w-3.5 h-3.5 text-slate-500 shrink-0" />
-                    )}
-                    <Folder className="w-3.5 h-3.5 text-amber-500 shrink-0" />
-                    <span className="truncate flex-1">{catName}</span>
-                    <span className="text-[10px] text-slate-400 font-normal">({catItems.length})</span>
-                  </button>
+                  <div className={`w-full flex items-center justify-between px-1.5 py-1 text-[11px] font-bold rounded transition ${
+                    isCategorySelected 
+                      ? 'bg-blue-100 text-blue-900 border border-blue-300' 
+                      : 'text-slate-700 hover:bg-[#E2E8F0]'
+                  }`}>
+                    <button
+                      onClick={() => toggleCategory(catName)}
+                      className="flex items-center gap-1.5 flex-1 text-left truncate cursor-pointer"
+                    >
+                      {isExpanded ? (
+                        <ChevronDown className="w-3.5 h-3.5 text-slate-500 shrink-0" />
+                      ) : (
+                        <ChevronRight className="w-3.5 h-3.5 text-slate-500 shrink-0" />
+                      )}
+                      <Folder className="w-3.5 h-3.5 text-amber-500 shrink-0" />
+                      <span className="truncate flex-1">{catName}</span>
+                    </button>
+                    <div className="flex items-center gap-1 shrink-0">
+                      <span className="text-[10px] text-slate-400 font-normal">
+                        ({fullCount.toLocaleString()})
+                      </span>
+                      <button
+                        title={isCategorySelected ? (isAr ? 'إلغاء تصفية التصنيف' : 'Clear category filter') : (isAr ? 'تصفية بهذا التصنيف' : 'Filter by category')}
+                        onClick={() => {
+                          setSelectedCategory(prev => prev === catName ? null : catName);
+                          setPage(1);
+                        }}
+                        className={`p-0.5 rounded text-[10px] cursor-pointer hover:bg-blue-200 transition ${
+                          isCategorySelected ? 'text-blue-700 font-black' : 'text-slate-400 hover:text-slate-700'
+                        }`}
+                      >
+                        <Filter className="w-3 h-3" />
+                      </button>
+                    </div>
+                  </div>
                 )}
 
                 {/* Items in Category */}

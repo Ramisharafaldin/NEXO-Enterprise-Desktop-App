@@ -884,6 +884,7 @@ export const App: React.FC = () => {
         settings={settings}
         language={language}
         selectedLocation={selectedLocation}
+        projectId={activeProjectId}
       />
 
       {/* Containers and Shipping Groups Modal */}
@@ -900,6 +901,8 @@ export const App: React.FC = () => {
         onClose={() => setIsDrpModalOpen(false)}
         items={items}
         language={language}
+        projectId={activeProjectId}
+        location={selectedLocation}
       />
 
       {/* Bill of Materials (BOM) Explosion Modal */}
@@ -908,6 +911,7 @@ export const App: React.FC = () => {
         onClose={() => setIsBomModalOpen(false)}
         items={items}
         language={language}
+        projectId={activeProjectId}
       />
 
       {/* ABC / XYZ Classification Matrix Modal */}
@@ -917,6 +921,8 @@ export const App: React.FC = () => {
         items={items}
         settings={settings}
         language={language}
+        projectId={activeProjectId}
+        location={selectedLocation}
       />
 
       {/* Mathematical Calculation Explain Drawer Modal */}

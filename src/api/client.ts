@@ -1060,5 +1060,225 @@ export const api = {
     return res.json();
   },
 
+  /**
+   * Workstream 4: Anomaly Detection & Repair
+   */
+  async repairAnomalies(projectId: string): Promise<{ status: string; repaired_rows: number; message: string }> {
+    const res = await fetch(`${API_BASE}/projects/${projectId}/repair-anomalies`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+    });
+    if (!res.ok) throw new Error('Failed to repair anomalies');
+    return res.json();
+  },
+
+  /**
+   * Workstream 5 & 6: Dedicated Full-DB Analytics Endpoints
+   */
+  async getPurchaseOrders(
+    projectId: string,
+    params: {
+      location?: string;
+      search?: string;
+      coverage_days?: number;
+      velocity_days?: number;
+      exclude_unmatched?: boolean;
+      page?: number;
+      page_size?: number;
+    } = {}
+  ): Promise<PurchaseOrdersResponse> {
+    const query = new URLSearchParams();
+    if (params.location && params.location !== 'ALL') query.set('location', params.location);
+    if (params.search) query.set('search', params.search);
+    if (params.coverage_days) query.set('coverage_days', String(params.coverage_days));
+    if (params.velocity_days) query.set('velocity_days', String(params.velocity_days));
+    if (params.exclude_unmatched !== undefined) query.set('exclude_unmatched', String(params.exclude_unmatched));
+    if (params.page) query.set('page', String(params.page));
+    if (params.page_size) query.set('page_size', String(params.page_size));
+    const res = await fetch(`${API_BASE}/projects/${projectId}/purchase-orders?${query.toString()}`);
+    if (!res.ok) throw new Error('Failed to fetch purchase orders');
+    return res.json();
+  },
+
+  async getDrp(
+    projectId: string,
+    params: {
+      search?: string;
+      source_location?: string;
+      dest_location?: string;
+      page?: number;
+      page_size?: number;
+    } = {}
+  ): Promise<DrpResponse> {
+    const query = new URLSearchParams();
+    if (params.search) query.set('search', params.search);
+    if (params.source_location) query.set('source_location', params.source_location);
+    if (params.dest_location) query.set('dest_location', params.dest_location);
+    if (params.page) query.set('page', String(params.page));
+    if (params.page_size) query.set('page_size', String(params.page_size));
+    const res = await fetch(`${API_BASE}/projects/${projectId}/drp?${query.toString()}`);
+    if (!res.ok) throw new Error('Failed to fetch DRP data');
+    return res.json();
+  },
+
+  async searchMrpParents(projectId: string, q?: string): Promise<any[]> {
+    const query = q ? `?q=${encodeURIComponent(q)}` : '';
+    const res = await fetch(`${API_BASE}/projects/${projectId}/mrp/search${query}`);
+    if (!res.ok) throw new Error('Failed to search MRP parents');
+    return res.json();
+  },
+
+  async getMrp(
+    projectId: string,
+    params: {
+      parent_sku?: string;
+      production_qty?: number;
+      lead_time_days?: number;
+    } = {}
+  ): Promise<any> {
+    const query = new URLSearchParams();
+    if (params.parent_sku) query.set('parent_sku', params.parent_sku);
+    if (params.production_qty) query.set('production_qty', String(params.production_qty));
+    if (params.lead_time_days) query.set('lead_time_days', String(params.lead_time_days));
+    const res = await fetch(`${API_BASE}/projects/${projectId}/mrp?${query.toString()}`);
+    if (!res.ok) throw new Error('Failed to fetch MRP explosion');
+    return res.json();
+  },
+
+  async getAbcXyz(
+    projectId: string,
+    params: {
+      location?: string;
+      filter_class?: string;
+      page?: number;
+      page_size?: number;
+    } = {}
+  ): Promise<any> {
+    const query = new URLSearchParams();
+    if (params.location && params.location !== 'ALL') query.set('location', params.location);
+    if (params.filter_class) query.set('filter_class', params.filter_class);
+    if (params.page) query.set('page', String(params.page));
+    if (params.page_size) query.set('page_size', String(params.page_size));
+    const res = await fetch(`${API_BASE}/projects/${projectId}/abc-xyz?${query.toString()}`);
+    if (!res.ok) throw new Error('Failed to fetch ABC-XYZ data');
+    return res.json();
+  },
+
+  async getTreeSummary(
+    projectId: string,
+    params: {
+      group_by?: string;
+      location?: string;
+      search?: string;
+      hide_ghost?: boolean;
+    } = {}
+  ): Promise<TreeSummaryResponse> {
+    const query = new URLSearchParams();
+    if (params.group_by) query.set('group_by', params.group_by);
+    if (params.location && params.location !== 'ALL') query.set('location', params.location);
+    if (params.search) query.set('search', params.search);
+    if (params.hide_ghost !== undefined) query.set('hide_ghost', String(params.hide_ghost));
+    const res = await fetch(`${API_BASE}/projects/${projectId}/tree-summary?${query.toString()}`);
+    if (!res.ok) throw new Error('Failed to fetch tree summary');
+    return res.json();
+  },
+
+  /**
+   * Workstream 7: Full-Dataset Dedicated Openpyxl Export Downloads
+   */
+  async downloadReportExport(url: string, filename: string): Promise<void> {
+    const res = await fetch(url, { method: 'POST' });
+    if (!res.ok) throw new Error(`Export download failed: ${res.statusText}`);
+    const blob = await res.blob();
+    const downloadUrl = window.URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = downloadUrl;
+    link.setAttribute('download', filename);
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    window.URL.revokeObjectURL(downloadUrl);
+  },
+
   uploadFileWithProgress,
 };
+
+export interface PoKpis {
+  total_pos: number;
+  total_skus: number;
+  total_units: number;
+  total_budget: number;
+  unmatched_excluded_count: number;
+}
+
+export interface PoItemLine {
+  code: string;
+  description: string;
+  location: string;
+  on_hand: number;
+  on_order: number;
+  avg_daily_demand: number;
+  days_of_supply: number;
+  safety_stock: number;
+  target_stock: number;
+  order_now: number;
+  purchase_price: number;
+  line_value: number;
+}
+
+export interface PoSupplierGroup {
+  po_number: string;
+  supplier_name: string;
+  branches: string[];
+  sku_count: number;
+  total_units: number;
+  total_value: number;
+  items: PoItemLine[];
+}
+
+export interface PurchaseOrdersResponse {
+  kpis: PoKpis;
+  suppliers: PoSupplierGroup[];
+  total_suppliers: number;
+  page: number;
+  page_size: number;
+}
+
+export interface DrpRecommendation {
+  code: string;
+  description: string;
+  source_branch: string;
+  dest_branch: string;
+  source_on_hand: number;
+  dest_on_hand: number;
+  transfer_qty: number;
+  transfer_value: number;
+  priority: string;
+  lead_time: number;
+}
+
+export interface DrpResponse {
+  kpis: {
+    total_recommendations: number;
+    total_transfer_units: number;
+    total_transfer_value: number;
+    balanced_skus_count: number;
+  };
+  recommendations: DrpRecommendation[];
+  total: number;
+  page: number;
+  page_size: number;
+}
+
+export interface TreeSummaryNode {
+  name: string;
+  sku_count: number;
+  on_hand: number;
+  mean_daily_demand: number;
+}
+
+export interface TreeSummaryResponse {
+  nodes: TreeSummaryNode[];
+  total_skus: number;
+  group_by: string;
+}

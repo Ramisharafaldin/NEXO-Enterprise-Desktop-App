@@ -1453,7 +1453,465 @@ SKU_RAGGED_3,طابعة ليزر "HP",مخزن الإسكندرية
             con_gran.close()
         print("33. Granularity Settings Synchronization & Monthly Aggregation Guard PASSED")
 
-        print('\n=== ALL 33 BACKEND & DATA HUB ENDPOINTS TESTED AND VERIFIED 100% OPERATIONAL! ===')
+        # ----------------------------------------------------------------------
+        # Test 34: DRP Multi-Sheet Excel Export (GET /api/export/drp)
+        # ----------------------------------------------------------------------
+        r_drp_ar = await client.get(f'/api/export/drp?project_id={pid}&language=ar')
+        assert r_drp_ar.status_code == 200, f"DRP export failed: {r_drp_ar.text}"
+        assert r_drp_ar.content.startswith(b'PK\x03\x04'), "DRP export response must be valid .xlsx bytes"
+        
+        wb_drp = openpyxl.load_workbook(io.BytesIO(r_drp_ar.content))
+        assert "توصيات المناقلات" in wb_drp.sheetnames, f"Expected 'توصيات المناقلات', got {wb_drp.sheetnames}"
+        assert "أرصدة الفروع الإقليمية" in wb_drp.sheetnames, f"Expected 'أرصدة الفروع الإقليمية', got {wb_drp.sheetnames}"
+        assert wb_drp["توصيات المناقلات"].views.sheetView[0].rightToLeft is True
+        assert wb_drp["أرصدة الفروع الإقليمية"].views.sheetView[0].rightToLeft is True
+        
+        ws_drp_rec = wb_drp["توصيات المناقلات"]
+        drp_headers_1 = [cell.value for cell in ws_drp_rec[1]]
+        assert "كود الصنف" in drp_headers_1
+        assert "المستودع المصدر" in drp_headers_1
+        assert "الفرع المستلم" in drp_headers_1
+        assert "كمية المناقلة" in drp_headers_1
+
+        ws_drp_bal = wb_drp["أرصدة الفروع الإقليمية"]
+        drp_headers_2 = [cell.value for cell in ws_drp_bal[1]]
+        assert "كود الصنف" in drp_headers_2
+        assert "الرصيد الحالي" in drp_headers_2
+        assert "مخزون الأمان" in drp_headers_2
+        assert "نقطة إعادة الطلب" in drp_headers_2
+        assert ws_drp_bal.max_row > 1, "Regional branch balances sheet must contain data rows"
+
+        # Also test English language export
+        r_drp_en = await client.get(f'/api/export/drp?project_id={pid}&language=en')
+        assert r_drp_en.status_code == 200
+        wb_drp_en = openpyxl.load_workbook(io.BytesIO(r_drp_en.content))
+        assert "Transfer Recommendations" in wb_drp_en.sheetnames
+        assert "Regional Branch Balances" in wb_drp_en.sheetnames
+        print("34. DRP Multi-Sheet RTL Excel Export PASSED (Bilingual sheets, transfers & regional branch balances verified)")
+
+        # ----------------------------------------------------------------------
+        # Test 35: MRP BOM Explosion Excel Export (GET /api/export/mrp)
+        # ----------------------------------------------------------------------
+        r_mrp_ar = await client.get(f'/api/export/mrp?project_id={pid}&language=ar&production_qty=250')
+        assert r_mrp_ar.status_code == 200, f"MRP export failed: {r_mrp_ar.text}"
+        assert r_mrp_ar.content.startswith(b'PK\x03\x04'), "MRP export response must be valid .xlsx bytes"
+
+        wb_mrp = openpyxl.load_workbook(io.BytesIO(r_mrp_ar.content))
+        ws_mrp = wb_mrp.active
+        assert ws_mrp.views.sheetView[0].rightToLeft is True
+        
+        # Check metadata row
+        row2_text = str(ws_mrp.cell(row=2, column=1).value)
+        assert "المنتج التام" in row2_text or "Finished Parent" in row2_text
+        
+        # Check table headers (Row 5)
+        mrp_headers = [cell.value for cell in ws_mrp[5]]
+        assert "كود المكون" in mrp_headers
+        assert "الكمية لكل وحدة" in mrp_headers
+        assert "إجمالي الاحتياج" in mrp_headers
+        assert "صافي العجز" in mrp_headers
+        assert "كمية أمر التوريد الموصى بها" in mrp_headers
+
+        # Check summary row at the bottom
+        last_mrp_row = [cell.value for cell in ws_mrp[ws_mrp.max_row]]
+        assert "الإجمالي العام" in str(last_mrp_row[0]) or "Total Summary" in str(last_mrp_row[0])
+        print("35. MRP BOM Explosion RTL Excel Export PASSED (Metadata block, components breakdown & summary totals verified)")
+
+        # ----------------------------------------------------------------------
+        # Test 36: ABC-XYZ Matrix Excel Export (GET /api/export/abc-xyz)
+        # ----------------------------------------------------------------------
+        r_abc_ar = await client.get(f'/api/export/abc-xyz?project_id={pid}&language=ar')
+        assert r_abc_ar.status_code == 200, f"ABC-XYZ export failed: {r_abc_ar.text}"
+        assert r_abc_ar.content.startswith(b'PK\x03\x04'), "ABC-XYZ export response must be valid .xlsx bytes"
+
+        wb_abc = openpyxl.load_workbook(io.BytesIO(r_abc_ar.content))
+        assert "ملخص المصفوفة" in wb_abc.sheetnames
+        assert "تفاصيل الأصناف" in wb_abc.sheetnames
+        assert wb_abc["ملخص المصفوفة"].views.sheetView[0].rightToLeft is True
+
+        ws_matrix = wb_abc["ملخص المصفوفة"]
+        assert ws_matrix.max_row >= 10, "Matrix summary sheet should have 9 cell rows + header"
+        matrix_cells_found = [ws_matrix.cell(row=r, column=1).value for r in range(2, 11)]
+        assert "AX" in matrix_cells_found and "CZ" in matrix_cells_found
+
+        ws_abc_items = wb_abc["تفاصيل الأصناف"]
+        abc_headers = [cell.value for cell in ws_abc_items[1]]
+        assert "كود الصنف" in abc_headers
+        assert "تصنيف ABC" in abc_headers
+        assert "تصنيف XYZ" in abc_headers
+        assert "التصنيف المزدوج" in abc_headers
+
+        # Verify no currency symbols in numeric columns
+        for h in abc_headers:
+            if h:
+                assert "$" not in str(h) and "EGP" not in str(h)
+        print("36. ABC-XYZ Matrix RTL Excel Export PASSED (3x3 Matrix Summary + SKU Classifications verified)")
+
+        # ----------------------------------------------------------------------
+        # Test 37: Planned Purchase Orders Multi-Sheet Excel Export (GET /api/export/orders)
+        # ----------------------------------------------------------------------
+        r_po_ar = await client.get(f'/api/export/orders?project_id={pid}&language=ar')
+        assert r_po_ar.status_code == 200, f"Orders export failed: {r_po_ar.text}"
+        assert r_po_ar.content.startswith(b'PK\x03\x04'), "Orders export response must be valid .xlsx bytes"
+
+        wb_po = openpyxl.load_workbook(io.BytesIO(r_po_ar.content))
+        assert "ملخص أوامر الشراء" in wb_po.sheetnames
+        assert "تفاصيل الأصناف" in wb_po.sheetnames
+        assert wb_po["ملخص أوامر الشراء"].views.sheetView[0].rightToLeft is True
+        print("37. Planned Purchase Orders Multi-Sheet RTL Excel Export PASSED (PO Summary + Line Items verified)")
+
+        # ----------------------------------------------------------------------
+        # Test 38: Unified Frontend Excel Export Endpoint (POST /api/export/excel)
+        # ----------------------------------------------------------------------
+        custom_payload = {
+            "filename": "Custom_Report_Test.xlsx",
+            "sheets": [
+                {
+                    "name": "تقرير التحليل الميداني",
+                    "rows": [
+                        {"كود الصنف": "TEST-SKU-1", "اسم الصنف": "صنف اختبار 1", "الكمية": 100, "سعر الوحدة": 45.5},
+                        {"كود الصنف": "TEST-SKU-2", "اسم الصنف": "صنف اختبار 2", "الكمية": 200, "سعر الوحدة": 80.0}
+                    ]
+                }
+            ]
+        }
+        r_custom_excel = await client.post('/api/export/excel', json=custom_payload)
+        assert r_custom_excel.status_code == 200, f"Custom Excel export failed: {r_custom_excel.text}"
+        assert r_custom_excel.content.startswith(b'PK\x03\x04'), "Custom Excel export must return valid .xlsx bytes"
+
+        wb_custom = openpyxl.load_workbook(io.BytesIO(r_custom_excel.content))
+        ws_custom = wb_custom["تقرير التحليل الميداني"]
+        assert ws_custom.views.sheetView[0].rightToLeft is True, "Arabic sheet must be right-to-left"
+        assert ws_custom.freeze_panes == "A2", "Header row must be frozen"
+        assert ws_custom.auto_filter.ref is not None, "AutoFilter must be active on styled sheet"
+        print("38. Unified Frontend Excel Export Endpoint PASSED (Openpyxl enterprise styling & RTL verified)")
+
+        # ======================================================================
+        # WORKSTREAM 1 & 2 REGRESSION TESTS (v0.1.13 Enterprise Overhaul)
+        # ======================================================================
+
+        # ----------------------------------------------------------------------
+        # Test 39: Multi-Branch Inventory Ingestion, UUID Safety & Legend Purge
+        # ----------------------------------------------------------------------
+        pid_v13 = "proj_v13_multibranch"
+        con_test = get_connection()
+        try:
+            con_test.execute("DELETE FROM daily_sales WHERE project_id = ?", (pid_v13,))
+            con_test.execute("DELETE FROM periods WHERE project_id = ?", (pid_v13,))
+            con_test.execute("DELETE FROM items WHERE project_id = ?", (pid_v13,))
+            con_test.execute("""
+                INSERT OR REPLACE INTO projects (id, name, dataset_name, sku_count, created_at, updated_at)
+                VALUES (?, 'v0.1.13 Multi-Branch Test', 'multibranch.csv', 3, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+            """, (pid_v13,))
+        finally:
+            con_test.close()
+
+        # Ingest CSV with same SKU across 3 branches + Arabic template legend row
+        inv_csv = (
+            "كود الصنف,اسم الصنف,التصنيف,الموقع,الرصيد الحالي,سعر الشراء,سعر البيع,فترة التوريد,الحد الأدنى للطلب\n"
+            "نص (Text),نص (Text),نص (Text),نوع البيانات,رقم (>= 0),رقم (>= 0),رقم (>= 0),رقم (>= 0),رقم (>= 0)\n"
+            "SKU_MULTI_1,Multi Item 1,Groceries,السلام,100,50.0,75.0,7,1\n"
+            "SKU_MULTI_1,Multi Item 1,Groceries,الزكاة,50,50.0,75.0,7,1\n"
+            "SKU_MULTI_1,Multi Item 1,Groceries,السراى,10,50.0,75.0,7,1\n"
+        ).encode('utf-8')
+
+        r_inv_v13 = await client.post(
+            '/api/files/import-typed',
+            files={'file': ('inv_multibranch.csv', inv_csv, 'text/csv')},
+            data={'import_type': 'inventory', 'project_id': pid_v13, 'merge_mode': 'replace'}
+        )
+        assert r_inv_v13.status_code == 200, f"Multi-branch inventory import failed: {r_inv_v13.text}"
+
+        con_chk = get_connection()
+        try:
+            items_v13 = con_chk.execute("""
+                SELECT id, code, location, on_hand FROM items 
+                WHERE project_id = ? ORDER BY location
+            """, (pid_v13,)).fetchall()
+            # Must have exactly 3 items (legend row stripped)
+            assert len(items_v13) == 3, f"Expected 3 branch items, got {len(items_v13)}: {items_v13}"
+            locations_found = [row[2] for row in items_v13]
+            assert "السلام" in locations_found
+            assert "الزكاة" in locations_found
+            # Check normalized السراى -> السراي
+            assert "السراي" in locations_found
+
+            # Verify all IDs are full UUIDs (at least 32 hex chars, zero truncated 8-char hashes)
+            for row in items_v13:
+                item_id = row[0]
+                uuid_part = item_id.replace(f"{pid_v13}_", "")
+                assert len(uuid_part) >= 32, f"ID {item_id} has truncated hash! Expected >= 32 chars"
+        finally:
+            con_chk.close()
+        print("39. Multi-Branch Inventory Ingestion, Full UUIDs & Legend Purge PASSED (3 branches preserved with full UUIDs)")
+
+        # ----------------------------------------------------------------------
+        # Test 40: .0 Cleanup Multi-Branch Preservation
+        # ----------------------------------------------------------------------
+        con_clean = get_connection()
+        try:
+            con_clean.execute(f"""
+                INSERT INTO items (id, project_id, code, description, category, location, on_hand, mean_daily_demand)
+                VALUES 
+                    ('{pid_v13}_dup_1', '{pid_v13}', '99999.0', 'Zero Test', 'General', 'السلام', 20.0, 0.0),
+                    ('{pid_v13}_dup_2', '{pid_v13}', '99999.0', 'Zero Test', 'General', 'الزكاة', 40.0, 0.0);
+            """)
+            con_clean.execute("CHECKPOINT;")
+        finally:
+            con_clean.close()
+
+        # Ingest a harmless append or trigger cleanup
+        r_clean = await client.get(f'/api/projects/{pid_v13}/items')
+        assert r_clean.status_code == 200
+
+        con_clean2 = get_connection()
+        try:
+            # Execute cleanup lock function directly to verify collision query safety
+            from backend.database import _cleanup_trailing_decimal_codes_locked
+            _cleanup_trailing_decimal_codes_locked(con_clean2)
+
+            dot_rows = con_clean2.execute("""
+                SELECT code, location, on_hand FROM items 
+                WHERE project_id = ? AND code IN ('99999', '99999.0')
+                ORDER BY location;
+            """, (pid_v13,)).fetchall()
+            assert len(dot_rows) == 2, f"Expected 2 distinct branch rows, got {len(dot_rows)}: {dot_rows}"
+            assert dot_rows[0][0] == '99999' and dot_rows[1][0] == '99999'
+            assert dot_rows[0][1] != dot_rows[1][1], "Branches must not be collapsed during .0 cleanup!"
+        finally:
+            con_clean2.close()
+        print("40. .0 Cleanup Multi-Branch Preservation PASSED (Distinct branches of same SKU never collapsed)")
+
+        # ----------------------------------------------------------------------
+        # Test 41: Dormant SKU 0.0 Guard (Elimination of 5.0 phantom default)
+        # ----------------------------------------------------------------------
+        con_dorm = get_connection()
+        try:
+            con_dorm.execute(f"""
+                INSERT INTO items (
+                    id, project_id, code, description, category, location, 
+                    on_hand, purchase_price, lead_time_days, order_cycle_days,
+                    mean_daily_demand, safety_stock, reorder_point, order_now, order_now_value, days_of_supply
+                ) VALUES (
+                    '{pid_v13}_dorm_1', '{pid_v13}', 'SKU_DORMANT_FRIDGE', 'Dormant Fridge 6-Door', 'Appliances', 'السلام',
+                    0.0, 35000.0, 14, 14,
+                    5.0, 20.0, 30.0, 87.0, 3045000.0, 0.0
+                );
+            """)
+            con_dorm.execute("CHECKPOINT;")
+            from backend.database import _rebuild_periods_and_demand_stats_locked
+            _rebuild_periods_and_demand_stats_locked(pid_v13, con=con_dorm)
+
+            dorm_row = con_dorm.execute("""
+                SELECT mean_daily_demand, safety_stock, reorder_point, order_now, order_now_value, days_of_supply
+                FROM items WHERE id = ?;
+            """, (f'{pid_v13}_dorm_1',)).fetchone()
+
+            assert dorm_row[0] == 0.0, f"mean_daily_demand must be 0.0, got {dorm_row[0]}"
+            assert dorm_row[1] == 0.0, f"safety_stock must be 0.0, got {dorm_row[1]}"
+            assert dorm_row[2] == 0.0, f"reorder_point must be 0.0, got {dorm_row[2]}"
+            assert dorm_row[3] == 0.0, f"order_now must be 0.0, got {dorm_row[3]}"
+            assert dorm_row[4] == 0.0, f"order_now_value must be 0.0, got {dorm_row[4]}"
+            assert dorm_row[5] >= 999.0, f"days_of_supply must be 999.0 for dormant item, got {dorm_row[5]}"
+        finally:
+            con_dorm.close()
+        print("41. Dormant SKU 0.0 Guard PASSED (Zero-sales SKU reset to 0.0 demand, 0 orders, 999 DOS)")
+
+        # ----------------------------------------------------------------------
+        # Test 42: Swapped qty_sold <-> revenue Anomaly Auto-Repair
+        # ----------------------------------------------------------------------
+        con_swap = get_connection()
+        try:
+            con_swap.execute(f"""
+                INSERT INTO items (id, project_id, code, description, category, location, on_hand, purchase_price, sales_price)
+                VALUES ('{pid_v13}_sku_toshiba', '{pid_v13}', 'SKU_TOSHIBA', 'Toshiba Refrigerator', 'Appliances', 'السلام', 5.0, 30000.0, 35619.0);
+            """)
+            # Ingest normal baseline sales
+            con_swap.execute(f"""
+                INSERT INTO daily_sales (id, project_id, item_code, location, sale_date, qty_sold, revenue)
+                VALUES 
+                    ('{pid_v13}_ds_1', '{pid_v13}', 'SKU_TOSHIBA', 'السلام', '2026-03-01', 1.0, 35619.0),
+                    ('{pid_v13}_ds_2', '{pid_v13}', 'SKU_TOSHIBA', 'السلام', '2026-03-05', 2.0, 71238.0),
+                    ('{pid_v13}_ds_inverted', '{pid_v13}', 'SKU_TOSHIBA', 'السلام', '2026-03-10', 35619.0, 1.0);
+            """)
+            con_swap.execute("CHECKPOINT;")
+        finally:
+            con_swap.close()
+
+        # Call anomaly repair endpoint
+        r_repair = await client.post(f'/api/projects/{pid_v13}/repair-anomalies')
+        assert r_repair.status_code == 200, f"Repair anomalies endpoint failed: {r_repair.text}"
+        repair_res = r_repair.json()
+        assert repair_res['repaired_swapped_sales'] >= 1, f"Expected at least 1 repaired row, got {repair_res}"
+
+        con_chk_swap = get_connection()
+        try:
+            inv_row = con_chk_swap.execute("""
+                SELECT qty_sold, revenue FROM daily_sales WHERE id = ?;
+            """, (f'{pid_v13}_ds_inverted',)).fetchone()
+            assert inv_row[0] == 1.0, f"Expected qty_sold to be repaired to 1.0, got {inv_row[0]}"
+            assert inv_row[1] == 35619.0, f"Expected revenue to be repaired to 35619.0, got {inv_row[1]}"
+        finally:
+            con_chk_swap.close()
+        print("42. Swapped qty_sold <-> revenue Anomaly Auto-Repair PASSED (Inverted 35619/1 row swapped back to 1/35619)")
+
+        # ----------------------------------------------------------------------
+        # Test 43: Periodic Review Order-Up-To Engine & Seasonal Anti-Dead Guard
+        # ----------------------------------------------------------------------
+        con_season = get_connection()
+        try:
+            # Active item selling today
+            con_season.execute(f"""
+                INSERT INTO items (id, project_id, code, description, category, location, on_hand, on_order, lead_time_days, order_cycle_days, purchase_price)
+                VALUES ('{pid_v13}_sku_active', '{pid_v13}', 'SKU_ACTIVE_MILK', 'Fresh Milk 1L', 'Dairy', 'السلام', 10.0, 0.0, 3, 14, 25.0);
+            """)
+            # Seasonal item that sold 150 days ago (Ramadan box)
+            con_season.execute(f"""
+                INSERT INTO items (id, project_id, code, description, category, location, on_hand, on_order, lead_time_days, order_cycle_days, purchase_price, min_batch)
+                VALUES ('{pid_v13}_sku_ramadan', '{pid_v13}', 'SKU_RAMADAN_BOX', 'Ramadan Kareem Box', 'Seasonal', 'السلام', 0.0, 0.0, 7, 14, 500.0, 10.0);
+            """)
+            con_season.execute(f"""
+                INSERT INTO daily_sales (id, project_id, item_code, location, sale_date, qty_sold, revenue)
+                VALUES 
+                    ('{pid_v13}_ds_act1', '{pid_v13}', 'SKU_ACTIVE_MILK', 'السلام', '2026-05-01', 300.0, 7500.0),
+                    ('{pid_v13}_ds_act2', '{pid_v13}', 'SKU_ACTIVE_MILK', 'السلام', '2026-05-20', 300.0, 7500.0),
+                    ('{pid_v13}_ds_ramadan', '{pid_v13}', 'SKU_RAMADAN_BOX', 'السلام', '2025-12-01', 50.0, 25000.0);
+            """)
+            con_season.execute("CHECKPOINT;")
+            from backend.database import _rebuild_periods_and_demand_stats_locked
+            _rebuild_periods_and_demand_stats_locked(pid_v13, con=con_season)
+
+            act_row = con_season.execute("SELECT mean_daily_demand, order_now FROM items WHERE id = ?", (f'{pid_v13}_sku_active',)).fetchone()
+            ram_row = con_season.execute("SELECT mean_daily_demand, order_now FROM items WHERE id = ?", (f'{pid_v13}_sku_ramadan',)).fetchone()
+
+            # Active item should have positive daily demand and order_now
+            assert act_row[0] > 0.0, f"Active item daily demand should be > 0, got {act_row[0]}"
+            assert act_row[1] > 0.0, f"Active item order_now should be > 0, got {act_row[1]}"
+
+            # Seasonal item with 0 sales in 60-day window must have order_now == 0
+            assert ram_row[1] == 0.0, f"Seasonal dormant item order_now must be 0.0, got {ram_row[1]}"
+        finally:
+            con_season.close()
+        print("43. Periodic Review Order-Up-To Engine & Seasonal Anti-Dead Guard PASSED (Active orders generated; seasonal dormant SKU excluded)")
+
+        # ----------------------------------------------------------------------
+        # Test 44: Dedicated Full-DB Endpoints (>100 SKUs)
+        # ----------------------------------------------------------------------
+        pid_150 = "proj_v13_150skus"
+        con_150 = get_connection()
+        try:
+            con_150.execute("DELETE FROM daily_sales WHERE project_id = ?", (pid_150,))
+            con_150.execute("DELETE FROM periods WHERE project_id = ?", (pid_150,))
+            con_150.execute("DELETE FROM items WHERE project_id = ?", (pid_150,))
+            con_150.execute("""
+                INSERT OR REPLACE INTO projects (id, name, dataset_name, sku_count, created_at, updated_at)
+                VALUES (?, '150 SKU Full-DB Test', 'full150.csv', 150, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+            """, (pid_150,))
+            con_150.execute(f"""
+                INSERT INTO items (
+                    id, project_id, code, description, category, location, on_hand, on_order,
+                    safety_stock, reorder_point, order_now, order_now_value, purchase_price, sales_price,
+                    lead_time_days, order_cycle_days, mean_daily_demand, supplier
+                )
+                SELECT 
+                    '{pid_150}_item_' || range,
+                    '{pid_150}',
+                    'SKU_150_' || range,
+                    'Item Desc ' || range,
+                    CASE WHEN range % 2 = 0 THEN 'Beverages' ELSE 'Snacks' END,
+                    CASE WHEN range % 2 = 0 THEN 'السلام' ELSE 'الزكاة' END,
+                    CASE WHEN range % 4 = 0 THEN 0.0 ELSE 20.0 END,
+                    0.0,
+                    15.0,
+                    25.0,
+                    CASE WHEN range % 4 = 0 THEN 50.0 ELSE 0.0 END,
+                    CASE WHEN range % 4 = 0 THEN 50.0 * 100.0 ELSE 0.0 END,
+                    100.0,
+                    150.0,
+                    7,
+                    14,
+                    5.0,
+                    CASE WHEN range % 3 = 0 THEN 'Al-Marai' WHEN range % 3 = 1 THEN 'Juhayna' ELSE 'Cadbury' END
+                FROM range(1, 151);
+            """)
+            con_150.execute("CHECKPOINT;")
+        finally:
+            con_150.close()
+
+        # 1. Planned Purchase Orders: Check full KPIs across 150 items
+        r_po_full = await client.get(f'/api/projects/{pid_150}/purchase-orders?exclude_unmatched=false&page_size=200')
+        assert r_po_full.status_code == 200, f"PO full endpoint failed: {r_po_full.text}"
+        po_data = r_po_full.json()
+        assert po_data['kpis']['total_skus'] > 0, "PO KPIs must reflect full database"
+        assert len(po_data['suppliers']) > 0, "Suppliers must be returned"
+
+        # 2. DRP Endpoint
+        r_drp_full = await client.get(f'/api/projects/{pid_150}/drp')
+        assert r_drp_full.status_code == 200, f"DRP full endpoint failed: {r_drp_full.text}"
+        drp_data = r_drp_full.json()
+        assert 'kpis' in drp_data and 'recommendations' in drp_data
+
+        # 3. MRP Search & Explosion
+        r_mrp_srch = await client.get(f'/api/projects/{pid_150}/mrp/search?q=SKU_150_1')
+        assert r_mrp_srch.status_code == 200
+        assert len(r_mrp_srch.json()) > 0
+        r_mrp_exp = await client.get(f'/api/projects/{pid_150}/mrp?parent_sku=SKU_150_1&production_qty=100')
+        assert r_mrp_exp.status_code == 200
+        assert len(r_mrp_exp.json()['components']) > 0
+
+        # 4. ABC-XYZ Matrix: Check total_skus == 150
+        r_abc_full = await client.get(f'/api/projects/{pid_150}/abc-xyz')
+        assert r_abc_full.status_code == 200
+        abc_data = r_abc_full.json()
+        assert abc_data['total_skus'] == 150, f"ABC-XYZ should classify 150 SKUs, got {abc_data['total_skus']}"
+        assert 'AX' in abc_data['matrix']
+
+        # 5. Tree Summary: Check total_skus == 150
+        r_tree = await client.get(f'/api/projects/{pid_150}/tree-summary?group_by=category')
+        assert r_tree.status_code == 200
+        tree_data = r_tree.json()
+        assert tree_data['total_skus'] == 150, f"Tree summary should report 150 total SKUs, got {tree_data['total_skus']}"
+        assert len(tree_data['nodes']) == 2
+        print("44. Dedicated Full-DB Endpoints (>100 SKUs) PASSED (150 SKUs evaluated with zero frontend slice truncation)")
+
+        # ----------------------------------------------------------------------
+        # Test 45: Dedicated Full-Dataset Pure-Python Openpyxl RTL Excel Exports
+        # ----------------------------------------------------------------------
+        # 1. PO Export
+        r_exp_po = await client.post(f'/api/projects/{pid_150}/export/purchase-orders?language=ar')
+        assert r_exp_po.status_code == 200, f"PO export failed: {r_exp_po.text}"
+        assert r_exp_po.content.startswith(b'PK\x03\x04')
+        wb_chk_po = openpyxl.load_workbook(io.BytesIO(r_exp_po.content))
+        assert "ملخص أوامر الشراء" in wb_chk_po.sheetnames
+        assert wb_chk_po["ملخص أوامر الشراء"].views.sheetView[0].rightToLeft is True
+
+        # 2. DRP Export
+        r_exp_drp = await client.post(f'/api/projects/{pid_150}/export/drp?language=ar')
+        assert r_exp_drp.status_code == 200, f"DRP export failed: {r_exp_drp.text}"
+        assert r_exp_drp.content.startswith(b'PK\x03\x04')
+        wb_chk_drp = openpyxl.load_workbook(io.BytesIO(r_exp_drp.content))
+        assert "توصيات المناقلات" in wb_chk_drp.sheetnames
+        assert wb_chk_drp["توصيات المناقلات"].views.sheetView[0].rightToLeft is True
+
+        # 3. MRP Export
+        r_exp_mrp = await client.post(f'/api/projects/{pid_150}/export/mrp?language=ar&parent_sku=SKU_150_1&production_qty=100')
+        assert r_exp_mrp.status_code == 200, f"MRP export failed: {r_exp_mrp.text}"
+        assert r_exp_mrp.content.startswith(b'PK\x03\x04')
+        wb_chk_mrp = openpyxl.load_workbook(io.BytesIO(r_exp_mrp.content))
+        assert "شجرة تراكيب المواد (MRP)" in wb_chk_mrp.sheetnames
+        assert wb_chk_mrp["شجرة تراكيب المواد (MRP)"].views.sheetView[0].rightToLeft is True
+
+        # 4. ABC-XYZ Export
+        r_exp_abc = await client.post(f'/api/projects/{pid_150}/export/abc-xyz?language=ar')
+        assert r_exp_abc.status_code == 200, f"ABC export failed: {r_exp_abc.text}"
+        assert r_exp_abc.content.startswith(b'PK\x03\x04')
+        wb_chk_abc = openpyxl.load_workbook(io.BytesIO(r_exp_abc.content))
+        assert "ملخص المصفوفة" in wb_chk_abc.sheetnames
+        assert wb_chk_abc["ملخص المصفوفة"].views.sheetView[0].rightToLeft is True
+
+        print("45. Dedicated Full-Dataset Pure-Python Openpyxl RTL Excel Exports PASSED (POs, DRP, MRP, ABC-XYZ valid .xlsx and RTL)")
+
+        print('\n=== ALL 45 BACKEND & DATA HUB ENDPOINTS TESTED AND VERIFIED 100% OPERATIONAL! ===')
 
 if __name__ == '__main__':
     try:
