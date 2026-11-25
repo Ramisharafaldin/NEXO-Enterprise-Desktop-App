@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useCallback, useMemo, useRef } from 'react';
-import { TrendingUp, CheckCircle2, Upload } from 'lucide-react';
+import { TrendingUp, CheckCircle2, Upload, Loader2 } from 'lucide-react';
 import { InventoryItem, ModelType, ReplenishmentStrategy, AppSettings, TimeSeriesPeriod, isAnalyzableItem } from './engine/types';
 import { getInitialInventoryItems } from './engine/sampleData';
 import {
@@ -92,6 +92,13 @@ export const App: React.FC = () => {
     settingsRef.current = settings;
   }, [settings]);
   const recalculateItemRef = useRef<any>(null);
+  const loadRequestIdRef = useRef(0);
+  const activeProjectIdRef = useRef(activeProjectId);
+  activeProjectIdRef.current = activeProjectId;
+  const activeTabRef = useRef(activeTab);
+  activeTabRef.current = activeTab;
+  const itemsRef = useRef(items);
+  itemsRef.current = items;
 
   // Update HTML direction and language attribute
   useEffect(() => {
@@ -100,32 +107,47 @@ export const App: React.FC = () => {
   }, [language]);
 
   // Load project items from DuckDB backend
-  const loadProject = useCallback(async (projectId: string, location?: string) => {
+  const loadProject = useCallback(async (
+    projectId: string,
+    location?: string,
+    options?: { skipProjectMeta?: boolean }
+  ) => {
+    const reqId = ++loadRequestIdRef.current;
+    const isBranchSwitch = Boolean(location !== undefined && projectId === activeProjectIdRef.current);
     setIsSyncing(true);
-    setItems([]);
-    setSelectedItemId('');
-    setDormantCount(0);
+    if (!isBranchSwitch) {
+      setItems([]);
+      setSelectedItemId('');
+      setDormantCount(0);
+    }
     const effectiveLoc = location !== undefined ? location : 'ALL';
     if (location !== undefined) {
       setSelectedLocation(effectiveLoc);
     }
     try {
-      try {
-        await api.activateProject(projectId);
-      } catch (actErr) {
-        console.warn('activateProject notification:', actErr);
-      }
+      if (!isBranchSwitch && !options?.skipProjectMeta) {
+        try {
+          await api.activateProject(projectId);
+        } catch (actErr) {
+          console.warn('activateProject notification:', actErr);
+        }
+        if (reqId !== loadRequestIdRef.current) return;
 
-      // Load locations for this project
-      try {
-        const locRes = await api.getLocations(projectId);
-        setAvailableLocations(locRes.locations || []);
-      } catch (locErr) {
-        console.warn('getLocations error:', locErr);
-        setAvailableLocations([]);
+        // Load locations for this project
+        try {
+          const locRes = await api.getLocations(projectId);
+          if (reqId !== loadRequestIdRef.current) return;
+          setAvailableLocations(locRes.locations || []);
+        } catch (locErr) {
+          console.warn('getLocations error:', locErr);
+          if (reqId === loadRequestIdRef.current) {
+            setAvailableLocations([]);
+          }
+        }
       }
 
       const ws = await api.getWorkspace(projectId, effectiveLoc);
+      if (reqId !== loadRequestIdRef.current) return;
       const pd = (ws as any)?.project_defaults;
       const curSettings = settingsRef.current;
       let effectiveHorizon = curSettings.forecast_horizon_periods;
@@ -168,24 +190,46 @@ export const App: React.FC = () => {
         }
         setItems([]);
         setSelectedItemId('');
-        setDormantCount(0);
+        setDormantCount(ws?.dormant_count ?? 0);
         setIsServerConnected(true);
       }
     } catch (err) {
+      if (reqId !== loadRequestIdRef.current) return;
       console.warn('Backend unavailable, project workspace empty:', err);
       setActiveProjectId(projectId);
-      setItems([]);
-      setSelectedItemId('');
-      setDormantCount(0);
+      if (!isBranchSwitch) {
+        setItems([]);
+        setSelectedItemId('');
+        setDormantCount(0);
+      }
       setIsServerConnected(false);
     } finally {
-      setIsSyncing(false);
+      if (reqId === loadRequestIdRef.current) {
+        setIsSyncing(false);
+      }
+    }
+  }, []);
+
+  const handleBranchDataLoaded = useCallback((hydratedItems: InventoryItem[], dormantCnt?: number, isRootPage?: boolean) => {
+    setIsSyncing(false);
+    if (isRootPage) {
+      setItems(hydratedItems);
+      if (dormantCnt !== undefined) {
+        setDormantCount(dormantCnt);
+      }
     }
   }, []);
 
   const handleLocationChange = useCallback((newLoc: string) => {
     setSelectedLocation(newLoc);
-    loadProject(activeProjectId, newLoc);
+    if (activeTabRef.current === 'demand' && itemsRef.current.length > 0) {
+      // Keep DemandView mounted; DemandView fetches the single /api/demand + /tree-summary pair
+      // and calls handleBranchDataLoaded, avoiding redundant /activate, /locations, and /workspace calls.
+      loadRequestIdRef.current += 1;
+      setIsSyncing(true);
+      return;
+    }
+    loadProject(activeProjectId, newLoc, { skipProjectMeta: true });
   }, [activeProjectId, loadProject]);
 
   // Fetch list of projects from DuckDB
@@ -903,7 +947,42 @@ export const App: React.FC = () => {
                 recalculateItem={recalculateItem}
                 onApprovalHorizonChange={handleApprovalHorizonChange}
                 onProjectDefaultsLoaded={handleProjectDefaultsLoaded}
+                isParentSyncing={isSyncing}
+                onBranchDataLoaded={handleBranchDataLoaded}
               />
+            ) : isSyncing ? (
+              <div className="flex-1 flex flex-col items-center justify-center p-8 bg-[#F8F9FA] text-[#1E293B]">
+                <div className="p-4 rounded-full bg-blue-50 text-[#2196F3] mb-4 shadow-xs">
+                  <Loader2 className="w-10 h-10 animate-spin stroke-[1.75]" />
+                </div>
+                <h3 className="text-base font-bold text-slate-800 mb-1 text-center">
+                  {language === 'ar'
+                    ? 'جاري تحميل بيانات الطلب والتنبؤ...'
+                    : 'Loading demand & forecast workspace...'}
+                </h3>
+                <p className="text-xs text-slate-500 text-center">
+                  {language === 'ar'
+                    ? (selectedLocation && selectedLocation !== 'ALL' ? `فرع: ${selectedLocation}` : 'جميع الفروع')
+                    : (selectedLocation && selectedLocation !== 'ALL' ? `Branch: ${selectedLocation}` : 'All Branches')}
+                </p>
+              </div>
+            ) : selectedLocation && selectedLocation !== 'ALL' ? (
+              <div className="flex-1 flex flex-col items-center justify-center p-8 bg-[#F8F9FA] text-[#1E293B]">
+                <div className="p-4 rounded-full bg-amber-50 text-amber-600 mb-4 shadow-xs">
+                  <TrendingUp className="w-10 h-10 stroke-[1.5]" />
+                </div>
+                <h3 className="text-base font-bold text-slate-800 mb-2 text-center">
+                  {language === 'ar'
+                    ? `لا توجد أصناف نشطة في فرع (${selectedLocation})`
+                    : `No active SKUs found for branch (${selectedLocation})`}
+                </h3>
+                <button
+                  onClick={() => handleLocationChange('ALL')}
+                  className="mt-2 px-5 py-2 bg-[#2196F3] hover:bg-blue-600 text-white text-xs font-bold rounded-lg transition shadow-sm cursor-pointer"
+                >
+                  {language === 'ar' ? 'عرض جميع الفروع' : 'Show All Branches'}
+                </button>
+              </div>
             ) : (
               <div className="flex-1 flex flex-col items-center justify-center p-8 bg-[#F8F9FA] text-[#1E293B]">
                 <div className="p-4 rounded-full bg-blue-50 text-[#2196F3] mb-4 shadow-xs">

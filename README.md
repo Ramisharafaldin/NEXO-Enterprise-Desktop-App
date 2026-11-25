@@ -9,7 +9,7 @@
 
 ---
 
-## Core Capabilities (<!-- VERSION_START -->v0.1.17<!-- VERSION_END -->)
+## Core Capabilities (<!-- VERSION_START -->v0.1.18<!-- VERSION_END -->)
 - **Full-DB DuckDB Analytics & Enterprise Integrity:** Dedicated backend analytics evaluating 100% of SKUs in DuckDB (>197k rows across multi-branch topologies, zero 50-row UI slice truncation) for Planned POs, Multi-Echelon DRP rebalancing, MRP explosion, and ABC-XYZ matrices; collision-free full UUID keys; automated swapped sales anomaly repair; and unit-based periodic review replenishment with anti-dead-SKU seasonal guards.
 - **Statistical Demand Forecasting:** Automated model selection (Seasonal Holt-Winters, Croston SBA Intermittent, Linear OLS, Moving Average) with inline planner overrides and 95% confidence intervals.
 - **Dynamic Inventory Replenishment:** Real-time Safety Stock, Reorder Point (ROP), MOQ & batch rounding, Periodic JIT vs. Min/Max policies, and ABC/XYZ portfolio classification.

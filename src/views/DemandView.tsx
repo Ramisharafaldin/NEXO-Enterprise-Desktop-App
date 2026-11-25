@@ -71,6 +71,8 @@ interface DemandViewProps {
   ) => InventoryItem;
   onApprovalHorizonChange?: (horizon: string) => void;
   onProjectDefaultsLoaded?: (defaults: any) => void;
+  isParentSyncing?: boolean;
+  onBranchDataLoaded?: (items: InventoryItem[], dormantCount?: number, isRootPage?: boolean) => void;
 }
 
 export const DemandView: React.FC<DemandViewProps> = ({
@@ -90,6 +92,8 @@ export const DemandView: React.FC<DemandViewProps> = ({
   recalculateItem,
   onApprovalHorizonChange,
   onProjectDefaultsLoaded,
+  isParentSyncing = false,
+  onBranchDataLoaded,
 }) => {
   const t = translations[language];
   const isAr = language === 'ar';
@@ -209,7 +213,16 @@ export const DemandView: React.FC<DemandViewProps> = ({
   projectDefaultsRef.current = projectDefaults;
   const settingsHorizonRef = useRef(settings?.forecast_horizon_periods);
   settingsHorizonRef.current = settings?.forecast_horizon_periods;
-  const prevQueryKeyRef = useRef<{ search: string; category: string | null }>({ search: '', category: null });
+  const onBranchDataLoadedRef = useRef(onBranchDataLoaded);
+  onBranchDataLoadedRef.current = onBranchDataLoaded;
+  const prevProjectIdRef = useRef<string | undefined>(projectId);
+  const prevScopeRef = useRef<{ projectId?: string; location?: string }>({ projectId, location: selectedLocation });
+  const prevQueryKeyRef = useRef<{ projectId?: string; location?: string; search: string; category: string | null }>({
+    projectId,
+    location: selectedLocation,
+    search: '',
+    category: null
+  });
   const skipNextAutoSelectRef = useRef(false);
   const fetchRequestIdRef = useRef(0);
 
@@ -402,14 +415,19 @@ export const DemandView: React.FC<DemandViewProps> = ({
 
   // Reset on project or branch switch
   useEffect(() => {
+    const projectChanged = prevProjectIdRef.current !== projectId;
+    prevProjectIdRef.current = projectId;
     setPage(1);
     setTreeSearch('');
     setDebouncedSearch('');
     setSelectedCategory(null);
-    setPaginatedItems([]);
-    setHasFetchedServerPage(false);
     setTotalCount(0);
-    prevQueryKeyRef.current = { search: '', category: null };
+    // Keep existing items rendered with loading indicator during same-project branch switch
+    // to prevent jarring tree blanking/flicker; only wipe when switching to a different project.
+    if (projectChanged) {
+      setPaginatedItems([]);
+      setHasFetchedServerPage(false);
+    }
   }, [projectId, selectedLocation]);
 
   // Debounce tree search input (300ms)
@@ -444,6 +462,17 @@ export const DemandView: React.FC<DemandViewProps> = ({
 
   const fetchDemandPage = useCallback(async () => {
     if (!projectId) return;
+
+    // If scope (project/branch) just switched while user had a non-default page/search/category,
+    // wait one render for the reset useEffect to reset them to (1, '', null) instead of double-fetching.
+    const scopeChanged =
+      prevScopeRef.current.projectId !== projectId ||
+      prevScopeRef.current.location !== selectedLocation;
+    if (scopeChanged && (page !== 1 || debouncedSearch !== '' || selectedCategory !== null)) {
+      return;
+    }
+    prevScopeRef.current = { projectId, location: selectedLocation };
+
     const reqId = ++fetchRequestIdRef.current;
     setIsLoadingList(true);
     try {
@@ -515,10 +544,21 @@ export const DemandView: React.FC<DemandViewProps> = ({
       setTotalCount(res.total_count ?? hydrated.length);
       setTotalPages(res.total_pages ?? Math.max(1, Math.ceil((res.total_count || 1) / pageSize)));
 
+      const locationChanged =
+        prevQueryKeyRef.current.projectId !== projectId ||
+        prevQueryKeyRef.current.location !== selectedLocation;
       const queryChanged =
         prevQueryKeyRef.current.search !== debouncedSearch ||
         prevQueryKeyRef.current.category !== selectedCategory;
-      prevQueryKeyRef.current = { search: debouncedSearch, category: selectedCategory };
+      prevQueryKeyRef.current = {
+        projectId,
+        location: selectedLocation,
+        search: debouncedSearch,
+        category: selectedCategory
+      };
+
+      const isRootPage = page === 1 && !debouncedSearch.trim() && !selectedCategory;
+      onBranchDataLoadedRef.current?.(hydrated, res.dormant_count, isRootPage);
 
       const skipAutoSelect = skipNextAutoSelectRef.current;
       skipNextAutoSelectRef.current = false;
@@ -537,12 +577,15 @@ export const DemandView: React.FC<DemandViewProps> = ({
           if (needsSync) {
             selectItemFn(found);
           }
-        } else if (!skipAutoSelect && (!currentSelected || (queryChanged && (debouncedSearch.trim().length > 0 || Boolean(selectedCategory))))) {
+        } else if (!skipAutoSelect && (!currentSelected || locationChanged || (queryChanged && (debouncedSearch.trim().length > 0 || Boolean(selectedCategory))))) {
           selectItemFn(hydrated[0]);
         }
       }
     } catch (err) {
       console.warn('Failed to load server-side demand page:', err);
+      if (reqId === fetchRequestIdRef.current) {
+        onBranchDataLoadedRef.current?.([], undefined, false);
+      }
     } finally {
       if (reqId === fetchRequestIdRef.current) {
         setIsLoadingList(false);
@@ -1034,6 +1077,22 @@ export const DemandView: React.FC<DemandViewProps> = ({
     ? 'sticky right-0 z-20 border-l border-slate-200 text-right shadow-[1px_0_3px_rgba(0,0,0,0.05)]' 
     : 'sticky left-0 z-20 border-r border-slate-200 text-left shadow-[-1px_0_3px_rgba(0,0,0,0.05)]';
 
+  if (isLoadingList || isParentSyncing) {
+    // Only replace view with spinner if we have no selected item at all yet
+    if (!selectedItem) {
+      return (
+        <div className="flex-1 flex flex-col items-center justify-center p-8 bg-[#F8F9FA] text-[#1E293B]">
+          <div className="p-4 rounded-full bg-blue-50 text-[#2196F3] mb-4 shadow-xs">
+            <Loader2 className="w-10 h-10 animate-spin stroke-[1.75]" />
+          </div>
+          <h3 className="text-base font-bold text-slate-800 mb-1 text-center">
+            {isAr ? 'جاري تحميل بيانات الطلب والتنبؤ...' : 'Loading demand & forecast data...'}
+          </h3>
+        </div>
+      );
+    }
+  }
+
   if (!items || items.length === 0 || !selectedItem) {
     return (
       <div className="flex-1 flex flex-col items-center justify-center p-8 bg-[#F8F9FA] text-[#1E293B]">
@@ -1041,9 +1100,9 @@ export const DemandView: React.FC<DemandViewProps> = ({
           <TrendingUp className="w-10 h-10 stroke-[1.5]" />
         </div>
         <h3 className="text-base font-bold text-slate-800 mb-2 text-center">
-          {isAr
-            ? 'المشروع فارغ حالياً — لا توجد بيانات مرفوعة بعد'
-            : 'This project is currently empty — no data uploaded yet'}
+          {selectedLocation && selectedLocation !== 'ALL'
+            ? (isAr ? `لا توجد أصناف نشطة في فرع (${selectedLocation})` : `No active SKUs found in branch (${selectedLocation})`)
+            : (isAr ? 'المشروع فارغ حالياً — لا توجد بيانات مرفوعة بعد' : 'This project is currently empty — no data uploaded yet')}
         </h3>
         <p className="text-xs text-slate-500 mb-6 text-center max-w-md leading-relaxed">
           {isAr
@@ -1110,7 +1169,7 @@ export const DemandView: React.FC<DemandViewProps> = ({
         </div>
 
         {/* Middle: Hierarchical Item/Category Tree */}
-        <div className="flex-1 overflow-y-auto p-1.5 space-y-1">
+        <div className={`flex-1 overflow-y-auto p-1.5 space-y-1 transition-opacity duration-150 ${(isLoadingList || isParentSyncing) ? 'opacity-65' : 'opacity-100'}`}>
           {Object.entries(categories).map(([catName, catItems]) => {
             const isExpanded = expandedCategories[catName] !== false;
             const fullCount = treeSummaryMap[catName] ?? catItems.length;
@@ -1319,6 +1378,12 @@ export const DemandView: React.FC<DemandViewProps> = ({
               >
                 <MapPin className="w-3 h-3 text-slate-500 shrink-0" />
                 <span className="truncate max-w-[150px]">{selectedItem.location}</span>
+              </span>
+            )}
+            {(isLoadingList || isParentSyncing) && (
+              <span className="inline-flex items-center gap-1 text-[10px] font-medium px-2 py-0.5 rounded-full bg-blue-50 text-[#2196F3] border border-blue-200 shrink-0">
+                <Loader2 className="w-3 h-3 animate-spin shrink-0" />
+                <span>{isAr ? 'جاري التحديث...' : 'Updating...'}</span>
               </span>
             )}
             {isCategoryMode && categorySeriesData && (

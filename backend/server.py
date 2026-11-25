@@ -120,7 +120,7 @@ def get_app_version() -> str:
                     return val.lstrip("v")
         except Exception:
             pass
-    return "0.1.17"
+    return "0.1.18"
 
 APP_VERSION = get_app_version()
 
@@ -141,6 +141,8 @@ try:
         get_project_locations,
         get_project_items,
         get_project_items_paginated,
+        get_demand_payload,
+        get_project_tree_summary_data,
         get_project_dashboard_summary,
         get_project_categories,
         get_category_demand_series,
@@ -191,6 +193,8 @@ except (ImportError, ModuleNotFoundError):
         get_project_locations,
         get_project_items,
         get_project_items_paginated,
+        get_demand_payload,
+        get_project_tree_summary_data,
         get_project_dashboard_summary,
         get_project_categories,
         get_category_demand_series,
@@ -600,34 +604,15 @@ def get_demand_endpoint(
     include_dormant: bool = Query(False)
 ):
     pid = _resolve_project_id(project_id)
-    paginated = get_project_items_paginated(
+    return get_demand_payload(
         project_id=pid,
         page=page,
         page_size=page_size,
         search=search,
         category=category,
-        location=location or "",
-        include_dormant=include_dormant,
-        include_periods=True
+        location=location,
+        include_dormant=include_dormant
     )
-    dormant_count = get_project_dormant_count(pid, location=location)
-    categories = get_project_categories(pid)
-    defaults = get_project_forecast_defaults(pid)
-    return {
-        "project_id": pid,
-        "page": paginated["page"],
-        "page_size": paginated["page_size"],
-        "total_count": paginated["total_count"],
-        "total_pages": paginated["total_pages"],
-        "count": len(paginated["items"]),
-        "dormant_count": dormant_count,
-        "excluded_dormant_count": dormant_count,
-        "location": location or "ALL",
-        "categories": categories,
-        "series": paginated["items"],
-        "items": paginated["items"],
-        "project_defaults": defaults
-    }
 
 @app.get("/api/projects/{project_id}/forecast/category-series")
 @app.get("/api/demand/category-series")
@@ -5488,66 +5473,13 @@ def get_project_tree_summary(
     Workstream 6: Returns true global category/location counts from DuckDB for the Demand sidebar tree.
     """
     pid = _resolve_project_id(project_id)
-    with _LOCK:
-        con = get_connection()
-        try:
-            where_clauses = [
-                "project_id = ?",
-                "code NOT IN ('نص (Text)', 'رقم (>= 0)', 'نوع البيانات', 'تاريخ يومي / شهري', 'Example', 'Data Type', 'نص', 'رقم')"
-            ]
-            params = [pid]
-
-            if location and location.upper() != "ALL":
-                norm_target = normalize_arabic_text(location)
-                norm_loc = "regexp_replace(replace(regexp_replace(regexp_replace(TRIM(COALESCE(location, 'Main Warehouse')), '[\u200b\u200c\u200d\ufeffـ]', '', 'g'), '[أإآٱ]', 'ا', 'g'), 'ى', 'ي'), '\\\\s+', ' ', 'g')"
-                where_clauses.append(f"{norm_loc} = ?")
-                params.append(norm_target)
-
-            if search:
-                s_param = f"%{search.strip().lower()}%"
-                where_clauses.append("(LOWER(code) LIKE ? OR LOWER(description) LIKE ?)")
-                params.extend([s_param, s_param])
-
-            if hide_ghost:
-                where_clauses.append("(supplier != 'Primary Supplier' AND category != 'General')")
-
-            where_sql = " AND ".join(where_clauses)
-
-            if group_by == "location":
-                group_col = "COALESCE(NULLIF(TRIM(location), ''), 'Main Warehouse')"
-            else:
-                group_col = "COALESCE(NULLIF(TRIM(category), ''), 'General')"
-
-            rows = con.execute(f"""
-                SELECT 
-                    {group_col} as node_name,
-                    COUNT(*) as sku_cnt,
-                    SUM(GREATEST(0.0, COALESCE(on_hand, 0.0))) as tot_on_hand,
-                    SUM(COALESCE(mean_daily_demand, 0.0)) as tot_demand
-                FROM items
-                WHERE {where_sql}
-                GROUP BY {group_col}
-                ORDER BY sku_cnt DESC;
-            """, params).fetchall()
-
-            nodes = []
-            for r in rows:
-                nodes.append({
-                    "name": r[0],
-                    "sku_count": r[1],
-                    "on_hand": round(float(r[2] or 0), 1),
-                    "mean_daily_demand": round(float(r[3] or 0), 2)
-                })
-
-            total_skus = con.execute(f"SELECT COUNT(*) FROM items WHERE {where_sql};", params).fetchone()[0]
-
-            return {
-                "nodes": nodes,
-                "total_skus": total_skus,
-                "group_by": group_by
-            }
-        finally:
-            con.close()
+    return get_project_tree_summary_data(
+        project_id=pid,
+        group_by=group_by,
+        location=location,
+        search=search,
+        hide_ghost=hide_ghost
+    )
 
 # Workstream 7: Full-Dataset Dedicated Openpyxl Export Endpoints
 @app.post("/api/projects/{project_id}/export/purchase-orders")
