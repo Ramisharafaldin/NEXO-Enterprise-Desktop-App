@@ -667,7 +667,7 @@ def _cleanup_arabic_locations_locked(con=None):
             "regexp_replace("
             "replace("
             "regexp_replace("
-            "regexp_replace(TRIM(CAST({col} AS VARCHAR)), '[\\u200b\\u200c\\u200d\\ufeffـ]', '', 'g'), "
+            "regexp_replace(TRIM(CAST({col} AS VARCHAR)), '[\u200b\u200c\u200d\ufeffـ]', '', 'g'), "
             "'[أإآٱ]', 'ا', 'g'), "
             "'ى', 'ي'), "
             "'\\\\s+', ' ', 'g')"
@@ -1223,8 +1223,8 @@ def _rebuild_periods_and_demand_stats_locked(project_id: str, con=None) -> Tuple
             date_group_sql = "substr(ds.sale_date, 1, 7)"
             divisor = 30.0
 
-        norm_loc_ds = "regexp_replace(replace(regexp_replace(regexp_replace(TRIM(COALESCE(ds.location, 'Main Warehouse')), '[\\u200b\\u200c\\u200d\\ufeffـ]', '', 'g'), '[أإآٱ]', 'ا', 'g'), 'ى', 'ي'), '\\\\s+', ' ', 'g')"
-        norm_loc_item = "regexp_replace(replace(regexp_replace(regexp_replace(TRIM(COALESCE(i.location, 'Main Warehouse')), '[\\u200b\\u200c\\u200d\\ufeffـ]', '', 'g'), '[أإآٱ]', 'ا', 'g'), 'ى', 'ي'), '\\\\s+', ' ', 'g')"
+        norm_loc_ds = "regexp_replace(replace(regexp_replace(regexp_replace(TRIM(COALESCE(ds.location, 'Main Warehouse')), '[\u200b\u200c\u200d\ufeffـ]', '', 'g'), '[أإآٱ]', 'ا', 'g'), 'ى', 'ي'), '\\\\s+', ' ', 'g')"
+        norm_loc_item = "regexp_replace(replace(regexp_replace(regexp_replace(TRIM(COALESCE(i.location, 'Main Warehouse')), '[\u200b\u200c\u200d\ufeffـ]', '', 'g'), '[أإآٱ]', 'ا', 'g'), 'ى', 'ي'), '\\\\s+', ' ', 'g')"
 
         # 3. Create temp table of sales aggregated by item_id and period date
         legend_vals = ("'نص (Text)'", "'رقم (>= 0)'", "'نوع البيانات'", "'تاريخ يومي / شهري'", "'Example'", "'Data Type'", "'نص'", "'رقم'")
@@ -1608,7 +1608,7 @@ def get_project_items(project_id: str, include_dormant: bool = False, location: 
             params = [project_id]
             if location and location.strip() and location.strip().upper() != "ALL":
                 norm_loc = normalize_arabic_text(location.strip())
-                where_sql += " AND regexp_replace(replace(regexp_replace(regexp_replace(TRIM(location), '[\\u200b\\u200c\\u200d\\ufeffـ]', '', 'g'), '[أإآٱ]', 'ا', 'g'), 'ى', 'ي'), '\\\\s+', ' ', 'g') = ?"
+                where_sql += " AND regexp_replace(replace(regexp_replace(regexp_replace(TRIM(location), '[\u200b\u200c\u200d\ufeffـ]', '', 'g'), '[أإآٱ]', 'ا', 'g'), 'ى', 'ي'), '\\\\s+', ' ', 'g') = ?"
                 params.append(norm_loc)
 
             items_query = f"""
@@ -1805,7 +1805,7 @@ def get_category_demand_series(project_id: str, category: str, location: Optiona
             is_loc_filter = bool(location and location.strip() and location.strip().upper() != "ALL")
             if is_loc_filter:
                 norm_loc = normalize_arabic_text(location.strip())
-                where_clauses.append("regexp_replace(replace(regexp_replace(regexp_replace(TRIM(i.location), '[\\u200b\\u200c\\u200d\\ufeffـ]', '', 'g'), '[أإآٱ]', 'ا', 'g'), 'ى', 'ي'), '\\\\s+', ' ', 'g') = ?")
+                where_clauses.append("regexp_replace(replace(regexp_replace(regexp_replace(TRIM(i.location), '[\u200b\u200c\u200d\ufeffـ]', '', 'g'), '[أإآٱ]', 'ا', 'g'), 'ى', 'ي'), '\\\\s+', ' ', 'g') = ?")
                 params.append(norm_loc)
 
             where_sql = " AND ".join(where_clauses)
@@ -1828,7 +1828,7 @@ def get_category_demand_series(project_id: str, category: str, location: Optiona
             sku_where = ["i.project_id = ?", "COALESCE(NULLIF(TRIM(i.category), ''), 'General') = ?"]
             sku_params: List[Any] = [project_id, target_cat]
             if is_loc_filter:
-                sku_where.append("regexp_replace(replace(regexp_replace(regexp_replace(TRIM(i.location), '[\\u200b\\u200c\\u200d\\ufeffـ]', '', 'g'), '[أإآٱ]', 'ا', 'g'), 'ى', 'ي'), '\\\\s+', ' ', 'g') = ?")
+                sku_where.append("regexp_replace(replace(regexp_replace(regexp_replace(TRIM(i.location), '[\u200b\u200c\u200d\ufeffـ]', '', 'g'), '[أإآٱ]', 'ا', 'g'), 'ى', 'ي'), '\\\\s+', ' ', 'g') = ?")
                 sku_params.append(norm_loc)
 
             sku_sql = " AND ".join(sku_where)
@@ -1901,7 +1901,7 @@ def get_project_items_paginated(
             summary_where = base_where
             summary_params: List[Any] = [project_id] + list(base_params)
             if is_loc_filter:
-                summary_where += " AND regexp_replace(replace(regexp_replace(regexp_replace(TRIM(i.location), '[\\u200b\\u200c\\u200d\\ufeffـ]', '', 'g'), '[أإآٱ]', 'ا', 'g'), 'ى', 'ي'), '\\\\s+', ' ', 'g') = ?"
+                summary_where += " AND regexp_replace(replace(regexp_replace(regexp_replace(TRIM(i.location), '[\u200b\u200c\u200d\ufeffـ]', '', 'g'), '[أإآٱ]', 'ا', 'g'), 'ى', 'ي'), '\\\\s+', ' ', 'g') = ?"
                 summary_params.append(loc_val)
 
             # 2. Compute summary_counts across all analyzable items in project (and branch) via fast SQL
@@ -1940,7 +1940,7 @@ def get_project_items_paginated(
                 filter_params.extend([s, s, s, s])
 
             if is_loc_filter:
-                filter_clauses.append("regexp_replace(replace(regexp_replace(regexp_replace(TRIM(i.location), '[\\u200b\\u200c\\u200d\\ufeffـ]', '', 'g'), '[أإآٱ]', 'ا', 'g'), 'ى', 'ي'), '\\\\s+', ' ', 'g') = ?")
+                filter_clauses.append("regexp_replace(replace(regexp_replace(regexp_replace(TRIM(i.location), '[\u200b\u200c\u200d\ufeffـ]', '', 'g'), '[أإآٱ]', 'ا', 'g'), 'ى', 'ي'), '\\\\s+', ' ', 'g') = ?")
                 filter_params.append(loc_val)
 
             if category and category.strip():
@@ -2732,7 +2732,7 @@ def compute_project_kpis(project_id: str, location: Optional[str] = None) -> Dic
             base_where = "i.project_id = ?"
             params = [project_id, project_id]
             if is_loc_filter:
-                base_where += " AND regexp_replace(replace(regexp_replace(regexp_replace(TRIM(i.location), '[\\u200b\\u200c\\u200d\\ufeffـ]', '', 'g'), '[أإآٱ]', 'ا', 'g'), 'ى', 'ي'), '\\\\s+', ' ', 'g') = ?"
+                base_where += " AND regexp_replace(replace(regexp_replace(regexp_replace(TRIM(i.location), '[\u200b\u200c\u200d\ufeffـ]', '', 'g'), '[أإآٱ]', 'ا', 'g'), 'ى', 'ي'), '\\\\s+', ' ', 'g') = ?"
                 params.append(loc_val)
 
             # Query all aggregates (including dormant and active orders counts) in ONE single pass

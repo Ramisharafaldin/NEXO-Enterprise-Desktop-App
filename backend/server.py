@@ -120,7 +120,7 @@ def get_app_version() -> str:
                     return val.lstrip("v")
         except Exception:
             pass
-    return "0.1.14"
+    return "0.1.15"
 
 APP_VERSION = get_app_version()
 
@@ -1640,7 +1640,7 @@ def arabic_norm_sql(col_sql: str) -> str:
         f"regexp_replace("
         f"replace("
         f"regexp_replace("
-        f"regexp_replace(TRIM(CAST({col_sql} AS VARCHAR)), '[\\u200b\\u200c\\u200d\\ufeffـ]', '', 'g'), "
+        f"regexp_replace(TRIM(CAST({col_sql} AS VARCHAR)), '[\u200b\u200c\u200d\ufeffـ]', '', 'g'), "
         f"'[أإآٱ]', 'ا', 'g'), "
         f"'ى', 'ي'), "
         f"'\\\\s+', ' ', 'g')"
@@ -1712,14 +1712,14 @@ def load_file_into_staging(con: duckdb.DuckDBPyConnection, file_path: str, ext: 
             try:
                 execute_csv_sql(con, f"""
                     CREATE OR REPLACE TEMP TABLE staging_raw AS
-                    SELECT * FROM read_csv_auto('{escaped_path}', all_varchar=true, strict_mode=false, null_padding=true, ignore_errors=true, sample_size=-1);
+                    SELECT * FROM read_csv_auto('{escaped_path}', all_varchar=true, strict_mode=false, null_padding=true, ignore_errors=true, sample_size=-1, parallel=false);
                 """)
             except Exception:
                 sanitized_path = sanitize_csv_to_rfc4180(norm_path)
                 escaped_san = sanitized_path.replace("\\", "/").replace("'", "''")
                 execute_csv_sql(con, f"""
                     CREATE OR REPLACE TEMP TABLE staging_raw AS
-                    SELECT * FROM read_csv('{escaped_san}', delim=',', quote='\"', escape='\"', header=true, all_varchar=true, strict_mode=false, null_padding=true, ignore_errors=true);
+                    SELECT * FROM read_csv('{escaped_san}', delim=',', quote='\"', escape='\"', header=true, all_varchar=true, strict_mode=false, null_padding=true, ignore_errors=true, parallel=false);
                 """)
             raw_cols = [desc[0] for desc in con.execute("DESCRIBE staging_raw").fetchall()]
             cols = [_clean_header_name(c) for c in raw_cols]
@@ -1816,7 +1816,7 @@ def load_file_into_staging(con: duckdb.DuckDBPyConnection, file_path: str, ext: 
             escaped_csv = temp_csv_path.replace("\\", "/").replace("'", "''")
             execute_csv_sql(con, f"""
                 CREATE OR REPLACE TEMP TABLE staging_raw AS
-                SELECT * FROM read_csv_auto('{escaped_csv}', all_varchar=true, strict_mode=false, null_padding=true, ignore_errors=true, sample_size=1000);
+                SELECT * FROM read_csv('{escaped_csv}', delim=',', quote='"', escape='"', header=true, all_varchar=true, strict_mode=false, null_padding=true, ignore_errors=true, parallel=false);
             """)
 
             raw_cols = [desc[0] for desc in con.execute("DESCRIBE staging_raw").fetchall()]
@@ -2396,14 +2396,14 @@ def _stream_ingest_sales_csv(
                 # 1. Strictly bounded column discovery from first 1000 rows
                 try:
                     sample_res = execute_csv_sql(con, f"""
-                        DESCRIBE SELECT * FROM read_csv_auto('{escaped_path}', all_varchar=true, strict_mode=false, null_padding=true, ignore_errors=true, sample_size=1000) LIMIT 1;
+                        DESCRIBE SELECT * FROM read_csv_auto('{escaped_path}', all_varchar=true, strict_mode=false, null_padding=true, ignore_errors=true, sample_size=1000, parallel=false) LIMIT 1;
                     """).fetchall()
                 except Exception:
                     san_path = sanitize_csv_to_rfc4180(norm_path)
                     escaped_san = san_path.replace("\\", "/").replace("'", "''")
                     try:
                         sample_res = execute_csv_sql(con, f"""
-                            DESCRIBE SELECT * FROM read_csv('{escaped_san}', delim=',', quote='\"', escape='\"', header=true, all_varchar=true, strict_mode=false, null_padding=true, ignore_errors=true) LIMIT 1;
+                            DESCRIBE SELECT * FROM read_csv('{escaped_san}', delim=',', quote='\"', escape='\"', header=true, all_varchar=true, strict_mode=false, null_padding=true, ignore_errors=true, parallel=false) LIMIT 1;
                         """).fetchall()
                     finally:
                         if os.path.exists(san_path):
@@ -2524,7 +2524,7 @@ def _stream_ingest_sales_csv(
                           SUM({qty_sql}) as qty_sold,
                           SUM({rev_sql}) as revenue,
                           COUNT(*) as row_count
-                        FROM read_csv_auto('{escaped_path}', all_varchar=true, strict_mode=false, null_padding=true, ignore_errors=true, sample_size=1000) s
+                        FROM read_csv_auto('{escaped_path}', all_varchar=true, strict_mode=false, null_padding=true, ignore_errors=true, sample_size=1000, parallel=false) s
                         WHERE {valid_code_cond}
                         GROUP BY 1, 2, 3;
                     """)
@@ -2541,7 +2541,7 @@ def _stream_ingest_sales_csv(
                               SUM({qty_sql}) as qty_sold,
                               SUM({rev_sql}) as revenue,
                               COUNT(*) as row_count
-                            FROM read_csv('{escaped_san}', delim=',', quote='\"', escape='\"', header=true, all_varchar=true, strict_mode=false, null_padding=true, ignore_errors=true) s
+                            FROM read_csv('{escaped_san}', delim=',', quote='\"', escape='\"', header=true, all_varchar=true, strict_mode=false, null_padding=true, ignore_errors=true, parallel=false) s
                             WHERE {valid_code_cond}
                             GROUP BY 1, 2, 3;
                         """)
@@ -2570,7 +2570,7 @@ def _stream_ingest_sales_csv(
                           {qty_sql},
                           {rev_sql},
                           strftime(CURRENT_TIMESTAMP, '%Y-%m-%dT%H:%M:%SZ')
-                        FROM read_csv_auto('{escaped_path}', all_varchar=true, strict_mode=false, null_padding=true, ignore_errors=true, sample_size=1000) s
+                        FROM read_csv_auto('{escaped_path}', all_varchar=true, strict_mode=false, null_padding=true, ignore_errors=true, sample_size=1000, parallel=false) s
                         WHERE {valid_code_cond};
                     """, (proj_id, proj_id))
                 except Exception:
@@ -2588,7 +2588,7 @@ def _stream_ingest_sales_csv(
                               {qty_sql},
                               {rev_sql},
                               strftime(CURRENT_TIMESTAMP, '%Y-%m-%dT%H:%M:%SZ')
-                            FROM read_csv('{escaped_san}', delim=',', quote='\"', escape='\"', header=true, all_varchar=true, strict_mode=false, null_padding=true, ignore_errors=true) s
+                            FROM read_csv('{escaped_san}', delim=',', quote='\"', escape='\"', header=true, all_varchar=true, strict_mode=false, null_padding=true, ignore_errors=true, parallel=false) s
                             WHERE {valid_code_cond};
                         """, (proj_id, proj_id))
                     finally:
@@ -3966,7 +3966,7 @@ async def inspect_file_endpoint(
                         try:
                             execute_csv_sql(con, f"""
                                 CREATE OR REPLACE TEMP TABLE staging_inspect AS 
-                                SELECT * FROM read_csv_auto('{escaped}', all_varchar=true, strict_mode=false, null_padding=true, ignore_errors=true, sample_size=1000)
+                                SELECT * FROM read_csv_auto('{escaped}', all_varchar=true, strict_mode=false, null_padding=true, ignore_errors=true, sample_size=1000, parallel=false)
                                 LIMIT 1000;
                             """)
                         except Exception:
@@ -3975,7 +3975,7 @@ async def inspect_file_endpoint(
                             try:
                                 execute_csv_sql(con, f"""
                                     CREATE OR REPLACE TEMP TABLE staging_inspect AS 
-                                    SELECT * FROM read_csv('{escaped_san}', delim=',', quote='\"', escape='\"', header=true, all_varchar=true, strict_mode=false, null_padding=true, ignore_errors=true)
+                                    SELECT * FROM read_csv('{escaped_san}', delim=',', quote='\"', escape='\"', header=true, all_varchar=true, strict_mode=false, null_padding=true, ignore_errors=true, parallel=false)
                                     LIMIT 1000;
                                 """)
                             finally:
@@ -4929,8 +4929,8 @@ def get_project_purchase_orders(
                     WHERE i.project_id = ?;
                 """, (pid,))
 
-            norm_loc_v = "regexp_replace(replace(regexp_replace(regexp_replace(TRIM(COALESCE(v.location, 'Main Warehouse')), '[\\u200b\\u200c\\u200d\\ufeffـ]', '', 'g'), '[أإآٱ]', 'ا', 'g'), 'ى', 'ي'), '\\\\s+', ' ', 'g')"
-            norm_loc_i = "regexp_replace(replace(regexp_replace(regexp_replace(TRIM(COALESCE(i.location, 'Main Warehouse')), '[\\u200b\\u200c\\u200d\\ufeffـ]', '', 'g'), '[أإآٱ]', 'ا', 'g'), 'ى', 'ي'), '\\\\s+', ' ', 'g')"
+            norm_loc_v = "regexp_replace(replace(regexp_replace(regexp_replace(TRIM(COALESCE(v.location, 'Main Warehouse')), '[\u200b\u200c\u200d\ufeffـ]', '', 'g'), '[أإآٱ]', 'ا', 'g'), 'ى', 'ي'), '\\\\s+', ' ', 'g')"
+            norm_loc_i = "regexp_replace(replace(regexp_replace(regexp_replace(TRIM(COALESCE(i.location, 'Main Warehouse')), '[\u200b\u200c\u200d\ufeffـ]', '', 'g'), '[أإآٱ]', 'ا', 'g'), 'ى', 'ي'), '\\\\s+', ' ', 'g')"
 
             where_clauses = [
                 "i.project_id = ?",
@@ -5362,7 +5362,7 @@ def get_project_abc_xyz(
             params = [pid]
             if location and location.upper() != "ALL":
                 norm_target = normalize_arabic_text(location)
-                norm_loc = "regexp_replace(replace(regexp_replace(regexp_replace(TRIM(COALESCE(location, 'Main Warehouse')), '[\\u200b\\u200c\\u200d\\ufeffـ]', '', 'g'), '[أإآٱ]', 'ا', 'g'), 'ى', 'ي'), '\\\\s+', ' ', 'g')"
+                norm_loc = "regexp_replace(replace(regexp_replace(regexp_replace(TRIM(COALESCE(location, 'Main Warehouse')), '[\u200b\u200c\u200d\ufeffـ]', '', 'g'), '[أإآٱ]', 'ا', 'g'), 'ى', 'ي'), '\\\\s+', ' ', 'g')"
                 where_clauses.append(f"{norm_loc} = ?")
                 params.append(norm_target)
 
@@ -5499,7 +5499,7 @@ def get_project_tree_summary(
 
             if location and location.upper() != "ALL":
                 norm_target = normalize_arabic_text(location)
-                norm_loc = "regexp_replace(replace(regexp_replace(regexp_replace(TRIM(COALESCE(location, 'Main Warehouse')), '[\\u200b\\u200c\\u200d\\ufeffـ]', '', 'g'), '[أإآٱ]', 'ا', 'g'), 'ى', 'ي'), '\\\\s+', ' ', 'g')"
+                norm_loc = "regexp_replace(replace(regexp_replace(regexp_replace(TRIM(COALESCE(location, 'Main Warehouse')), '[\u200b\u200c\u200d\ufeffـ]', '', 'g'), '[أإآٱ]', 'ا', 'g'), 'ى', 'ي'), '\\\\s+', ' ', 'g')"
                 where_clauses.append(f"{norm_loc} = ?")
                 params.append(norm_target)
 
