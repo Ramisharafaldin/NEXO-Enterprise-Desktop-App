@@ -22,6 +22,7 @@ import {
   Check
 } from 'lucide-react';
 import { exportSheetsToExcel } from '../utils/excelExport';
+import { saveBlobWithDesktopFallback, formatExportSuccessToast } from '../utils/exportDownload';
 import { api, SavedFilter, InTransitionRecord } from '../api/client';
 
 interface InventoryViewProps {
@@ -86,6 +87,8 @@ export const InventoryView: React.FC<InventoryViewProps> = ({
   const [searchTerm, setSearchTerm] = useState('');
   const [debouncedSearch, setDebouncedSearch] = useState('');
   const [showInTransitionOnly, setShowInTransitionOnly] = useState(false);
+  const [isExporting, setIsExporting] = useState(false);
+  const [exportToast, setExportToast] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
 
   // Server-side pagination state (capped at 100 rows per page to prevent Edge WebView2 Error code 39)
   const [page, setPage] = useState(1);
@@ -283,27 +286,36 @@ export const InventoryView: React.FC<InventoryViewProps> = ({
   };
 
   // Export / Import parameter files
-  const handleExportParameters = () => {
-    const params = activeItems.map(i => ({
-      code: i.code,
-      description: i.description,
-      modelType: i.modelType,
-      replenishmentStrategy: i.replenishmentStrategy,
-      leadTimeDays: i.leadTimeDays,
-      leadTimeVarianceDays: i.leadTimeVarianceDays,
-      orderCycleDays: i.orderCycleDays,
-      serviceLevel: i.serviceLevel,
-      minBatch: i.minBatch,
-      batchRounding: i.batchRounding,
-      safetyStock: i.safetyStock,
-      reorderPoint: i.reorderPoint,
-    }));
-    const blob = new Blob([JSON.stringify(params, null, 2)], { type: 'application/json' });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = `NEXO_Inventory_Parameters_${projectId}.json`;
-    a.click();
+  const handleExportParameters = async () => {
+    try {
+      const params = activeItems.map(i => ({
+        code: i.code,
+        description: i.description,
+        modelType: i.modelType,
+        replenishmentStrategy: i.replenishmentStrategy,
+        leadTimeDays: i.leadTimeDays,
+        leadTimeVarianceDays: i.leadTimeVarianceDays,
+        orderCycleDays: i.orderCycleDays,
+        serviceLevel: i.serviceLevel,
+        minBatch: i.minBatch,
+        batchRounding: i.batchRounding,
+        safetyStock: i.safetyStock,
+        reorderPoint: i.reorderPoint,
+      }));
+      const blob = new Blob([JSON.stringify(params, null, 2)], { type: 'application/json' });
+      const res = await saveBlobWithDesktopFallback(blob, `NEXO_Inventory_Parameters_${projectId}.json`, '.json');
+      const msg = formatExportSuccessToast(res, isAr);
+      if (msg) {
+        setExportToast({ type: 'success', text: msg });
+        setTimeout(() => setExportToast(null), 5000);
+      }
+    } catch (err: any) {
+      setExportToast({
+        type: 'error',
+        text: (isAr ? 'فشل تصدير المعلمات: ' : 'Parameter export failed: ') + (err?.message || 'Unknown error'),
+      });
+      setTimeout(() => setExportToast(null), 6000);
+    }
   };
 
   const paramFileInputRef = useRef<HTMLInputElement>(null);
@@ -372,27 +384,53 @@ export const InventoryView: React.FC<InventoryViewProps> = ({
   });
 
   const handleExportTable = async () => {
-    const data = filteredItems.map(i => ({
-      'Item Code': formatItemCode(i.code),
-      'Description': i.description,
-      'Category': i.category,
-      'Location': i.location,
-      'ABC/XYZ': `${i.abcClass}${i.xyzClass}`,
-      'On Hand': i.onHand,
-      'On Order': i.onOrder,
-      'Backorders': i.backorders,
-      'Lead Time (Days)': i.leadTimeDays,
-      'Safety Stock': i.safetyStock,
-      'Reorder Point': i.reorderPoint,
-      'Days of Supply': i.daysOfSupply,
-      'Order Now': i.orderNow,
-      'Order Value': i.orderNowValue,
-      'Transfer Suggestion': i.transferQty ? `${i.transferQty} units from ${i.transferSource}` : 'None',
-      'Approval': i.approvalState,
-    }));
-    const hasLoc = Boolean(selectedLocation && selectedLocation !== 'ALL');
-    const locTag = hasLoc ? `_${selectedLocation!.trim()}` : '';
-    await exportSheetsToExcel([{ name: 'Inventory Replenishment', rows: data }], `NEXO_Inventory_Replenishment${locTag}_${projectId}.xlsx`);
+    setIsExporting(true);
+    try {
+      const hasLoc = Boolean(selectedLocation && selectedLocation !== 'ALL');
+      const locTag = hasLoc ? `_${selectedLocation!.trim()}` : '';
+      let res;
+      if (projectId && activeFilterTab === 'all' && !debouncedSearch && !showInTransitionOnly) {
+        res = await api.downloadExcelExport(
+          projectId,
+          'replenishment',
+          `NEXO_Inventory_Replenishment${locTag}_${projectId}.xlsx`,
+          selectedLocation
+        );
+      } else {
+        const data = filteredItems.map(i => ({
+          'Item Code': formatItemCode(i.code),
+          'Description': i.description,
+          'Category': i.category,
+          'Location': i.location,
+          'ABC/XYZ': `${i.abcClass}${i.xyzClass}`,
+          'On Hand': i.onHand,
+          'On Order': i.onOrder,
+          'Backorders': i.backorders,
+          'Lead Time (Days)': i.leadTimeDays,
+          'Safety Stock': i.safetyStock,
+          'Reorder Point': i.reorderPoint,
+          'Days of Supply': i.daysOfSupply,
+          'Order Now': i.orderNow,
+          'Order Value': i.orderNowValue,
+          'Transfer Suggestion': i.transferQty ? `${i.transferQty} units from ${i.transferSource}` : 'None',
+          'Approval': i.approvalState,
+        }));
+        res = await exportSheetsToExcel([{ name: 'Inventory Replenishment', rows: data }], `NEXO_Inventory_Replenishment${locTag}_${projectId}.xlsx`);
+      }
+      const msg = formatExportSuccessToast(res, isAr);
+      if (msg) {
+        setExportToast({ type: 'success', text: msg });
+        setTimeout(() => setExportToast(null), 5000);
+      }
+    } catch (err: any) {
+      setExportToast({
+        type: 'error',
+        text: (isAr ? 'فشل تصدير جدول المخزون: ' : 'Inventory table export failed: ') + (err?.message || 'Unknown error'),
+      });
+      setTimeout(() => setExportToast(null), 6000);
+    } finally {
+      setIsExporting(false);
+    }
   };
 
   const toOrderCount = activeItems.filter(i => (i.orderNow || 0) > 0).length;
@@ -644,9 +682,10 @@ export const InventoryView: React.FC<InventoryViewProps> = ({
 
           <button
             onClick={handleExportTable}
-            className="flex items-center gap-1 px-2.5 py-1 border border-[#CBD5E1] rounded hover:bg-[#E2E8F0] text-slate-700 shadow-xs cursor-pointer"
+            disabled={isExporting}
+            className="flex items-center gap-1 px-2.5 py-1 border border-[#CBD5E1] rounded hover:bg-[#E2E8F0] text-slate-700 shadow-xs disabled:opacity-50 cursor-pointer"
           >
-            <Download className="w-3.5 h-3.5 text-slate-500" />
+            <Download className={`w-3.5 h-3.5 text-slate-500 ${isExporting ? 'animate-bounce text-blue-600' : ''}`} />
             <span>{t.inventory.toolbar.exportTable}</span>
           </button>
 
@@ -1145,6 +1184,17 @@ export const InventoryView: React.FC<InventoryViewProps> = ({
               </button>
             </div>
           </div>
+        </div>
+      )}
+
+      {exportToast && (
+        <div
+          className={`fixed bottom-6 ${isAr ? 'left-6' : 'right-6'} z-50 px-4 py-2.5 rounded-lg shadow-xl flex items-center gap-2 text-xs font-semibold ${
+            exportToast.type === 'success' ? 'bg-emerald-600 text-white' : 'bg-rose-600 text-white'
+          }`}
+        >
+          {exportToast.type === 'success' ? <CheckCircle2 className="w-4 h-4 shrink-0" /> : <AlertTriangle className="w-4 h-4 shrink-0" />}
+          <span>{exportToast.text}</span>
         </div>
       )}
     </div>

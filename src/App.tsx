@@ -45,6 +45,7 @@ import { DataHubView } from './views/DataHubView';
 
 import { api, ProjectSummary } from './api/client';
 import { exportSheetsToExcel } from './utils/excelExport';
+import { formatExportSuccessToast } from './utils/exportDownload';
 
 export const App: React.FC = () => {
   const [language, setLanguage] = useState<Language>('en');
@@ -621,29 +622,51 @@ export const App: React.FC = () => {
     const hasLoc = Boolean(selectedLocation && selectedLocation !== 'ALL');
     const locTag = hasLoc ? `_${selectedLocation.trim()}` : '';
     const filename = `${activeDataset.replace('.xlsx', '')}${locTag}_Export.xlsx`;
+    const isAr = language === 'ar';
     try {
-      await api.downloadExcelExport(activeProjectId, 'all', filename, selectedLocation);
-    } catch {
-      // Fallback client-side XLSX generation
-      const invData = items.map(i => ({
-        'Item Code': formatItemCode(i.code),
-        'Description': i.description,
-        'Category': i.category,
-        'Location': i.location,
-        'Supplier': i.supplier,
-        'On Hand': i.onHand,
-        'On Order': i.onOrder,
-        'Lead Time (Days)': i.leadTimeDays,
-        'Safety Stock': i.safetyStock,
-        'Reorder Point': i.reorderPoint,
-        'Order Now': i.orderNow,
-        'Order Value': i.orderNowValue,
-        'Purchase Price': i.purchasePrice,
-        'Sales Price': i.salesPrice,
-        'Days of Supply': i.daysOfSupply,
-        'Forecast Accuracy (%)': i.accuracy?.toFixed(1),
-      }));
-      await exportSheetsToExcel([{ name: 'Inventory Planning', rows: invData }], filename);
+      setIsSyncing(true);
+      const res = await api.downloadExcelExport(activeProjectId, 'all', filename, selectedLocation);
+      const msg = formatExportSuccessToast(res, isAr);
+      if (msg) {
+        setToastMessage({ text: msg, type: 'success' });
+        setTimeout(() => setToastMessage(null), 5000);
+      }
+    } catch (primaryErr: any) {
+      // Fallback client-side XLSX generation when backend project export isn't available
+      try {
+        const invData = items.map(i => ({
+          'Item Code': formatItemCode(i.code),
+          'Description': i.description,
+          'Category': i.category,
+          'Location': i.location,
+          'Supplier': i.supplier,
+          'On Hand': i.onHand,
+          'On Order': i.onOrder,
+          'Lead Time (Days)': i.leadTimeDays,
+          'Safety Stock': i.safetyStock,
+          'Reorder Point': i.reorderPoint,
+          'Order Now': i.orderNow,
+          'Order Value': i.orderNowValue,
+          'Purchase Price': i.purchasePrice,
+          'Sales Price': i.salesPrice,
+          'Days of Supply': i.daysOfSupply,
+          'Forecast Accuracy (%)': i.accuracy?.toFixed(1),
+        }));
+        const fallbackRes = await exportSheetsToExcel([{ name: 'Inventory Planning', rows: invData }], filename);
+        const msg = formatExportSuccessToast(fallbackRes, isAr);
+        if (msg) {
+          setToastMessage({ text: msg, type: 'success' });
+          setTimeout(() => setToastMessage(null), 5000);
+        }
+      } catch (fallbackErr: any) {
+        setToastMessage({
+          text: (isAr ? 'فشل تصدير ملف Excel: ' : 'Excel export failed: ') + (fallbackErr?.message || primaryErr?.message || 'Unknown error'),
+          type: 'error'
+        });
+        setTimeout(() => setToastMessage(null), 6000);
+      }
+    } finally {
+      setIsSyncing(false);
     }
   };
 

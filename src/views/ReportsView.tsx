@@ -20,6 +20,7 @@ import {
   Upload
 } from 'lucide-react';
 import { exportSheetsToExcel } from '../utils/excelExport';
+import { formatExportSuccessToast } from '../utils/exportDownload';
 
 interface ReportsViewProps {
   items: InventoryItem[];
@@ -44,6 +45,8 @@ export const ReportsView: React.FC<ReportsViewProps> = ({
   const [reportType, setReportType] = useState<'replenishment' | 'projectedStock' | 'accuracy' | 'drp' | 'abc' | 'bom'>('replenishment');
   const [periodHorizon, setPeriodHorizon] = useState<'next6' | 'next12' | 'past12'>('next6');
   const [searchTerm, setSearchTerm] = useState('');
+  const [isExporting, setIsExporting] = useState(false);
+  const [exportToast, setExportToast] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
 
   // Advanced Filter Modal State
   const [isFilterModalOpen, setIsFilterModalOpen] = useState(false);
@@ -145,84 +148,100 @@ export const ReportsView: React.FC<ReportsViewProps> = ({
   };
 
   const handleExportReport = async () => {
-    let exportData: any[] = [];
+    setIsExporting(true);
+    try {
+      let exportData: any[] = [];
 
-    if (reportType === 'replenishment') {
-      exportData = filteredItems.map(i => ({
-        'Item Code': formatItemCode(i.code),
-        'Description': i.description,
-        'Location': i.location,
-        'Supplier': i.supplier,
-        'On Hand': i.onHand,
-        'On Order': i.onOrder,
-        'Safety Stock': i.safetyStock,
-        'ROP': i.reorderPoint,
-        'Order Now': i.orderNow || 0,
-        'Unit Cost': i.purchasePrice,
-        'Total Order Value': i.orderNowValue || 0,
-        'Approval': i.approvalState,
-      }));
-    } else if (reportType === 'projectedStock') {
-      exportData = filteredItems.map(i => {
-        const projections = calculateProjectedStockArray(i);
-        const minStock = projections.length > 0 ? Math.min(...projections) : i.onHand;
-        const row: Record<string, any> = {
+      if (reportType === 'replenishment') {
+        exportData = filteredItems.map(i => ({
           'Item Code': formatItemCode(i.code),
           'Description': i.description,
           'Location': i.location,
+          'Supplier': i.supplier,
           'On Hand': i.onHand,
-        };
-        activePeriodColumns.forEach((col, idx) => {
-          row[col] = projections[idx] ?? 0;
+          'On Order': i.onOrder,
+          'Safety Stock': i.safetyStock,
+          'ROP': i.reorderPoint,
+          'Order Now': i.orderNow || 0,
+          'Unit Cost': i.purchasePrice,
+          'Total Order Value': i.orderNowValue || 0,
+          'Approval': i.approvalState,
+        }));
+      } else if (reportType === 'projectedStock') {
+        exportData = filteredItems.map(i => {
+          const projections = calculateProjectedStockArray(i);
+          const minStock = projections.length > 0 ? Math.min(...projections) : i.onHand;
+          const row: Record<string, any> = {
+            'Item Code': formatItemCode(i.code),
+            'Description': i.description,
+            'Location': i.location,
+            'On Hand': i.onHand,
+          };
+          activePeriodColumns.forEach((col, idx) => {
+            row[col] = projections[idx] ?? 0;
+          });
+          row['Projected Min Stock'] = minStock;
+          return row;
         });
-        row['Projected Min Stock'] = minStock;
-        return row;
-      });
-    } else if (reportType === 'accuracy') {
-      exportData = filteredItems.map(i => ({
-        'Item Code': formatItemCode(i.code),
-        'Description': i.description,
-        'Model Applied': i.fittedModelType || i.modelType,
-        'WMAPE (%)': i.wmape?.toFixed(2),
-        'MAPE (%)': i.mape?.toFixed(2),
-        'Forecast Accuracy (%)': i.accuracy?.toFixed(2),
-      }));
-    } else if (reportType === 'abc') {
-      exportData = filteredItems.map(i => ({
-        'Item Code': formatItemCode(i.code),
-        'Description': i.description,
-        'ABC Class': i.abcClass,
-        'XYZ Class': i.xyzClass,
-        'Sales Price': i.salesPrice,
-        'Turnover Ratio': i.turnoverRatio,
-        'Inventory Value': i.inventoryValue,
-      }));
-    } else if (reportType === 'drp') {
-      exportData = filteredItems.map(i => ({
-        'Item Code': formatItemCode(i.code),
-        'Description': i.description,
-        'Location': i.location,
-        'DC Hub': i.dc ? 'Yes' : 'No',
-        'On Hand': i.onHand,
-        'Safety Stock': i.safetyStock,
-        'Transfer Qty': i.transferQty || 0,
-        'Transfer Source': i.transferSource || '-',
-        'Order Now': i.orderNow || 0,
-      }));
-    } else {
-      exportData = filteredItems.map(i => ({
-        'Item Code': formatItemCode(i.code),
-        'Description': i.description,
-        'BOM Type': i.bomType || 'Material',
-        'On Hand': i.onHand,
-        'Order Now': i.orderNow || 0,
-        'Lead Time': i.leadTimeDays,
-      }));
-    }
+      } else if (reportType === 'accuracy') {
+        exportData = filteredItems.map(i => ({
+          'Item Code': formatItemCode(i.code),
+          'Description': i.description,
+          'Model Applied': i.fittedModelType || i.modelType,
+          'WMAPE (%)': i.wmape?.toFixed(2),
+          'MAPE (%)': i.mape?.toFixed(2),
+          'Forecast Accuracy (%)': i.accuracy?.toFixed(2),
+        }));
+      } else if (reportType === 'abc') {
+        exportData = filteredItems.map(i => ({
+          'Item Code': formatItemCode(i.code),
+          'Description': i.description,
+          'ABC Class': i.abcClass,
+          'XYZ Class': i.xyzClass,
+          'Sales Price': i.salesPrice,
+          'Turnover Ratio': i.turnoverRatio,
+          'Inventory Value': i.inventoryValue,
+        }));
+      } else if (reportType === 'drp') {
+        exportData = filteredItems.map(i => ({
+          'Item Code': formatItemCode(i.code),
+          'Description': i.description,
+          'Location': i.location,
+          'DC Hub': i.dc ? 'Yes' : 'No',
+          'On Hand': i.onHand,
+          'Safety Stock': i.safetyStock,
+          'Transfer Qty': i.transferQty || 0,
+          'Transfer Source': i.transferSource || '-',
+          'Order Now': i.orderNow || 0,
+        }));
+      } else {
+        exportData = filteredItems.map(i => ({
+          'Item Code': formatItemCode(i.code),
+          'Description': i.description,
+          'BOM Type': i.bomType || 'Material',
+          'On Hand': i.onHand,
+          'Order Now': i.orderNow || 0,
+          'Lead Time': i.leadTimeDays,
+        }));
+      }
 
-    const hasLoc = Boolean(selectedLocation && selectedLocation !== 'ALL');
-    const locTag = hasLoc ? `_${selectedLocation!.trim()}` : '';
-    await exportSheetsToExcel([{ name: 'Report', rows: exportData }], `NEXO_${reportType}_${periodHorizon}${locTag}_Report.xlsx`);
+      const hasLoc = Boolean(selectedLocation && selectedLocation !== 'ALL');
+      const locTag = hasLoc ? `_${selectedLocation!.trim()}` : '';
+      const res = await exportSheetsToExcel([{ name: 'Report', rows: exportData }], `NEXO_${reportType}_${periodHorizon}${locTag}_Report.xlsx`);
+      const msg = formatExportSuccessToast(res, isAr);
+      if (msg) {
+        setExportToast({ type: 'success', text: msg });
+        setTimeout(() => setExportToast(null), 5000);
+      }
+    } catch (err: any) {
+      setExportToast({
+        type: 'error',
+        text: (isAr ? 'فشل تصدير التقرير: ' : 'Report export failed: ') + (err?.message || 'Unknown error'),
+      });
+      setTimeout(() => setExportToast(null), 6000);
+    } finally {
+      setIsExporting(false);
+    }
   };
 
   if (activeItems.length === 0) {
@@ -365,9 +384,10 @@ export const ReportsView: React.FC<ReportsViewProps> = ({
         <div>
           <button
             onClick={handleExportReport}
-            className="flex items-center gap-1.5 px-3 py-1 bg-[#2196F3] text-white font-semibold rounded hover:bg-blue-600 transition shadow-xs text-[11px] cursor-pointer"
+            disabled={isExporting}
+            className="flex items-center gap-1.5 px-3 py-1 bg-[#2196F3] text-white font-semibold rounded hover:bg-blue-600 transition shadow-xs text-[11px] disabled:opacity-50 cursor-pointer"
           >
-            <Download className="w-3.5 h-3.5" />
+            <Download className={`w-3.5 h-3.5 ${isExporting ? 'animate-bounce' : ''}`} />
             <span>{t.reports.toolbar.exportReport}</span>
           </button>
         </div>
@@ -728,6 +748,16 @@ export const ReportsView: React.FC<ReportsViewProps> = ({
               </div>
             </div>
           </div>
+        </div>
+      )}
+
+      {exportToast && (
+        <div
+          className={`fixed bottom-6 ${isAr ? 'left-6' : 'right-6'} z-50 px-4 py-2.5 rounded-lg shadow-xl flex items-center gap-2 text-xs font-semibold ${
+            exportToast.type === 'success' ? 'bg-emerald-600 text-white' : 'bg-rose-600 text-white'
+          }`}
+        >
+          <span>{exportToast.text}</span>
         </div>
       )}
     </div>

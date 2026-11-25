@@ -15,6 +15,7 @@ import {
   Clock 
 } from 'lucide-react';
 import { exportSheetsToExcel } from '../utils/excelExport';
+import { formatExportSuccessToast } from '../utils/exportDownload';
 import { formatItemCode } from '../utils/formatters';
 import { api, PurchaseOrdersResponse } from '../api/client';
 
@@ -62,6 +63,7 @@ export const PlannedOrdersModal: React.FC<PlannedOrdersModalProps> = ({
   const [excludeUnmatched, setExcludeUnmatched] = useState<boolean>(true);
   const [expandedPOs, setExpandedPOs] = useState<Set<string>>(() => new Set());
   const [isExporting, setIsExporting] = useState(false);
+  const [exportFeedback, setExportFeedback] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
   const [backendData, setBackendData] = useState<PurchaseOrdersResponse | null>(null);
   const [isLoading, setIsLoading] = useState(false);
 
@@ -178,12 +180,24 @@ export const PlannedOrdersModal: React.FC<PlannedOrdersModalProps> = ({
   // Full-Dataset Pure-Python openpyxl Export
   const handleExportAllPOs = async () => {
     setIsExporting(true);
+    setExportFeedback(null);
     try {
+      const hasLoc = Boolean(selectedLocation && selectedLocation !== 'ALL');
+      const locTag = hasLoc ? `_${selectedLocation!.trim()}` : '';
+      let res;
       if (projectId) {
-        const locParam = selectedLocation && selectedLocation !== 'ALL' ? `&location=${encodeURIComponent(selectedLocation)}` : '';
-        await api.downloadReportExport(
-          `/api/projects/${projectId}/export/purchase-orders?language=${language}${locParam}`,
-          `PO_Planned_Purchase_Orders_${language}.xlsx`
+        const params = new URLSearchParams({
+          language,
+          coverage_days: String(coverageDays),
+          velocity_days: String(velocityDays),
+          exclude_unmatched: String(excludeUnmatched),
+        });
+        if (hasLoc) params.set('location', selectedLocation!.trim());
+        if (searchQuery.trim()) params.set('search', searchQuery.trim());
+
+        res = await api.downloadReportExport(
+          `/api/projects/${projectId}/export/purchase-orders?${params.toString()}`,
+          `PO_Planned_Purchase_Orders${locTag}_${language}.xlsx`
         );
       } else {
         const summaryRows = displayGroups.map(g => ({
@@ -194,10 +208,19 @@ export const PlannedOrdersModal: React.FC<PlannedOrdersModalProps> = ({
           [isAr ? 'إجمالي قيمة أمر الشراء' : 'Total PO Value']: Number(g.totalValue.toFixed(2)),
           [isAr ? 'الفروع المغطاة' : 'Locations Covered']: g.locations.join(', ') || '-',
         }));
-        await exportSheetsToExcel([{ name: isAr ? 'ملخص أوامر الشراء' : 'PO Summary', rows: summaryRows }], 'Planned_Purchase_Orders.xlsx');
+        res = await exportSheetsToExcel([{ name: isAr ? 'ملخص أوامر الشراء' : 'PO Summary', rows: summaryRows }], `Planned_Purchase_Orders${locTag}.xlsx`);
       }
-    } catch (err) {
+      const msg = formatExportSuccessToast(res, isAr);
+      if (msg) {
+        setExportFeedback({ type: 'success', text: msg });
+        setTimeout(() => setExportFeedback(null), 6000);
+      }
+    } catch (err: any) {
       console.error('Failed to export all POs:', err);
+      setExportFeedback({
+        type: 'error',
+        text: (isAr ? 'فشل تصدير أوامر الشراء: ' : 'PO export failed: ') + (err?.message || 'Unknown error'),
+      });
     } finally {
       setIsExporting(false);
     }
@@ -467,6 +490,17 @@ export const PlannedOrdersModal: React.FC<PlannedOrdersModalProps> = ({
             })
           )}
         </div>
+
+        {/* Export Feedback Banner */}
+        {exportFeedback && (
+          <div className={`px-4 py-2 text-xs font-semibold border-t ${
+            exportFeedback.type === 'success'
+              ? 'bg-emerald-50 text-emerald-800 border-emerald-200'
+              : 'bg-rose-50 text-rose-800 border-rose-200'
+          }`}>
+            {exportFeedback.text}
+          </div>
+        )}
 
         {/* Footer */}
         <div className="p-3.5 bg-[#ECEFF1] border-t border-[#CBD5E1] flex flex-wrap items-center justify-between gap-3 text-xs">

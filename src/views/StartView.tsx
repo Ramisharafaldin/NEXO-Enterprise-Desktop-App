@@ -25,6 +25,7 @@ import {
 import { translations, Language } from '../i18n/translations';
 import { NexoLogo } from '../components/NexoLogo';
 import { api, ProjectSummary, FileInspectResult } from '../api/client';
+import { formatExportSuccessToast } from '../utils/exportDownload';
 
 interface StartViewProps {
   language: Language;
@@ -49,6 +50,8 @@ export const StartView: React.FC<StartViewProps> = ({
   const isAr = language === 'ar';
 
   const [activeSubTab, setActiveSubTab] = useState<'projects' | 'examples' | 'tutorials'>('examples');
+  const [exportingProjectId, setExportingProjectId] = useState<string | null>(null);
+  const [exportToast, setExportToast] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
   
   // New Project Modal State
   const [isNewProjectModalOpen, setIsNewProjectModalOpen] = useState(false);
@@ -460,15 +463,34 @@ export const StartView: React.FC<StartViewProps> = ({
                         </div>
 
                         <div className="flex items-center gap-2">
-                          <a
-                            href={api.getExportUrl(proj.id)}
-                            onClick={e => e.stopPropagation()}
-                            download={`NEXO_${proj.name}.xlsx`}
-                            className="p-1.5 hover:bg-slate-100 text-slate-500 hover:text-slate-800 rounded transition"
+                          <button
+                            type="button"
+                            disabled={exportingProjectId === proj.id}
+                            onClick={async (e) => {
+                              e.stopPropagation();
+                              setExportingProjectId(proj.id);
+                              try {
+                                const res = await api.downloadExcelExport(proj.id, 'all', `NEXO_${proj.name}.xlsx`);
+                                const msg = formatExportSuccessToast(res, isAr);
+                                if (msg) {
+                                  setExportToast({ type: 'success', text: msg });
+                                  setTimeout(() => setExportToast(null), 5000);
+                                }
+                              } catch (err: any) {
+                                setExportToast({
+                                  type: 'error',
+                                  text: (isAr ? 'فشل تصدير المشروع: ' : 'Project export failed: ') + (err?.message || 'Unknown error'),
+                                });
+                                setTimeout(() => setExportToast(null), 6000);
+                              } finally {
+                                setExportingProjectId(null);
+                              }
+                            }}
+                            className="p-1.5 hover:bg-slate-100 text-slate-500 hover:text-slate-800 rounded transition disabled:opacity-50 cursor-pointer"
                             title={isAr ? 'تصدير كملف Excel' : 'Export to Excel'}
                           >
-                            <Download className="w-4 h-4" />
-                          </a>
+                            {exportingProjectId === proj.id ? <RefreshCw className="w-4 h-4 animate-spin text-blue-600" /> : <Download className="w-4 h-4" />}
+                          </button>
                           <button
                             onClick={e => handleDeleteProject(proj.id, e)}
                             className="p-1.5 hover:bg-rose-50 text-slate-400 hover:text-rose-600 rounded transition cursor-pointer"
@@ -796,6 +818,17 @@ export const StartView: React.FC<StartViewProps> = ({
               </div>
             </div>
           </div>
+        </div>
+      )}
+
+      {exportToast && (
+        <div
+          className={`fixed bottom-6 ${isAr ? 'left-6' : 'right-6'} z-50 px-4 py-2.5 rounded-lg shadow-xl flex items-center gap-2 text-xs font-semibold ${
+            exportToast.type === 'success' ? 'bg-emerald-600 text-white' : 'bg-rose-600 text-white'
+          }`}
+        >
+          {exportToast.type === 'success' ? <CheckCircle2 className="w-4 h-4 shrink-0" /> : <AlertCircle className="w-4 h-4 shrink-0" />}
+          <span>{exportToast.text}</span>
         </div>
       )}
     </div>

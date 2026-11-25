@@ -5,6 +5,7 @@ import { formatCurrency, getCurrencySymbol, formatItemCode } from '../utils/form
 import { classifyAbcXyz } from '../engine/math';
 import { X, Grid, Info, CheckCircle2, FileSpreadsheet, Loader2, Filter } from 'lucide-react';
 import { exportAbcXyzReport } from '../utils/excelExport';
+import { formatExportSuccessToast } from '../utils/exportDownload';
 import { api } from '../api/client';
 
 interface AbcXyzModalProps {
@@ -37,6 +38,7 @@ export const AbcXyzModal: React.FC<AbcXyzModalProps> = ({
   const [selectedCell, setSelectedCell] = useState<string | null>(null);
   const [isLoading, setIsLoading] = useState<boolean>(false);
   const [isExporting, setIsExporting] = useState<boolean>(false);
+  const [exportFeedback, setExportFeedback] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
 
   // Re-classify dynamically with configured thresholds (client fallback)
   const clientClassifiedItems = useMemo(() => {
@@ -92,20 +94,32 @@ export const AbcXyzModal: React.FC<AbcXyzModalProps> = ({
 
   const handleExportExcel = async () => {
     setIsExporting(true);
+    setExportFeedback(null);
     try {
+      let res;
       if (projectId) {
         let exportUrl = `/api/projects/${projectId}/export/abc-xyz?language=${language}`;
         if (location && location !== 'ALL') exportUrl += `&location=${encodeURIComponent(location)}`;
-        await api.downloadReportExport(exportUrl, 'ABC_XYZ_Matrix_Report.xlsx');
+        res = await api.downloadReportExport(exportUrl, 'ABC_XYZ_Matrix_Report.xlsx');
       } else {
-        await exportAbcXyzReport({
+        res = await exportAbcXyzReport({
           matrix,
           classifiedItems: clientClassifiedItems,
           language,
+          selectedLocation: location,
         });
       }
-    } catch (err) {
+      const msg = formatExportSuccessToast(res, isAr);
+      if (msg) {
+        setExportFeedback({ type: 'success', text: msg });
+        setTimeout(() => setExportFeedback(null), 6000);
+      }
+    } catch (err: any) {
       console.error('Failed to export ABC-XYZ report:', err);
+      setExportFeedback({
+        type: 'error',
+        text: (isAr ? 'فشل تصدير مصفوفة ABC-XYZ: ' : 'ABC-XYZ export failed: ') + (err?.message || 'Unknown error'),
+      });
     } finally {
       setIsExporting(false);
     }
@@ -329,6 +343,17 @@ export const AbcXyzModal: React.FC<AbcXyzModalProps> = ({
             </div>
           </div>
         </div>
+
+        {/* Export Feedback Banner */}
+        {exportFeedback && (
+          <div className={`px-4 py-2 text-xs font-semibold border-t ${
+            exportFeedback.type === 'success'
+              ? 'bg-emerald-50 text-emerald-800 border-emerald-200'
+              : 'bg-rose-50 text-rose-800 border-rose-200'
+          }`}>
+            {exportFeedback.text}
+          </div>
+        )}
 
         {/* Footer */}
         <div className="p-3 bg-[#ECEFF1] border-t border-[#CBD5E1] flex items-center justify-between">

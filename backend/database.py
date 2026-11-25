@@ -1676,7 +1676,7 @@ def get_project_dormant_count(project_id: str, location: Optional[str] = None) -
         finally:
             con.close()
 
-def get_project_items(project_id: str, include_dormant: bool = False, location: Optional[str] = None) -> List[Dict[str, Any]]:
+def get_project_items(project_id: str, include_dormant: bool = False, location: Optional[str] = None, include_periods: bool = True) -> List[Dict[str, Any]]:
     """Returns all analyzable items for a project, excluding dormant SKUs (0 stock & 0 sales) unless include_dormant=True, with optional branch filter."""
     with _LOCK:
         con = get_connection()
@@ -1704,31 +1704,38 @@ def get_project_items(project_id: str, include_dormant: bool = False, location: 
             if items_df.empty:
                 return []
 
-            periods_df = con.execute("SELECT * FROM periods WHERE project_id = ? ORDER BY date ASC", (project_id,)).fetchdf()
-            
-            # Group periods by item_id
             periods_by_item: Dict[str, List[Dict[str, Any]]] = {}
-            if not periods_df.empty:
-                for row in periods_df.to_dict(orient="records"):
-                    iid = row["item_id"]
-                    if iid not in periods_by_item:
-                        periods_by_item[iid] = []
-                    periods_by_item[iid].append({
-                        "date": str(row["date"]),
-                        "actual": clean_float(row["actual"], 0.0),
-                        "forecast": clean_opt_float(row.get("forecast")),
-                        "model": clean_opt_float(row.get("model")),
-                        "confUpper": clean_opt_float(row.get("conf_upper")),
-                        "confLower": clean_opt_float(row.get("conf_lower")),
-                        "override": clean_opt_float(row.get("override")),
-                        "promotion": clean_float(row.get("promotion"), 0.0)
-                    })
+            sales_sum_by_item: Dict[str, float] = {}
+            if include_periods:
+                periods_df = con.execute("SELECT * FROM periods WHERE project_id = ? ORDER BY date ASC", (project_id,)).fetchdf()
+                if not periods_df.empty:
+                    for row in periods_df.to_dict(orient="records"):
+                        iid = row["item_id"]
+                        if iid not in periods_by_item:
+                            periods_by_item[iid] = []
+                        periods_by_item[iid].append({
+                            "date": str(row["date"]),
+                            "actual": clean_float(row["actual"], 0.0),
+                            "forecast": clean_opt_float(row.get("forecast")),
+                            "model": clean_opt_float(row.get("model")),
+                            "confUpper": clean_opt_float(row.get("conf_upper")),
+                            "confLower": clean_opt_float(row.get("conf_lower")),
+                            "override": clean_opt_float(row.get("override")),
+                            "promotion": clean_float(row.get("promotion"), 0.0)
+                        })
+            else:
+                sales_rows = con.execute(
+                    "SELECT item_id, COALESCE(SUM(actual), 0.0) FROM periods WHERE project_id = ? GROUP BY item_id",
+                    (project_id,)
+                ).fetchall()
+                for iid_val, tot_val in sales_rows:
+                    sales_sum_by_item[str(iid_val)] = clean_float(tot_val, 0.0)
 
             res = []
             for item in items_df.to_dict(orient="records"):
                 iid = str(item["id"])
                 item_periods = periods_by_item.get(iid, [])
-                total_sales = sum(clean_float(p.get("actual"), 0.0) for p in item_periods)
+                total_sales = sum(clean_float(p.get("actual"), 0.0) for p in item_periods) if include_periods else sales_sum_by_item.get(iid, 0.0)
                 on_hand = clean_float(item.get("on_hand"), 0.0)
                 is_active = is_analyzable_sku(on_hand, total_sales)
 

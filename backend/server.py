@@ -120,7 +120,7 @@ def get_app_version() -> str:
                     return val.lstrip("v")
         except Exception:
             pass
-    return "0.1.18"
+    return "0.1.19"
 
 APP_VERSION = get_app_version()
 
@@ -4103,15 +4103,37 @@ async def import_file_endpoint(
     res["columns_detected"] = []
     return res
 
+_ILLEGAL_EXCEL_XML_RE = re.compile(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]')
+
 def sanitize_excel_cell(val: Any) -> Any:
     """
-    Prevents CSV / Excel formula injection (CWE-1236, SEC-MED-01).
-    Neutralizes leading formula operators (=, +, -, @, \t, \r) on string values.
+    Sanitizes cell values for safe OpenPyXL XML generation and CWE-1236 formula defense:
+    - Strips XML-illegal control characters that cause OpenPyXL IllegalCharacterError.
+    - Converts NaN/Inf floats to empty string.
+    - Neutralizes leading formula operators (=, +, -, @, \t, \r) on strings.
     """
+    if isinstance(val, float) and (math.isnan(val) or math.isinf(val)):
+        return ""
     if isinstance(val, str):
-        if val.startswith(("=", "+", "-", "@", "\t", "\r")):
-            return f"'{val}"
+        cleaned = _ILLEGAL_EXCEL_XML_RE.sub("", val)
+        if cleaned.startswith(("=", "+", "-", "@", "\t", "\r")):
+            return f"'{cleaned}"
+        return cleaned
     return val
+
+def _safe_sheet_name(raw_name: Optional[str], wb, fallback: str = "Sheet") -> str:
+    """Sanitizes and deduplicates an Excel worksheet title within the 31-char limit."""
+    base = re.sub(r'[\\/*?:\[\]]', '_', (raw_name or fallback).strip()) or fallback
+    base = _ILLEGAL_EXCEL_XML_RE.sub("", base)[:31] or fallback
+    existing = set(wb.sheetnames)
+    if base not in existing:
+        return base
+    for n in range(2, 100):
+        suffix = f"_{n}"
+        cand = f"{base[:31 - len(suffix)]}{suffix}"
+        if cand not in existing:
+            return cand
+    return f"Sheet_{len(existing) + 1}"[:31]
 
 def _style_openpyxl_sheet(
     ws,
@@ -4123,10 +4145,10 @@ def _style_openpyxl_sheet(
     header_font_color: str = "FFFFFF"
 ):
     """
-    Applies professional enterprise styling to an openpyxl worksheet:
+    Applies professional enterprise styling to an openpyxl worksheet in a single fast pass:
     - Sets RTL when is_arabic is True.
     - Dark styled headers with bold white text.
-    - Auto-fitted column widths with safe padding (12 to 45 chars).
+    - Auto-fitted column widths with safe padding (12 to 48 chars).
     - Frozen header rows and AutoFilter.
     - Zebra striping on data rows (#F8FAFC on even rows).
     - Clean numeric formatting (#,##0 or #,##0.00) without currency symbols.
@@ -4142,44 +4164,56 @@ def _style_openpyxl_sheet(
 
     header_font = Font(name="Segoe UI", size=11, bold=True, color=header_font_color)
     header_fill = PatternFill(start_color=header_fill_hex, end_color=header_fill_hex, fill_type="solid")
-    thin_border = Border(
-        left=Side(style='thin', color='CBD5E1'),
-        right=Side(style='thin', color='CBD5E1'),
-        top=Side(style='thin', color='CBD5E1'),
-        bottom=Side(style='thin', color='CBD5E1')
-    )
+    header_align = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    num_align = Alignment(horizontal="right", vertical="center")
+    text_align = Alignment(horizontal="right" if is_arabic else "left", vertical="center")
+    side = Side(style='thin', color='CBD5E1')
+    thin_border = Border(left=side, right=side, top=side, bottom=side)
     zebra_fill = PatternFill(start_color="F8FAFC", end_color="F8FAFC", fill_type="solid")
 
     max_r = ws.max_row
     max_c = ws.max_column
+    col_widths = [0] * max_c
 
-    if max_r >= header_row and max_c >= 1:
-        ws.row_dimensions[header_row].height = 26
-        for col_idx in range(1, max_c + 1):
-            cell = ws.cell(row=header_row, column=col_idx)
-            cell.font = header_font
-            cell.fill = header_fill
-            cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
-            cell.border = thin_border
-
-    for r_idx in range(header_row + 1, max_r + 1):
-        ws.row_dimensions[r_idx].height = 20
-        is_even = ((r_idx - header_row) % 2 == 0)
-        for col_idx in range(1, max_c + 1):
-            cell = ws.cell(row=r_idx, column=col_idx)
-            cell.border = thin_border
-            if is_even:
-                cell.fill = zebra_fill
-            val = cell.value
-            if isinstance(val, (int, float)):
-                if isinstance(val, float) and not val.is_integer():
-                    cell.number_format = '#,##0.00'
-                else:
-                    cell.number_format = '#,##0'
-                cell.alignment = Alignment(horizontal="right", vertical="center")
+    if max_c >= 1:
+        for r_idx, row in enumerate(ws.iter_rows(min_row=1, max_row=max_r, max_col=max_c), start=1):
+            if r_idx < header_row:
+                for c_idx, cell in enumerate(row):
+                    v_len = len(str(cell.value or ""))
+                    if v_len > col_widths[c_idx]:
+                        col_widths[c_idx] = v_len
+            elif r_idx == header_row:
+                ws.row_dimensions[r_idx].height = 26
+                for c_idx, cell in enumerate(row):
+                    cell.font = header_font
+                    cell.fill = header_fill
+                    cell.alignment = header_align
+                    cell.border = thin_border
+                    v_len = len(str(cell.value or ""))
+                    if v_len > col_widths[c_idx]:
+                        col_widths[c_idx] = v_len
             else:
-                align_h = "right" if is_arabic else "left"
-                cell.alignment = Alignment(horizontal=align_h, vertical="center")
+                ws.row_dimensions[r_idx].height = 20
+                is_even = ((r_idx - header_row) % 2 == 0)
+                for c_idx, cell in enumerate(row):
+                    cell.border = thin_border
+                    if is_even:
+                        cell.fill = zebra_fill
+                    val = cell.value
+                    if isinstance(val, (int, float)) and not isinstance(val, bool):
+                        if isinstance(val, float) and not val.is_integer():
+                            cell.number_format = '#,##0.00'
+                        else:
+                            cell.number_format = '#,##0'
+                        cell.alignment = num_align
+                    else:
+                        cell.alignment = text_align
+                    v_len = len(str(val or ""))
+                    if v_len > col_widths[c_idx]:
+                        col_widths[c_idx] = v_len
+
+        for c_idx, max_len in enumerate(col_widths, start=1):
+            ws.column_dimensions[get_column_letter(c_idx)].width = min(max(max_len + 4, 12), 48)
 
     if freeze_pane:
         ws.freeze_panes = freeze_pane
@@ -4188,20 +4222,6 @@ def _style_openpyxl_sheet(
         start_col = get_column_letter(1)
         end_col = get_column_letter(max_c)
         ws.auto_filter.ref = f"{start_col}{header_row}:{end_col}{max_r}"
-
-    # Auto-fit columns
-    if max_c >= 1:
-        for col in ws.columns:
-            try:
-                col_letter = get_column_letter(col[0].column)
-                max_len = 0
-                for cell in col:
-                    v_str = str(cell.value or "")
-                    if len(v_str) > max_len:
-                        max_len = len(v_str)
-                ws.column_dimensions[col_letter].width = min(max(max_len + 4, 12), 48)
-            except Exception:
-                pass
 
 class ExcelSheetData(BaseModel):
     name: str
@@ -4215,8 +4235,8 @@ class ExcelExportRequest(BaseModel):
 def export_custom_excel(req: ExcelExportRequest):
     """
     Unified, hardened Excel (.xlsx) export endpoint (SEC-HIGH-03, SEC-MED-01).
-    Sanitizes all cells against formula injection and generates openpyxl workbooks
-    with automatic Arabic RTL sheet support and enterprise styling.
+    Sanitizes all cells against formula injection and illegal XML control chars,
+    deduplicates worksheet names, and applies Arabic RTL support and enterprise styling.
     """
     import openpyxl
 
@@ -4224,12 +4244,11 @@ def export_custom_excel(req: ExcelExportRequest):
     default_sheet = wb.active
 
     for idx, sheet_spec in enumerate(req.sheets):
-        sheet_name = (sheet_spec.name or f"Sheet{idx+1}").strip()[:31]
-        sheet_name = re.sub(r'[\\/*?:\[\]]', '_', sheet_name) or f"Sheet{idx+1}"
+        sheet_name = _safe_sheet_name(sheet_spec.name, wb, fallback=f"Sheet{idx+1}")
         ws = wb.create_sheet(title=sheet_name)
-        
+
         has_arabic = bool(re.search(r'[\u0600-\u06FF]', sheet_name))
-        
+
         if sheet_spec.rows:
             headers = []
             for row in sheet_spec.rows:
@@ -4292,7 +4311,7 @@ def export_drp_endpoint(
 ):
     """Generates DRP_Transfers_Report.xlsx with Transfer Recommendations and Regional Branch Balances."""
     pid = _resolve_project_id(project_id)
-    items = get_project_items(pid, location=location)
+    items = get_project_items(pid, location=location, include_periods=False)
     is_ar = (language != "en")
 
     # Group items by code to detect surplus vs deficit across locations
@@ -4404,7 +4423,7 @@ def export_mrp_endpoint(
 ):
     """Generates MRP_BOM_Explosion.xlsx with parent metadata, component gross/net requirements, and shortage totals."""
     pid = _resolve_project_id(project_id)
-    items = get_project_items(pid)
+    items = get_project_items(pid, include_periods=False)
     is_ar = (language != "en")
 
     parent = None
@@ -4537,7 +4556,7 @@ def export_abc_xyz_endpoint(
 ):
     """Generates ABC_XYZ_Matrix_Report.xlsx with 3x3 Matrix Summary and Item Classification Breakdown."""
     pid = _resolve_project_id(project_id)
-    items = get_project_items(pid, location=location)
+    items = get_project_items(pid, location=location, include_periods=False)
     is_ar = (language != "en")
 
     matrix_cells = [
@@ -4627,67 +4646,231 @@ def export_abc_xyz_endpoint(
         headers={"Content-Disposition": f'attachment; filename="{ascii_filename}"; filename*=UTF-8\'\'{encoded_filename}'}
     )
 
+def _prepare_po_active_tables(
+    con,
+    pid: str,
+    location: Optional[str] = None,
+    search: Optional[str] = None,
+    coverage_days: int = 14,
+    velocity_days: int = 60,
+    exclude_unmatched: bool = True,
+) -> int:
+    """
+    Populates DuckDB temp tables (`tmp_po_active`, etc.) using exact velocity + coverage math
+    shared between GET /purchase-orders and PO Excel exports. Returns unmatched_excluded_count.
+    """
+    max_d_row = con.execute(
+        "SELECT MAX(sale_date) FROM daily_sales WHERE project_id = ? AND sale_date IS NOT NULL AND sale_date != ''",
+        (pid,)
+    ).fetchone()
+    max_d = max_d_row[0] if max_d_row and max_d_row[0] else None
+
+    cov = float(coverage_days or 14)
+    vel = float(velocity_days or 60)
+
+    if max_d:
+        con.execute("""
+            CREATE OR REPLACE TEMP TABLE tmp_po_velocity AS
+            SELECT 
+                ds.item_code,
+                ds.location,
+                SUM(ds.qty_sold) / ? as daily_demand
+            FROM daily_sales ds
+            WHERE ds.project_id = ?
+              AND ds.sale_date IS NOT NULL
+              AND TRY_CAST(ds.sale_date AS DATE) >= (TRY_CAST(? AS DATE) - CAST(? || ' days' AS INTERVAL))
+            GROUP BY ds.item_code, ds.location;
+        """, (vel, pid, max_d, vel))
+    else:
+        con.execute("""
+            CREATE OR REPLACE TEMP TABLE tmp_po_velocity AS
+            SELECT 
+                i.code as item_code,
+                i.location,
+                COALESCE(i.mean_daily_demand, 0.0) as daily_demand
+            FROM items i
+            WHERE i.project_id = ?;
+        """, (pid,))
+
+    norm_loc_v = "regexp_replace(replace(regexp_replace(regexp_replace(TRIM(COALESCE(v.location, 'Main Warehouse')), '[\u200b\u200c\u200d\ufeffـ]', '', 'g'), '[أإآٱ]', 'ا', 'g'), 'ى', 'ي'), '\\\\s+', ' ', 'g')"
+    norm_loc_i = "regexp_replace(replace(regexp_replace(regexp_replace(TRIM(COALESCE(i.location, 'Main Warehouse')), '[\u200b\u200c\u200d\ufeffـ]', '', 'g'), '[أإآٱ]', 'ا', 'g'), 'ى', 'ي'), '\\\\s+', ' ', 'g')"
+
+    where_clauses = [
+        "i.project_id = ?",
+        "i.code NOT IN ('نص (Text)', 'رقم (>= 0)', 'نوع البيانات', 'تاريخ يومي / شهري', 'Example', 'Data Type', 'نص', 'رقم')"
+    ]
+    params: List[Any] = [cov, pid]
+
+    if location and location.strip() and location.strip().upper() != "ALL":
+        norm_target_loc = normalize_arabic_text(location.strip())
+        where_clauses.append(f"({norm_loc_i} = ?)")
+        params.append(norm_target_loc)
+
+    if search and search.strip():
+        s_param = f"%{search.strip().lower()}%"
+        where_clauses.append("(LOWER(i.code) LIKE ? OR LOWER(i.description) LIKE ? OR LOWER(i.supplier) LIKE ?)")
+        params.extend([s_param, s_param, s_param])
+
+    con.execute(f"""
+        CREATE OR REPLACE TEMP TABLE tmp_all_po_candidates AS
+        SELECT 
+            i.id,
+            i.code,
+            i.description,
+            COALESCE(i.category, 'General') as category,
+            COALESCE(i.location, 'Main Warehouse') as location,
+            COALESCE(NULLIF(TRIM(i.supplier), ''), 'Primary Supplier') as supplier,
+            GREATEST(0.0, COALESCE(i.on_hand, 0.0)) as on_hand,
+            COALESCE(i.on_order, 0.0) as on_order,
+            COALESCE(i.backorders, 0.0) as backorders,
+            COALESCE(i.purchase_price, 50.0) as purchase_price,
+            COALESCE(i.sales_price, 100.0) as sales_price,
+            GREATEST(1.0, COALESCE(i.lead_time_days, 3.0)) as lead_time_days,
+            LEAST(COALESCE(i.lead_time_variance_days, 1.0), GREATEST(1.0, COALESCE(i.lead_time_days, 3.0))) as lead_time_var,
+            COALESCE(v.daily_demand, 0.0) as avg_daily_demand,
+            ROUND((CASE WHEN i.service_level >= 0.98 THEN 2.054 WHEN i.service_level >= 0.95 THEN 1.645 ELSE 1.282 END) * 
+              SQRT(GREATEST(1.0, i.lead_time_days) * POWER(COALESCE(v.daily_demand, 0.0) * 0.3, 2) + POWER(COALESCE(v.daily_demand, 0.0), 2) * POWER(LEAST(COALESCE(i.lead_time_variance_days, 1.0), GREATEST(1.0, i.lead_time_days)), 2))
+            ) as safety_stock,
+            ROUND(COALESCE(v.daily_demand, 0.0) * (GREATEST(1.0, COALESCE(i.lead_time_days, 3.0)) + ?) + 
+              ROUND((CASE WHEN i.service_level >= 0.98 THEN 2.054 WHEN i.service_level >= 0.95 THEN 1.645 ELSE 1.282 END) * 
+                SQRT(GREATEST(1.0, i.lead_time_days) * POWER(COALESCE(v.daily_demand, 0.0) * 0.3, 2) + POWER(COALESCE(v.daily_demand, 0.0), 2) * POWER(LEAST(COALESCE(i.lead_time_variance_days, 1.0), GREATEST(1.0, i.lead_time_days)), 2))
+              )
+            ) as target_stock,
+            GREATEST(0.0, COALESCE(i.on_hand, 0.0)) + COALESCE(i.on_order, 0.0) - COALESCE(i.backorders, 0.0) as inv_position,
+            COALESCE(i.min_batch, 1.0) as min_batch,
+            COALESCE(i.batch_rounding, 1.0) as batch_rounding
+        FROM items i
+        LEFT JOIN tmp_po_velocity v
+          ON v.item_code = i.code
+         AND ({norm_loc_v} = {norm_loc_i} OR (v.location IS NULL AND i.location IS NULL))
+        WHERE {' AND '.join(where_clauses)};
+    """, params)
+
+    con.execute("""
+        CREATE OR REPLACE TEMP TABLE tmp_po_computed AS
+        SELECT 
+            id, code, description, category, location, supplier,
+            on_hand, on_order, backorders, purchase_price, sales_price,
+            lead_time_days, avg_daily_demand, safety_stock, target_stock,
+            CASE WHEN avg_daily_demand > 0 THEN ROUND(on_hand / avg_daily_demand) ELSE 999.0 END as days_of_supply,
+            CASE 
+                WHEN avg_daily_demand > 0.0 AND (target_stock - inv_position) >= 0.5 THEN
+                    GREATEST(
+                        min_batch,
+                        CEIL((target_stock - inv_position) / GREATEST(1.0, batch_rounding)) * GREATEST(1.0, batch_rounding)
+                    )
+                ELSE 0.0
+            END as order_now,
+            CASE 
+                WHEN (supplier = 'Primary Supplier' OR category = 'General') THEN TRUE 
+                ELSE FALSE 
+            END as is_unmatched
+        FROM tmp_all_po_candidates;
+    """)
+
+    unmatched_cnt_row = con.execute("SELECT COUNT(*) FROM tmp_po_computed WHERE order_now > 0 AND is_unmatched = TRUE").fetchone()
+    unmatched_count = unmatched_cnt_row[0] if unmatched_cnt_row else 0
+
+    unmatch_filter = "AND is_unmatched = FALSE" if exclude_unmatched else ""
+    con.execute(f"""
+        CREATE OR REPLACE TEMP TABLE tmp_po_active AS
+        SELECT * FROM tmp_po_computed WHERE order_now > 0 {unmatch_filter};
+    """)
+    return unmatched_count
+
+def _drop_po_temp_tables(con):
+    for tbl in ("tmp_po_velocity", "tmp_all_po_candidates", "tmp_po_computed", "tmp_po_active"):
+        con.execute(f"DROP TABLE IF EXISTS {tbl};")
+
 @app.get("/api/export/orders")
 @app.post("/api/export/orders")
 def export_orders_endpoint(
     project_id: Optional[str] = Query(None),
     language: Optional[str] = Query("ar"),
-    location: Optional[str] = Query(None)
+    location: Optional[str] = Query(None),
+    search: Optional[str] = Query(None),
+    coverage_days: int = Query(14),
+    velocity_days: int = Query(60),
+    exclude_unmatched: bool = Query(True),
 ):
-    """Generates PO_Planned_Purchase_Orders.xlsx with PO Summary and Line Items."""
+    """Generates PO_Planned_Purchase_Orders.xlsx using the exact same SQL engine as PlannedOrdersModal."""
     pid = _resolve_project_id(project_id)
-    items = get_project_items(pid, location=location)
     is_ar = (language != "en")
 
-    order_items = [it for it in items if float(it.get("orderNow", 0)) > 0]
+    with _LOCK:
+        con = get_connection()
+        try:
+            _prepare_po_active_tables(
+                con,
+                pid,
+                location=location,
+                search=search,
+                coverage_days=coverage_days,
+                velocity_days=velocity_days,
+                exclude_unmatched=exclude_unmatched,
+            )
+            sup_rows = con.execute("""
+                SELECT 
+                    supplier,
+                    COUNT(*) as sku_cnt,
+                    COALESCE(SUM(order_now), 0.0) as units,
+                    COALESCE(SUM(order_now * purchase_price), 0.0) as val,
+                    list(DISTINCT location) as locs
+                FROM tmp_po_active
+                GROUP BY supplier
+                ORDER BY val DESC;
+            """).fetchall()
 
-    # Group by supplier
-    sup_map: Dict[str, List[Dict[str, Any]]] = {}
-    for it in order_items:
-        raw_sup = (it.get("supplier") or "").strip()
-        sup_name = raw_sup or ("مورد غير محدد" if is_ar else "Unassigned Supplier")
-        if sup_name not in sup_map:
-            sup_map[sup_name] = []
-        sup_map[sup_name].append(it)
+            po_num_by_sup: Dict[str, str] = {}
+            summary_rows = []
+            for idx, (s_name, s_cnt, s_units, s_val, s_locs) in enumerate(sup_rows):
+                po_num = f"PO-{idx+1:03d}"
+                po_num_by_sup[s_name] = po_num
+                locs = sorted([loc for loc in (s_locs or []) if loc])
+                summary_rows.append({
+                    "رقم أمر الشراء" if is_ar else "PO Number": po_num,
+                    "اسم المورد" if is_ar else "Supplier": s_name,
+                    "عدد الأصناف" if is_ar else "SKU Count": int(s_cnt),
+                    "إجمالي الوحدات المطلوبة" if is_ar else "Total Units": float(s_units),
+                    "إجمالي قيمة أمر الشراء" if is_ar else "Total PO Value": round(float(s_val), 2),
+                    "الفروع المغطاة" if is_ar else "Locations Covered": ", ".join(locs) if locs else "-",
+                })
 
-    # Sort suppliers descending by value
-    sorted_sups = sorted(
-        sup_map.items(),
-        key=lambda kv: sum(float(x.get("orderNowValue", 0)) for x in kv[1]),
-        reverse=True
-    )
+            line_rows = con.execute("""
+                SELECT 
+                    supplier, code, description, location, on_hand, on_order,
+                    avg_daily_demand, days_of_supply, safety_stock, target_stock,
+                    order_now, purchase_price, ROUND(order_now * purchase_price, 2) as line_value,
+                    lead_time_days
+                FROM tmp_po_active
+                ORDER BY supplier ASC, line_value DESC;
+            """).fetchall()
+        finally:
+            try:
+                _drop_po_temp_tables(con)
+            finally:
+                con.close()
 
-    summary_rows = []
     line_item_rows = []
-
-    for idx, (sup_name, g_items) in enumerate(sorted_sups):
-        po_num = f"PO-{idx+1:03d}"
-        g_units = sum(float(x.get("orderNow", 0)) for x in g_items)
-        g_val = sum(float(x.get("orderNowValue", 0)) for x in g_items)
-        locs = sorted(list(set(x.get("location") for x in g_items if x.get("location"))))
-
-        summary_rows.append({
-            "رقم أمر الشراء" if is_ar else "PO Number": po_num,
+    for row in line_rows:
+        sup_name = row[0]
+        line_item_rows.append({
+            "رقم أمر الشراء" if is_ar else "PO Number": po_num_by_sup.get(sup_name, "-"),
             "اسم المورد" if is_ar else "Supplier": sup_name,
-            "عدد الأصناف" if is_ar else "SKU Count": len(g_items),
-            "إجمالي الوحدات المطلوبة" if is_ar else "Total Units": g_units,
-            "إجمالي قيمة أمر الشراء" if is_ar else "Total PO Value": round(g_val, 2),
-            "الفروع المغطاة" if is_ar else "Locations Covered": ", ".join(locs) if locs else "-",
+            "كود الصنف" if is_ar else "Item Code": clean_item_code(row[1]),
+            "اسم الصنف" if is_ar else "Description": row[2] or "",
+            "الموقع / الفرع" if is_ar else "Location": row[3] or "",
+            "الرصيد الحالي" if is_ar else "On Hand": float(row[4] or 0),
+            "قيد التوريد" if is_ar else "On Order": float(row[5] or 0),
+            "البيع اليومي" if is_ar else "Daily Sales": round(float(row[6] or 0), 2),
+            "أيام التغطية" if is_ar else "Days of Supply": int(float(row[7] or 0)),
+            "مخزون الأمان" if is_ar else "Safety Stock": float(row[8] or 0),
+            "الكمية المطلوبة" if is_ar else "Order Qty": float(row[10] or 0),
+            "سعر التكلفة" if is_ar else "Unit Cost": round(float(row[11] or 0), 2),
+            "إجمالي القيمة" if is_ar else "Line Total": round(float(row[12] or 0), 2),
+            "فترة التوريد (يوم)" if is_ar else "Lead Time (Days)": int(float(row[13] or 14)),
+            "حالة الاعتماد" if is_ar else "Approval Status": "مؤكد ومخطط" if is_ar else "Planned Draft",
         })
-
-        for it in g_items:
-            line_item_rows.append({
-                "رقم أمر الشراء" if is_ar else "PO Number": po_num,
-                "اسم المورد" if is_ar else "Supplier": sup_name,
-                "كود الصنف" if is_ar else "Item Code": clean_item_code(it.get("code")),
-                "اسم الصنف" if is_ar else "Description": it.get("description", ""),
-                "الموقع / الفرع" if is_ar else "Location": it.get("location", ""),
-                "الكمية المطلوبة" if is_ar else "Order Qty": float(it.get("orderNow", 0)),
-                "سعر التكلفة" if is_ar else "Unit Cost": round(float(it.get("purchasePrice", 0)), 2),
-                "إجمالي القيمة" if is_ar else "Line Total": round(float(it.get("orderNowValue", 0)), 2),
-                "فترة التوريد (يوم)" if is_ar else "Lead Time (Days)": int(it.get("leadTimeDays", 14) or 14),
-                "حالة الاعتماد" if is_ar else "Approval Status": "مؤكد ومخطط" if is_ar else "Planned Draft",
-            })
 
     if not summary_rows:
         summary_rows.append({
@@ -4710,7 +4893,11 @@ def export_orders_endpoint(
     _style_openpyxl_sheet(ws1, is_arabic=is_ar, header_row=1, freeze_pane="A2", enable_autofilter=True)
 
     ws2 = wb.create_sheet(title="تفاصيل الأصناف" if is_ar else "PO Line Items")
-    h2 = list(line_item_rows[0].keys()) if line_item_rows else ["رقم أمر الشراء", "اسم المورد", "كود الصنف"]
+    h2 = list(line_item_rows[0].keys()) if line_item_rows else (
+        ["رقم أمر الشراء", "اسم المورد", "كود الصنف", "اسم الصنف", "الكمية المطلوبة"]
+        if is_ar else
+        ["PO Number", "Supplier", "Item Code", "Description", "Order Qty"]
+    )
     ws2.append([sanitize_excel_cell(h) for h in h2])
     for r in line_item_rows:
         ws2.append([sanitize_excel_cell(r.get(h, "")) for h in h2])
@@ -4720,8 +4907,13 @@ def export_orders_endpoint(
     wb.save(output)
     output.seek(0)
 
-    filename = "PO_Planned_Purchase_Orders.xlsx"
-    ascii_filename = "PO_Planned_Purchase_Orders.xlsx"
+    has_loc = bool(location and location.strip() and location.strip().upper() != "ALL")
+    loc_tag = ""
+    if has_loc:
+        cleaned_loc = re.sub(r'[\\/*?:<>|"\r\n]', '_', location.strip())
+        loc_tag = f"_{cleaned_loc}"
+    filename = f"PO_Planned_Purchase_Orders{loc_tag}_{language or 'ar'}.xlsx"
+    ascii_filename = re.sub(r'[^\x20-\x7E]', '_', filename)
     encoded_filename = urllib.parse.quote(filename)
 
     return StreamingResponse(
@@ -4732,75 +4924,108 @@ def export_orders_endpoint(
 
 def _generate_excel_export(project_id: str, export_type: str = "all", location: Optional[str] = None) -> StreamingResponse:
     """Generates real .xlsx exports from DuckDB tables with formula sanitization and optional location filtering."""
-    items = get_project_items(project_id, location=location)
+    need_periods = export_type in ("all", "forecast")
+    items = get_project_items(project_id, location=location, include_periods=need_periods)
     if not items:
         raise HTTPException(status_code=404, detail="No items found for this project")
 
-    inv_data = []
-    for it in items:
-        inv_data.append({
-            "Item Code": sanitize_excel_cell(it["code"]),
-            "Description": sanitize_excel_cell(it["description"]),
-            "Category": sanitize_excel_cell(it["category"]),
-            "Location": sanitize_excel_cell(it["location"]),
-            "Supplier": sanitize_excel_cell(it["supplier"]),
-            "Sales Price": it["salesPrice"],
-            "Purchase Price": it["purchasePrice"],
-            "On Hand": it["onHand"],
-            "On Order": it["onOrder"],
-            "Lead Time (Days)": it["leadTimeDays"],
-            "Safety Stock": it["safetyStock"],
-            "Reorder Point": it["reorderPoint"],
-            "Order Now": it["orderNow"],
-            "Order Value": it["orderNowValue"],
-            "Days of Supply": it["daysOfSupply"],
-            "ABC Class": sanitize_excel_cell(it["abcClass"]),
-            "XYZ Class": sanitize_excel_cell(it["xyzClass"]),
-            "Forecast Model": sanitize_excel_cell(it["modelType"]),
-            "Replenishment Strategy": sanitize_excel_cell(it["replenishmentStrategy"]),
-            "Forecast Accuracy (%)": it["accuracy"]
-        })
+    import openpyxl
+    wb = openpyxl.Workbook()
+    default_sheet = wb.active
 
-    forecast_data = []
-    for it in items:
-        row = {
-            "Item Code": sanitize_excel_cell(it["code"]),
-            "Description": sanitize_excel_cell(it["description"]),
-            "Category": sanitize_excel_cell(it["category"]),
-            "Location": sanitize_excel_cell(it["location"])
-        }
-        for p in it.get("periods", []):
-            label = sanitize_excel_cell(p["date"])
-            val = p.get("override") if p.get("override") is not None else (p.get("forecast") if p.get("actual") == 0 else p.get("actual"))
-            row[label] = sanitize_excel_cell(val)
-        forecast_data.append(row)
+    if export_type in ("all", "replenishment"):
+        inv_headers = [
+            "Item Code", "Description", "Category", "Location", "Supplier",
+            "Sales Price", "Purchase Price", "On Hand", "On Order", "Lead Time (Days)",
+            "Safety Stock", "Reorder Point", "Order Now", "Order Value", "Days of Supply",
+            "ABC Class", "XYZ Class", "Forecast Model", "Replenishment Strategy", "Forecast Accuracy (%)"
+        ]
+        ws_inv = wb.create_sheet(title="Inventory Replenishment")
+        ws_inv.append(inv_headers)
+        for it in items:
+            ws_inv.append([
+                sanitize_excel_cell(it["code"]),
+                sanitize_excel_cell(it["description"]),
+                sanitize_excel_cell(it["category"]),
+                sanitize_excel_cell(it["location"]),
+                sanitize_excel_cell(it["supplier"]),
+                sanitize_excel_cell(it["salesPrice"]),
+                sanitize_excel_cell(it["purchasePrice"]),
+                sanitize_excel_cell(it["onHand"]),
+                sanitize_excel_cell(it["onOrder"]),
+                sanitize_excel_cell(it["leadTimeDays"]),
+                sanitize_excel_cell(it["safetyStock"]),
+                sanitize_excel_cell(it["reorderPoint"]),
+                sanitize_excel_cell(it["orderNow"]),
+                sanitize_excel_cell(it["orderNowValue"]),
+                sanitize_excel_cell(it["daysOfSupply"]),
+                sanitize_excel_cell(it["abcClass"]),
+                sanitize_excel_cell(it["xyzClass"]),
+                sanitize_excel_cell(it["modelType"]),
+                sanitize_excel_cell(it["replenishmentStrategy"]),
+                sanitize_excel_cell(it["accuracy"]),
+            ])
+        _style_openpyxl_sheet(ws_inv, is_arabic=False, header_row=1, freeze_pane="A2", enable_autofilter=True)
 
-    orders_data = []
-    for it in items:
-        if it["orderNow"] > 0:
-            orders_data.append({
-                "Order No": sanitize_excel_cell(f"PO-PLAN-{it['code']}"),
+    if export_type in ("all", "forecast"):
+        forecast_data = []
+        fc_headers = ["Item Code", "Description", "Category", "Location"]
+        fc_seen = set(fc_headers)
+        for it in items:
+            row = {
                 "Item Code": sanitize_excel_cell(it["code"]),
                 "Description": sanitize_excel_cell(it["description"]),
-                "Supplier": sanitize_excel_cell(it["supplier"]),
-                "Destination": sanitize_excel_cell(it["location"]),
-                "Order Qty": it["orderNow"],
-                "Unit Cost": it["purchasePrice"],
-                "Total Value": it["orderNowValue"],
-                "Reorder Point": it["reorderPoint"],
-                "Current On Hand": it["onHand"],
-                "Status": "Planned Draft"
-            })
+                "Category": sanitize_excel_cell(it["category"]),
+                "Location": sanitize_excel_cell(it["location"]),
+            }
+            for p in it.get("periods", []):
+                label = sanitize_excel_cell(str(p["date"]))
+                if label not in fc_seen:
+                    fc_seen.add(label)
+                    fc_headers.append(label)
+                val = p.get("override") if p.get("override") is not None else (p.get("forecast") if p.get("actual") == 0 else p.get("actual"))
+                row[label] = sanitize_excel_cell(val)
+            forecast_data.append(row)
+
+        ws_fc = wb.create_sheet(title="Demand Forecast")
+        ws_fc.append([sanitize_excel_cell(h) for h in fc_headers])
+        for row in forecast_data:
+            ws_fc.append([row.get(h, "") for h in fc_headers])
+        _style_openpyxl_sheet(ws_fc, is_arabic=False, header_row=1, freeze_pane="A2", enable_autofilter=True)
+
+    if export_type in ("all", "orders"):
+        order_headers = [
+            "Order No", "Item Code", "Description", "Supplier", "Destination",
+            "Order Qty", "Unit Cost", "Total Value", "Reorder Point", "Current On Hand", "Status"
+        ]
+        ws_ord = wb.create_sheet(title="Planned Orders")
+        ws_ord.append(order_headers)
+        ord_count = 0
+        for it in items:
+            if it["orderNow"] > 0:
+                ord_count += 1
+                ws_ord.append([
+                    sanitize_excel_cell(f"PO-PLAN-{it['code']}"),
+                    sanitize_excel_cell(it["code"]),
+                    sanitize_excel_cell(it["description"]),
+                    sanitize_excel_cell(it["supplier"]),
+                    sanitize_excel_cell(it["location"]),
+                    sanitize_excel_cell(it["orderNow"]),
+                    sanitize_excel_cell(it["purchasePrice"]),
+                    sanitize_excel_cell(it["orderNowValue"]),
+                    sanitize_excel_cell(it["reorderPoint"]),
+                    sanitize_excel_cell(it["onHand"]),
+                    "Planned Draft",
+                ])
+        if ord_count == 0:
+            ws_ord.append(["-", "-", "No planned orders at this time", "-", "-", 0, 0.0, 0.0, 0, 0, "Empty"])
+        _style_openpyxl_sheet(ws_ord, is_arabic=False, header_row=1, freeze_pane="A2", enable_autofilter=True)
+
+    if default_sheet and default_sheet in wb.worksheets and len(wb.worksheets) > 1:
+        wb.remove(default_sheet)
 
     output = io.BytesIO()
-    with pd.ExcelWriter(output, engine="openpyxl") as writer:
-        if export_type in ("all", "replenishment"):
-            pd.DataFrame(inv_data).to_excel(writer, sheet_name="Inventory Replenishment", index=False)
-        if export_type in ("all", "forecast"):
-            pd.DataFrame(forecast_data).to_excel(writer, sheet_name="Demand Forecast", index=False)
-        if export_type in ("all", "orders") and orders_data:
-            pd.DataFrame(orders_data).to_excel(writer, sheet_name="Planned Orders", index=False)
-
+    wb.save(output)
     output.seek(0)
     has_loc = bool(location and location.strip() and location.strip().upper() != "ALL")
     loc_clean = re.sub(r'[\r\n"\\/*?:]', '_', location.strip()) if has_loc else ""
@@ -4836,6 +5061,57 @@ def export_project_to_excel(
     location: Optional[str] = Query(None)
 ):
     return _generate_excel_export(project_id, export_type or "all", location=location)
+
+class SaveDesktopFileRequest(BaseModel):
+    filename: str
+    content_base64: str
+
+@app.post("/api/files/save-desktop")
+def save_desktop_file_endpoint(req: SaveDesktopFileRequest):
+    """
+    Authenticated fallback for desktop WebView2 / browser environments when
+    pywebview native file dialog is unavailable or fails. Writes validated
+    export bytes (.xlsx/.json/.csv) safely into the user's Downloads folder.
+    """
+    import base64
+
+    raw_name = os.path.basename((req.filename or "NEXO_Export.xlsx").strip())
+    clean_name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', '_', raw_name).strip(" .") or "NEXO_Export.xlsx"
+    stem, ext = os.path.splitext(clean_name)
+    ext_lower = ext.lower()
+    if ext_lower not in (".xlsx", ".json", ".csv"):
+        ext_lower = ".xlsx"
+        clean_name = f"{clean_name}.xlsx"
+        stem = clean_name[:-5]
+
+    try:
+        payload = base64.b64decode(req.content_base64, validate=True)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid base64 export payload.")
+
+    if len(payload) > 120 * 1024 * 1024:
+        raise HTTPException(status_code=413, detail="Export payload exceeds maximum supported size.")
+
+    downloads_dir = os.path.join(os.path.expanduser("~"), "Downloads")
+    if not os.path.isdir(downloads_dir):
+        downloads_dir = os.path.expanduser("~")
+    os.makedirs(downloads_dir, exist_ok=True)
+
+    target_path = os.path.join(downloads_dir, f"{stem}{ext_lower}")
+    counter = 1
+    while os.path.exists(target_path) and counter < 1000:
+        target_path = os.path.join(downloads_dir, f"{stem} ({counter}){ext_lower}")
+        counter += 1
+
+    with open(target_path, "wb") as f:
+        f.write(payload)
+
+    return {
+        "saved": True,
+        "path": target_path,
+        "filename": os.path.basename(target_path),
+        "bytes": len(payload),
+    }
 
 # ===============================================================================
 # Workstreams 4, 5, 6, 7: Dedicated Full-DB Analytics & Full-Dataset Export Endpoints
@@ -4884,120 +5160,15 @@ def get_project_purchase_orders(
     with _LOCK:
         con = get_connection()
         try:
-            max_d_row = con.execute("SELECT MAX(sale_date) FROM daily_sales WHERE project_id = ? AND sale_date IS NOT NULL AND sale_date != ''", (pid,)).fetchone()
-            max_d = max_d_row[0] if max_d_row and max_d_row[0] else None
-
-            cov = float(coverage_days or 14)
-            vel = float(velocity_days or 60)
-
-            if max_d:
-                con.execute("""
-                    CREATE OR REPLACE TEMP TABLE tmp_po_velocity AS
-                    SELECT 
-                        ds.item_code,
-                        ds.location,
-                        SUM(ds.qty_sold) / ? as daily_demand
-                    FROM daily_sales ds
-                    WHERE ds.project_id = ?
-                      AND ds.sale_date IS NOT NULL
-                      AND TRY_CAST(ds.sale_date AS DATE) >= (TRY_CAST(? AS DATE) - CAST(? || ' days' AS INTERVAL))
-                    GROUP BY ds.item_code, ds.location;
-                """, (vel, pid, max_d, vel))
-            else:
-                con.execute("""
-                    CREATE OR REPLACE TEMP TABLE tmp_po_velocity AS
-                    SELECT 
-                        i.code as item_code,
-                        i.location,
-                        COALESCE(i.mean_daily_demand, 0.0) as daily_demand
-                    FROM items i
-                    WHERE i.project_id = ?;
-                """, (pid,))
-
-            norm_loc_v = "regexp_replace(replace(regexp_replace(regexp_replace(TRIM(COALESCE(v.location, 'Main Warehouse')), '[\u200b\u200c\u200d\ufeffـ]', '', 'g'), '[أإآٱ]', 'ا', 'g'), 'ى', 'ي'), '\\\\s+', ' ', 'g')"
-            norm_loc_i = "regexp_replace(replace(regexp_replace(regexp_replace(TRIM(COALESCE(i.location, 'Main Warehouse')), '[\u200b\u200c\u200d\ufeffـ]', '', 'g'), '[أإآٱ]', 'ا', 'g'), 'ى', 'ي'), '\\\\s+', ' ', 'g')"
-
-            where_clauses = [
-                "i.project_id = ?",
-                "i.code NOT IN ('نص (Text)', 'رقم (>= 0)', 'نوع البيانات', 'تاريخ يومي / شهري', 'Example', 'Data Type', 'نص', 'رقم')"
-            ]
-            params = [cov, pid]
-
-            if location and location.upper() != "ALL":
-                norm_target_loc = normalize_arabic_text(location)
-                where_clauses.append(f"({norm_loc_i} = ?)")
-                params.append(norm_target_loc)
-
-            if search:
-                s_param = f"%{search.strip().lower()}%"
-                where_clauses.append("(LOWER(i.code) LIKE ? OR LOWER(i.description) LIKE ? OR LOWER(i.supplier) LIKE ?)")
-                params.extend([s_param, s_param, s_param])
-
-            con.execute(f"""
-                CREATE OR REPLACE TEMP TABLE tmp_all_po_candidates AS
-                SELECT 
-                    i.id,
-                    i.code,
-                    i.description,
-                    COALESCE(i.category, 'General') as category,
-                    COALESCE(i.location, 'Main Warehouse') as location,
-                    COALESCE(NULLIF(TRIM(i.supplier), ''), 'Primary Supplier') as supplier,
-                    GREATEST(0.0, COALESCE(i.on_hand, 0.0)) as on_hand,
-                    COALESCE(i.on_order, 0.0) as on_order,
-                    COALESCE(i.backorders, 0.0) as backorders,
-                    COALESCE(i.purchase_price, 50.0) as purchase_price,
-                    COALESCE(i.sales_price, 100.0) as sales_price,
-                    GREATEST(1.0, COALESCE(i.lead_time_days, 3.0)) as lead_time_days,
-                    LEAST(COALESCE(i.lead_time_variance_days, 1.0), GREATEST(1.0, COALESCE(i.lead_time_days, 3.0))) as lead_time_var,
-                    COALESCE(v.daily_demand, 0.0) as avg_daily_demand,
-                    ROUND((CASE WHEN i.service_level >= 0.98 THEN 2.054 WHEN i.service_level >= 0.95 THEN 1.645 ELSE 1.282 END) * 
-                      SQRT(GREATEST(1.0, i.lead_time_days) * POWER(COALESCE(v.daily_demand, 0.0) * 0.3, 2) + POWER(COALESCE(v.daily_demand, 0.0), 2) * POWER(LEAST(COALESCE(i.lead_time_variance_days, 1.0), GREATEST(1.0, i.lead_time_days)), 2))
-                    ) as safety_stock,
-                    ROUND(COALESCE(v.daily_demand, 0.0) * (GREATEST(1.0, COALESCE(i.lead_time_days, 3.0)) + ?) + 
-                      ROUND((CASE WHEN i.service_level >= 0.98 THEN 2.054 WHEN i.service_level >= 0.95 THEN 1.645 ELSE 1.282 END) * 
-                        SQRT(GREATEST(1.0, i.lead_time_days) * POWER(COALESCE(v.daily_demand, 0.0) * 0.3, 2) + POWER(COALESCE(v.daily_demand, 0.0), 2) * POWER(LEAST(COALESCE(i.lead_time_variance_days, 1.0), GREATEST(1.0, i.lead_time_days)), 2))
-                      )
-                    ) as target_stock,
-                    GREATEST(0.0, COALESCE(i.on_hand, 0.0)) + COALESCE(i.on_order, 0.0) - COALESCE(i.backorders, 0.0) as inv_position,
-                    COALESCE(i.min_batch, 1.0) as min_batch,
-                    COALESCE(i.batch_rounding, 1.0) as batch_rounding
-                FROM items i
-                LEFT JOIN tmp_po_velocity v
-                  ON v.item_code = i.code
-                 AND ({norm_loc_v} = {norm_loc_i} OR (v.location IS NULL AND i.location IS NULL))
-                WHERE {' AND '.join(where_clauses)};
-            """, params)
-
-            con.execute("""
-                CREATE OR REPLACE TEMP TABLE tmp_po_computed AS
-                SELECT 
-                    id, code, description, category, location, supplier,
-                    on_hand, on_order, backorders, purchase_price, sales_price,
-                    lead_time_days, avg_daily_demand, safety_stock, target_stock,
-                    CASE WHEN avg_daily_demand > 0 THEN ROUND(on_hand / avg_daily_demand) ELSE 999.0 END as days_of_supply,
-                    CASE 
-                        WHEN avg_daily_demand > 0.0 AND (target_stock - inv_position) >= 0.5 THEN
-                            GREATEST(
-                                min_batch,
-                                CEIL((target_stock - inv_position) / GREATEST(1.0, batch_rounding)) * GREATEST(1.0, batch_rounding)
-                            )
-                        ELSE 0.0
-                    END as order_now,
-                    CASE 
-                        WHEN (supplier = 'Primary Supplier' OR category = 'General') THEN TRUE 
-                        ELSE FALSE 
-                    END as is_unmatched
-                FROM tmp_all_po_candidates;
-            """)
-
-            unmatched_cnt_row = con.execute("SELECT COUNT(*) FROM tmp_po_computed WHERE order_now > 0 AND is_unmatched = TRUE").fetchone()
-            unmatched_count = unmatched_cnt_row[0] if unmatched_cnt_row else 0
-
-            unmatch_filter = "AND is_unmatched = FALSE" if exclude_unmatched else ""
-            con.execute(f"""
-                CREATE OR REPLACE TEMP TABLE tmp_po_active AS
-                SELECT * FROM tmp_po_computed WHERE order_now > 0 {unmatch_filter};
-            """)
+            unmatched_count = _prepare_po_active_tables(
+                con,
+                pid,
+                location=location,
+                search=search,
+                coverage_days=coverage_days,
+                velocity_days=velocity_days,
+                exclude_unmatched=exclude_unmatched,
+            )
 
             kpis_row = con.execute("""
                 SELECT 
@@ -5069,11 +5240,6 @@ def get_project_purchase_orders(
                     "items": items_list
                 })
 
-            con.execute("DROP TABLE IF EXISTS tmp_po_velocity;")
-            con.execute("DROP TABLE IF EXISTS tmp_all_po_candidates;")
-            con.execute("DROP TABLE IF EXISTS tmp_po_computed;")
-            con.execute("DROP TABLE IF EXISTS tmp_po_active;")
-
             return {
                 "kpis": {
                     "total_pos": total_pos,
@@ -5088,7 +5254,10 @@ def get_project_purchase_orders(
                 "page_size": page_size
             }
         finally:
-            con.close()
+            try:
+                _drop_po_temp_tables(con)
+            finally:
+                con.close()
 
 @app.get("/api/projects/{project_id}/drp")
 def get_project_drp(
@@ -5486,9 +5655,21 @@ def get_project_tree_summary(
 def export_project_po_excel(
     project_id: str,
     language: Optional[str] = Query("ar"),
-    location: Optional[str] = Query(None)
+    location: Optional[str] = Query(None),
+    search: Optional[str] = Query(None),
+    coverage_days: int = Query(14),
+    velocity_days: int = Query(60),
+    exclude_unmatched: bool = Query(True),
 ):
-    return export_orders_endpoint(project_id=project_id, language=language, location=location)
+    return export_orders_endpoint(
+        project_id=project_id,
+        language=language,
+        location=location,
+        search=search,
+        coverage_days=coverage_days,
+        velocity_days=velocity_days,
+        exclude_unmatched=exclude_unmatched,
+    )
 
 @app.post("/api/projects/{project_id}/export/drp")
 def export_project_drp_excel(

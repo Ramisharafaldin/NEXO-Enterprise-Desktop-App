@@ -208,38 +208,53 @@ class DesktopApi:
     def save_file_dialog(self, filename: str, base64_content: str):
         """
         Opens a native Windows Save As dialog and saves binary payload directly to disk.
-        Returns the absolute filepath if saved, or None if canceled.
+        Returns a structured dict:
+          {"status": "saved", "path": filepath, "filename": basename}
+          {"status": "cancelled"}
+          {"status": "error", "error": message}
         """
         if not self._window:
-            return None
-        
-        file_types = (
-            'Excel Workbook (*.xlsx)',
-        )
-        
+            return {"status": "error", "error": "Desktop window is not initialized"}
+
+        safe_name = os.path.basename((filename or "NEXO_Export.xlsx").strip()) or "NEXO_Export.xlsx"
+        ext = os.path.splitext(safe_name)[1].lower() or ".xlsx"
+        if ext == ".json":
+            file_types = ('JSON Files (*.json)', 'All files (*.*)')
+        elif ext == ".csv":
+            file_types = ('CSV Files (*.csv)', 'All files (*.*)')
+        else:
+            ext = ".xlsx"
+            if not safe_name.lower().endswith(".xlsx"):
+                safe_name += ".xlsx"
+            file_types = ('Excel Workbook (*.xlsx)', 'All files (*.*)')
+
         dialog_type = getattr(webview, "FileDialog", None)
         save_mode = dialog_type.SAVE if dialog_type else 30
 
         try:
             result = self._window.create_file_dialog(
                 dialog_type=save_mode,
-                save_filename=filename,
+                save_filename=safe_name,
                 file_types=file_types
             )
-            
+
             if result:
                 filepath = result[0] if isinstance(result, (list, tuple)) else str(result)
-                if not filepath.lower().endswith(".xlsx"):
-                    filepath += ".xlsx"
+                if not filepath.lower().endswith(ext):
+                    filepath += ext
                 data = base64.b64decode(base64_content)
                 with open(filepath, "wb") as f:
                     f.write(data)
                 logger.info(f"File successfully exported via native dialog: {filepath}")
-                return filepath
+                return {
+                    "status": "saved",
+                    "path": filepath,
+                    "filename": os.path.basename(filepath),
+                }
+            return {"status": "cancelled"}
         except Exception as e:
             logger.exception(f"Error in save_file_dialog: {e}")
-            return None
-        return None
+            return {"status": "error", "error": str(e)}
 
 def restart_desktop_process():
     """

@@ -4,6 +4,7 @@ import { translations, Language } from '../i18n/translations';
 import { formatItemCode } from '../utils/formatters';
 import { X, Network, ArrowRightLeft, Building2, Store, CheckCircle2, FileSpreadsheet, Loader2, Search, Filter } from 'lucide-react';
 import { exportDrpReport } from '../utils/excelExport';
+import { formatExportSuccessToast } from '../utils/exportDownload';
 import { api, DrpResponse, DrpRecommendation } from '../api/client';
 
 interface DrpModalProps {
@@ -35,6 +36,7 @@ export const DrpModal: React.FC<DrpModalProps> = ({
   const [sourceFilter, setSourceFilter] = useState<string>('');
   const [destFilter, setDestFilter] = useState<string>('');
   const [isExporting, setIsExporting] = useState<boolean>(false);
+  const [exportFeedback, setExportFeedback] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
 
   // Client-side fallback topology
   const activeItems = useMemo(() => (items || []).filter(isAnalyzableItem), [items]);
@@ -130,13 +132,16 @@ export const DrpModal: React.FC<DrpModalProps> = ({
 
   const handleExportExcel = async () => {
     setIsExporting(true);
+    setExportFeedback(null);
     try {
+      let res;
       if (projectId) {
         let exportUrl = `/api/projects/${projectId}/export/drp?language=${language}`;
+        if (location && location !== 'ALL') exportUrl += `&location=${encodeURIComponent(location)}`;
         if (search.trim()) exportUrl += `&search=${encodeURIComponent(search.trim())}`;
-        await api.downloadReportExport(exportUrl, 'DRP_Transfers_Report.xlsx');
+        res = await api.downloadReportExport(exportUrl, 'DRP_Transfers_Report.xlsx');
       } else {
-        await exportDrpReport({
+        res = await exportDrpReport({
           items: activeItems,
           transferRecommendations: recommendations.map((r, i) => ({
             id: `${r.code}-${i}`,
@@ -153,8 +158,17 @@ export const DrpModal: React.FC<DrpModalProps> = ({
           language,
         });
       }
-    } catch (err) {
+      const msg = formatExportSuccessToast(res, isAr);
+      if (msg) {
+        setExportFeedback({ type: 'success', text: msg });
+        setTimeout(() => setExportFeedback(null), 6000);
+      }
+    } catch (err: any) {
       console.error('Failed to export DRP report:', err);
+      setExportFeedback({
+        type: 'error',
+        text: (isAr ? 'فشل تصدير تقرير DRP: ' : 'DRP export failed: ') + (err?.message || 'Unknown error'),
+      });
     } finally {
       setIsExporting(false);
     }
@@ -343,6 +357,17 @@ export const DrpModal: React.FC<DrpModalProps> = ({
             </div>
           </div>
         </div>
+
+        {/* Export Feedback Banner */}
+        {exportFeedback && (
+          <div className={`px-4 py-2 text-xs font-semibold border-t ${
+            exportFeedback.type === 'success'
+              ? 'bg-emerald-50 text-emerald-800 border-emerald-200'
+              : 'bg-rose-50 text-rose-800 border-rose-200'
+          }`}>
+            {exportFeedback.text}
+          </div>
+        )}
 
         {/* Footer */}
         <div className="p-3 bg-[#ECEFF1] border-t border-[#CBD5E1] flex items-center justify-between">

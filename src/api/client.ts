@@ -4,7 +4,8 @@
  */
 
 import { InventoryItem, DashboardKpis, ModelType, ReplenishmentStrategy, AppSettings } from '../engine/types';
-export type { AppSettings, DashboardKpis };
+import { fetchAndSaveExport, SaveExportResult } from '../utils/exportDownload';
+export type { AppSettings, DashboardKpis, SaveExportResult };
 
 const getApiBase = (): string => {
   if (typeof window !== 'undefined' && window.location.origin.startsWith('http')) {
@@ -799,15 +800,15 @@ export const api = {
 
   /**
    * Native Desktop / Browser Excel Export
-   * If pywebview desktop window is active, triggers a native Windows SaveFileDialog.
-   * Otherwise triggers standard browser file download.
+   * Triggers native Windows SaveFileDialog in PyWebView, authenticated Downloads save
+   * in WebView2 fallback, or standard browser Blob download.
    */
   async downloadExcelExport(
     projectId: string,
     exportType: string = 'all',
     defaultFilename?: string,
     location?: string
-  ): Promise<boolean> {
+  ): Promise<SaveExportResult> {
     const hasLoc = Boolean(location && location !== 'ALL');
     const locTag = hasLoc ? `_${location!.trim()}` : '';
     const filename = defaultFilename || (
@@ -818,39 +819,10 @@ export const api = {
     const locQuery = hasLoc ? `&location=${encodeURIComponent(location!)}` : '';
     const exportUrl = `${API_BASE}/files/export/${projectId}?export_type=${exportType}${locQuery}`;
 
-    // 1. Check if running inside native pywebview desktop window
-    const pyApi = (window as any).pywebview?.api;
-    if (pyApi && typeof pyApi.save_file_dialog === 'function') {
-      try {
-        const res = await fetch(exportUrl);
-        const blob = await res.blob();
-        return new Promise((resolve) => {
-          const reader = new FileReader();
-          reader.onloadend = async () => {
-            try {
-              const base64data = (reader.result as string).split(',')[1];
-              const savedPath = await pyApi.save_file_dialog(filename, base64data);
-              resolve(!!savedPath);
-            } catch (dialogErr) {
-              console.warn('save_file_dialog bridge error:', dialogErr);
-              resolve(false);
-            }
-          };
-          reader.readAsDataURL(blob);
-        });
-      } catch (err) {
-        console.warn('Native desktop save dialog encountered error, falling back to browser download:', err);
-      }
-    }
-
-    // 2. Standard browser fallback
-    const link = document.createElement('a');
-    link.href = exportUrl;
-    link.setAttribute('download', filename);
-    document.body.appendChild(link);
-    link.click();
-    link.remove();
-    return true;
+    return fetchAndSaveExport(exportUrl, {
+      method: 'GET',
+      fallbackFilename: filename,
+    });
   },
 
   /**
@@ -860,7 +832,7 @@ export const api = {
     templateType: 'sales' | 'inventory' | 'in-transit',
     defaultFilename?: string,
     language: 'ar' | 'en' = 'en'
-  ): Promise<boolean> {
+  ): Promise<SaveExportResult> {
     const isAr = language === 'ar';
     const filename = defaultFilename || (
       templateType === 'sales' ? `NEXO_Sales_Template_${isAr ? 'AR' : 'EN'}.xlsx` :
@@ -869,37 +841,10 @@ export const api = {
     );
     const templateUrl = `${API_BASE}/templates/${templateType}?lang=${language}`;
 
-    const pyApi = (window as any).pywebview?.api;
-    if (pyApi && typeof pyApi.save_file_dialog === 'function') {
-      try {
-        const res = await fetch(templateUrl);
-        const blob = await res.blob();
-        return new Promise((resolve) => {
-          const reader = new FileReader();
-          reader.onloadend = async () => {
-            try {
-              const base64data = (reader.result as string).split(',')[1];
-              const savedPath = await pyApi.save_file_dialog(filename, base64data);
-              resolve(!!savedPath);
-            } catch (dialogErr) {
-              console.warn('save_file_dialog error:', dialogErr);
-              resolve(false);
-            }
-          };
-          reader.readAsDataURL(blob);
-        });
-      } catch (err) {
-        console.warn('Native desktop save dialog encountered error, falling back:', err);
-      }
-    }
-
-    const link = document.createElement('a');
-    link.href = templateUrl;
-    link.setAttribute('download', filename);
-    document.body.appendChild(link);
-    link.click();
-    link.remove();
-    return true;
+    return fetchAndSaveExport(templateUrl, {
+      method: 'GET',
+      fallbackFilename: filename,
+    });
   },
 
   async importTypedFile(
@@ -1243,18 +1188,14 @@ export const api = {
   /**
    * Workstream 7: Full-Dataset Dedicated Openpyxl Export Downloads
    */
-  async downloadReportExport(url: string, filename: string): Promise<void> {
-    const res = await fetch(url, { method: 'POST' });
-    if (!res.ok) throw new Error(`Export download failed: ${res.statusText}`);
-    const blob = await res.blob();
-    const downloadUrl = window.URL.createObjectURL(blob);
-    const link = document.createElement('a');
-    link.href = downloadUrl;
-    link.setAttribute('download', filename);
-    document.body.appendChild(link);
-    link.click();
-    link.remove();
-    window.URL.revokeObjectURL(downloadUrl);
+  async downloadReportExport(url: string, filename: string): Promise<SaveExportResult> {
+    const resolvedUrl = url.startsWith('/api/')
+      ? `${API_BASE}${url.slice(4)}`
+      : url;
+    return fetchAndSaveExport(resolvedUrl, {
+      method: 'POST',
+      fallbackFilename: filename,
+    });
   },
 
   uploadFileWithProgress,

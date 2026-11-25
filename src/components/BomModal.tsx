@@ -4,6 +4,7 @@ import { translations, Language } from '../i18n/translations';
 import { formatItemCode } from '../utils/formatters';
 import { X, Layers, AlertCircle, CheckCircle2, ChevronRight, Cog, ArrowRight, FileSpreadsheet, Loader2, Search } from 'lucide-react';
 import { exportMrpReport } from '../utils/excelExport';
+import { formatExportSuccessToast } from '../utils/exportDownload';
 import { api } from '../api/client';
 
 interface BomModalProps {
@@ -54,6 +55,7 @@ export const BomModal: React.FC<BomModalProps> = ({
   const [mrpData, setMrpData] = useState<any>(null);
   const [isLoadingMrp, setIsLoadingMrp] = useState<boolean>(false);
   const [isExporting, setIsExporting] = useState<boolean>(false);
+  const [exportFeedback, setExportFeedback] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
 
   // Search MRP parents from DuckDB
   useEffect(() => {
@@ -126,20 +128,33 @@ export const BomModal: React.FC<BomModalProps> = ({
 
   const handleExportExcel = async () => {
     setIsExporting(true);
+    setExportFeedback(null);
     try {
+      let res;
       if (projectId && selectedParentSku) {
         const exportUrl = `/api/projects/${projectId}/export/mrp?language=${language}&parent_sku=${encodeURIComponent(selectedParentSku)}&production_qty=${productionPlanQty}&lead_time_days=${leadTimeDays}`;
-        await api.downloadReportExport(exportUrl, 'MRP_Explosion_Report.xlsx');
+        res = await api.downloadReportExport(exportUrl, 'MRP_Explosion_Report.xlsx');
       } else if (selectedParent) {
-        await exportMrpReport({
+        res = await exportMrpReport({
           selectedParent,
           productionPlanQty,
           components: clientComponents,
           language,
         });
       }
-    } catch (err) {
+      if (res) {
+        const msg = formatExportSuccessToast(res, isAr);
+        if (msg) {
+          setExportFeedback({ type: 'success', text: msg });
+          setTimeout(() => setExportFeedback(null), 6000);
+        }
+      }
+    } catch (err: any) {
       console.error('Failed to export MRP report:', err);
+      setExportFeedback({
+        type: 'error',
+        text: (isAr ? 'فشل تصدير شجرة المواد MRP: ' : 'MRP export failed: ') + (err?.message || 'Unknown error'),
+      });
     } finally {
       setIsExporting(false);
     }
@@ -372,6 +387,17 @@ export const BomModal: React.FC<BomModalProps> = ({
             </div>
           </div>
         </div>
+
+        {/* Export Feedback Banner */}
+        {exportFeedback && (
+          <div className={`px-4 py-2 text-xs font-semibold border-t ${
+            exportFeedback.type === 'success'
+              ? 'bg-emerald-50 text-emerald-800 border-emerald-200'
+              : 'bg-rose-50 text-rose-800 border-rose-200'
+          }`}>
+            {exportFeedback.text}
+          </div>
+        )}
 
         {/* Footer */}
         <div className="p-3 bg-[#ECEFF1] border-t border-[#CBD5E1] flex items-center justify-between">

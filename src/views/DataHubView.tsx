@@ -23,6 +23,7 @@ import {
 } from 'lucide-react';
 import { translations, Language } from '../i18n/translations';
 import { api, IngestionLog, ErpConnection, SqlServerTestResult, UploadProgressInfo } from '../api/client';
+import { formatExportSuccessToast } from '../utils/exportDownload';
 
 interface DataHubViewProps {
   projectId: string;
@@ -162,9 +163,10 @@ export const DataHubView: React.FC<DataHubViewProps> = ({
   const handleDownloadTemplate = async (templateType: 'sales' | 'inventory' | 'in-transit') => {
     setDownloadingTemplate(templateType);
     try {
-      const ok = await api.downloadTemplate(templateType, undefined, language);
-      if (ok) {
-        showNotification('success', isAr ? 'تم حفظ النموذج القياسي بنجاح على جهازك!' : 'Standard template downloaded successfully!');
+      const result = await api.downloadTemplate(templateType, undefined, language);
+      const toastText = formatExportSuccessToast(result, isAr);
+      if (toastText) {
+        showNotification('success', toastText);
       }
     } catch (err: any) {
       showNotification('error', err.message || 'Failed to download template');
