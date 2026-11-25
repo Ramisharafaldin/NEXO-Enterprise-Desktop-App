@@ -185,6 +185,14 @@ export const DemandView: React.FC<DemandViewProps> = ({
   useEffect(() => {
     rawSelectedItemRef.current = rawSelectedItem;
   }, [rawSelectedItem]);
+  const onSelectItemRef = useRef(onSelectItem);
+  useEffect(() => {
+    onSelectItemRef.current = onSelectItem;
+  }, [onSelectItem]);
+  const recalculateItemRef = useRef(recalculateItem);
+  useEffect(() => {
+    recalculateItemRef.current = recalculateItem;
+  }, [recalculateItem]);
 
   const showToast = useCallback((msg: string) => {
     if (toastTimeoutRef.current) clearTimeout(toastTimeoutRef.current);
@@ -448,9 +456,11 @@ export const DemandView: React.FC<DemandViewProps> = ({
       }
 
       const dateBounds = { minActualDate: effectiveMinDate, maxActualDate: effectiveMaxDate };
+      const recalcFn = recalculateItemRef.current;
+      const selectItemFn = onSelectItemRef.current;
       const hydrated = (res.items || []).map(i => {
-        if (recalculateItem && shouldAutoRecalculateItem(i)) {
-          return recalculateItem(i, undefined, undefined, effectiveHorizon, effectiveSeasonality, dateBounds);
+        if (recalcFn && shouldAutoRecalculateItem(i)) {
+          return recalcFn(i, undefined, undefined, effectiveHorizon, effectiveSeasonality, dateBounds);
         }
         return i;
       });
@@ -458,15 +468,15 @@ export const DemandView: React.FC<DemandViewProps> = ({
       setTotalCount(res.total_count ?? hydrated.length);
       setTotalPages(res.total_pages ?? Math.max(1, Math.ceil((res.total_count || 1) / pageSize)));
       const currentSelected = rawSelectedItemRef.current;
-      if (hydrated.length > 0 && !currentSelected) {
-        onSelectItem(hydrated[0]);
-      } else if (currentSelected && recalculateItem) {
-        const found = hydrated.find(x => x.id === currentSelected.id);
+      if (hydrated.length > 0) {
+        const found = currentSelected ? hydrated.find(x => x.id === currentSelected.id) : undefined;
         if (found) {
-          onSelectItem(shouldAutoRecalculateItem(found)
-            ? recalculateItem(found, undefined, undefined, effectiveHorizon, effectiveSeasonality, dateBounds)
+          selectItemFn(recalcFn && shouldAutoRecalculateItem(found)
+            ? recalcFn(found, undefined, undefined, effectiveHorizon, effectiveSeasonality, dateBounds)
             : found
           );
+        } else if (!currentSelected || debouncedSearch.trim().length > 0 || Boolean(selectedCategory)) {
+          selectItemFn(hydrated[0]);
         }
       }
     } catch (err) {
@@ -474,7 +484,7 @@ export const DemandView: React.FC<DemandViewProps> = ({
     } finally {
       setIsLoadingList(false);
     }
-  }, [projectId, page, pageSize, debouncedSearch, selectedCategory, onSelectItem, selectedLocation, recalculateItem, onProjectDefaultsLoaded, approvalHorizon, seasonalityPattern, projectDefaults.minActualDate, projectDefaults.maxActualDate, onApprovalHorizonChange, settings?.forecast_horizon_periods]);
+  }, [projectId, page, pageSize, debouncedSearch, selectedCategory, selectedLocation, onProjectDefaultsLoaded, approvalHorizon, seasonalityPattern, projectDefaults.minActualDate, projectDefaults.maxActualDate, onApprovalHorizonChange, settings?.forecast_horizon_periods]);
 
   useEffect(() => {
     fetchDemandPage();

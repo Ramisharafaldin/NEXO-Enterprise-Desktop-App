@@ -244,6 +244,18 @@ export const App: React.FC = () => {
     });
   }, []);
 
+  const handleSelectItem = useCallback((item: InventoryItem) => {
+    setSelectedItemId(item.id);
+    setItems(prev => {
+      const idx = prev.findIndex(x => x.id === item.id);
+      if (idx === -1) return [...prev, item];
+      if (prev[idx] === item) return prev;
+      const next = [...prev];
+      next[idx] = item;
+      return next;
+    });
+  }, []);
+
   const selectedItem = items.find(i => i.id === selectedItemId) || items[0];
 
   // Recalculate item forecast and replenishment using the verified math engine
@@ -868,7 +880,7 @@ export const App: React.FC = () => {
                 items={items}
                 projectId={activeProjectId}
                 selectedItem={selectedItem}
-                onSelectItem={i => setSelectedItemId(i.id)}
+                onSelectItem={handleSelectItem}
                 onModelChange={handleModelChange}
                 onOverrideChange={handleOverrideChange}
                 onExplainCalculation={i => setExplainingItem(i)}
