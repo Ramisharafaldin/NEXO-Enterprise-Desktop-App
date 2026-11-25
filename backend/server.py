@@ -120,7 +120,7 @@ def get_app_version() -> str:
                     return val.lstrip("v")
         except Exception:
             pass
-    return "0.1.19"
+    return "0.1.20"
 
 APP_VERSION = get_app_version()
 

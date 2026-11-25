@@ -5,7 +5,7 @@ Synchronizes the application release version consistently across all core locati
   1. VERSION
   2. package.json
   3. backend/server.py (fallback return in get_app_version())
-  4. README.md (top release badge & Core Capabilities HTML marker comments)
+  4. README.md (top release badge & Current Release Version bullet)
 
 Usage:
   python scripts/bump_version.py 0.1.14
@@ -98,7 +98,7 @@ def update_readme_md(new_ver: str):
     """
     Updates README.md:
       - Top release badge: [![Release](https://img.shields.io/badge/Release-v0.1.13-2196F3?style=flat-square)]()
-      - Core Capabilities version marker: <!-- VERSION_START -->v0.1.13<!-- VERSION_END -->
+      - Dedicated bullet: - **Current Release Version:** v0.1.19
     """
     if not README_MD.exists():
         return
@@ -113,10 +113,10 @@ def update_readme_md(new_ver: str):
             content
         )
 
-        # 2. Update Core Capabilities HTML marker comments
+        # 2. Update dedicated Current Release Version bullet in Core Capabilities
         content = re.sub(
-            r'<!-- VERSION_START -->.*?<!-- VERSION_END -->',
-            f'<!-- VERSION_START -->{v_tag}<!-- VERSION_END -->',
+            r'(-\s+\*\*Current Release Version:\*\*\s*)(?:<!--\s*VERSION_START\s*-->)?v?[0-9]+\.[0-9]+\.[0-9]+(?:<!--\s*VERSION_END\s*-->)?',
+            rf'\g<1>{v_tag}',
             content
         )
 
@@ -183,7 +183,7 @@ def main():
         print("  - VERSION")
         print("  - package.json")
         print("  - backend/server.py")
-        print("  - README.md (top badge & Core Capabilities marker)")
+        print("  - README.md (top badge & Current Release Version bullet)")
 
 if __name__ == "__main__":
     main()
