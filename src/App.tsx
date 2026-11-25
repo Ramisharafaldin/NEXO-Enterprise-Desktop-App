@@ -87,6 +87,12 @@ export const App: React.FC = () => {
     }
   }, []);
 
+  const settingsRef = useRef(settings);
+  useEffect(() => {
+    settingsRef.current = settings;
+  }, [settings]);
+  const recalculateItemRef = useRef<any>(null);
+
   // Update HTML direction and language attribute
   useEffect(() => {
     document.documentElement.dir = language === 'ar' ? 'rtl' : 'ltr';
@@ -121,9 +127,10 @@ export const App: React.FC = () => {
 
       const ws = await api.getWorkspace(projectId, effectiveLoc);
       const pd = (ws as any)?.project_defaults;
-      let effectiveHorizon = settings.forecast_horizon_periods;
-      let effectiveMaxDate = settings.max_actual_date;
-      let effectiveMinDate = settings.min_actual_date;
+      const curSettings = settingsRef.current;
+      let effectiveHorizon = curSettings.forecast_horizon_periods;
+      let effectiveMaxDate = curSettings.max_actual_date;
+      let effectiveMinDate = curSettings.min_actual_date;
       if (pd) {
         if (pd.approvalHorizon) effectiveHorizon = normalizeHorizonKey(pd.approvalHorizon);
         if (pd.maxActualDate) {
@@ -141,8 +148,9 @@ export const App: React.FC = () => {
         const analyzable = ws.items.filter(isAnalyzableItem);
         const baseItems = analyzable.length > 0 ? analyzable : ws.items;
         const dateBounds = { minActualDate: effectiveMinDate, maxActualDate: effectiveMaxDate };
-        const recalculated = baseItems.map(i => shouldAutoRecalculateItem(i)
-          ? recalculateItem(i, undefined, undefined, effectiveHorizon, pd?.seasonalityPeriod, dateBounds)
+        const recalcFn = recalculateItemRef.current;
+        const recalculated = baseItems.map(i => (recalcFn && shouldAutoRecalculateItem(i))
+          ? recalcFn(i, undefined, undefined, effectiveHorizon, pd?.seasonalityPeriod, dateBounds)
           : i
         );
         setItems(recalculated);
@@ -245,7 +253,7 @@ export const App: React.FC = () => {
   }, []);
 
   const handleSelectItem = useCallback((item: InventoryItem) => {
-    setSelectedItemId(item.id);
+    setSelectedItemId(prevId => prevId === item.id ? prevId : item.id);
     setItems(prev => {
       const idx = prev.findIndex(x => x.id === item.id);
       if (idx === -1) return [...prev, item];
@@ -259,7 +267,7 @@ export const App: React.FC = () => {
   const selectedItem = items.find(i => i.id === selectedItemId) || items[0];
 
   // Recalculate item forecast and replenishment using the verified math engine
-  const recalculateItem = (
+  const recalculateItem = useCallback((
     item: InventoryItem,
     newModel?: ModelType,
     newStrategy?: ReplenishmentStrategy,
@@ -440,10 +448,12 @@ export const App: React.FC = () => {
       ...updatedBase,
       ...metrics,
     };
-  };
+  }, [settings?.forecast_horizon_periods, settings?.max_actual_date, settings?.min_actual_date, language]);
+
+  recalculateItemRef.current = recalculateItem;
 
   // Model selection change handler
-  const handleModelChange = (itemId: string, newModel: ModelType) => {
+  const handleModelChange = useCallback((itemId: string, newModel: ModelType) => {
     setItems(prev => prev.map(item => {
       if (item.id === itemId) {
         const updated = recalculateItem(item, newModel);
@@ -461,7 +471,7 @@ export const App: React.FC = () => {
       }
       return item;
     }));
-  };
+  }, [activeProjectId, recalculateItem]);
 
   // Global replenishment strategy change handler
   const handleStrategyChange = (newStrategy: ReplenishmentStrategy) => {
@@ -480,7 +490,7 @@ export const App: React.FC = () => {
   };
 
   // Inline forecast override change handler
-  const handleOverrideChange = (itemId: string, periodDate: string, val: number | undefined) => {
+  const handleOverrideChange = useCallback((itemId: string, periodDate: string, val: number | undefined) => {
     setItems(prev => prev.map(item => {
       if (item.id !== itemId) return item;
       const updatedPeriods = item.periods.map(p =>
@@ -516,7 +526,7 @@ export const App: React.FC = () => {
 
       return updatedItem;
     }));
-  };
+  }, [activeProjectId, settings?.forecast_horizon_periods, settings?.period_granularity]);
 
   // Order Approval Handler
   const handleApproveOrder = (itemId: string) => {
@@ -534,7 +544,7 @@ export const App: React.FC = () => {
   };
 
   // Handler for item parameter changes (lead time, service level, strategy, batch/moq, etc.)
-  const handleItemParameterChange = (itemId: string, updates: Partial<InventoryItem>) => {
+  const handleItemParameterChange = useCallback((itemId: string, updates: Partial<InventoryItem>) => {
     setItems(prev => prev.map(item => {
       if (item.id === itemId) {
         const mergedItem: InventoryItem = { ...item, ...updates };
@@ -554,7 +564,7 @@ export const App: React.FC = () => {
       }
       return item;
     }));
-  };
+  }, [activeProjectId, recalculateItem]);
 
   // Recalculate all items trigger
   const handleRecalculateAll = () => {
@@ -772,10 +782,10 @@ export const App: React.FC = () => {
     });
   };
 
-  const handleApprovalHorizonChange = (horizon: string) => {
+  const handleApprovalHorizonChange = useCallback((horizon: string) => {
     const norm = normalizeHorizonKey(horizon);
-    setSettings(prev => ({ ...prev, forecast_horizon_periods: norm }));
-  };
+    setSettings(prev => prev.forecast_horizon_periods === norm ? prev : { ...prev, forecast_horizon_periods: norm });
+  }, []);
 
   const handleProjectDefaultsLoaded = useCallback((defaults: any) => {
     if (defaults) {

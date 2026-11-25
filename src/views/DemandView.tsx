@@ -193,6 +193,25 @@ export const DemandView: React.FC<DemandViewProps> = ({
   useEffect(() => {
     recalculateItemRef.current = recalculateItem;
   }, [recalculateItem]);
+  const onProjectDefaultsLoadedRef = useRef(onProjectDefaultsLoaded);
+  useEffect(() => {
+    onProjectDefaultsLoadedRef.current = onProjectDefaultsLoaded;
+  }, [onProjectDefaultsLoaded]);
+  const onApprovalHorizonChangeRef = useRef(onApprovalHorizonChange);
+  useEffect(() => {
+    onApprovalHorizonChangeRef.current = onApprovalHorizonChange;
+  }, [onApprovalHorizonChange]);
+  const approvalHorizonRef = useRef(approvalHorizon);
+  approvalHorizonRef.current = approvalHorizon;
+  const seasonalityPatternRef = useRef(seasonalityPattern);
+  seasonalityPatternRef.current = seasonalityPattern;
+  const projectDefaultsRef = useRef(projectDefaults);
+  projectDefaultsRef.current = projectDefaults;
+  const settingsHorizonRef = useRef(settings?.forecast_horizon_periods);
+  settingsHorizonRef.current = settings?.forecast_horizon_periods;
+  const prevQueryKeyRef = useRef<{ search: string; category: string | null }>({ search: '', category: null });
+  const skipNextAutoSelectRef = useRef(false);
+  const fetchRequestIdRef = useRef(0);
 
   const showToast = useCallback((msg: string) => {
     if (toastTimeoutRef.current) clearTimeout(toastTimeoutRef.current);
@@ -206,36 +225,42 @@ export const DemandView: React.FC<DemandViewProps> = ({
   // Synchronize state when selected item, projectDefaults, or settings change
   useEffect(() => {
     if (selectedItem) {
-      setCurrentNote(selectedItem.notes || '');
+      setCurrentNote(prev => prev === (selectedItem.notes || '') ? prev : (selectedItem.notes || ''));
 
       // Single Source of Truth: Approval Horizon is strictly project-wide and immutable across SKU clicks
       const projectHorizon = projectDefaults.approvalHorizon 
         ? normalizeHorizonKey(projectDefaults.approvalHorizon) 
         : (settings?.forecast_horizon_periods ? normalizeHorizonKey(settings.forecast_horizon_periods) : '12m');
-      setApprovalHorizon(projectHorizon);
+      setApprovalHorizon(prev => prev === projectHorizon ? prev : projectHorizon);
 
       // Forecast approach (Single Source of Truth: projectDefaults, falling back to item)
       const fAppr = projectDefaults.forecastApproach || selectedItem.forecastApproach || 'item';
-      setForecastApproach(fAppr === 'category' ? 'category' : 'item');
+      const nextApproach = fAppr === 'category' ? 'category' : 'item';
+      setForecastApproach(prev => prev === nextApproach ? prev : nextApproach);
 
       // Seasonality pattern (Single Source of Truth: projectDefaults, falling back to item)
       const sPat = projectDefaults.seasonalityPattern 
         || selectedItem.seasonalityPattern 
         || '12';
-      setSeasonalityPattern(sPat);
-      setModalSeasonality(sPat);
+      setSeasonalityPattern(prev => prev === sPat ? prev : sPat);
+      setModalSeasonality(prev => prev === sPat ? prev : sPat);
 
       // Model status (strictly scoped to this selected item only)
-      setModelStatus(selectedItem.modelStatus === 'inactive' ? 'inactive' : 'active');
+      const nextStatus = selectedItem.modelStatus === 'inactive' ? 'inactive' : 'active';
+      setModelStatus(prev => prev === nextStatus ? prev : nextStatus);
 
       // Model type & horizon modal defaults
-      setModalModel(selectedItem.modelType || 'auto');
-      setModalHorizon(projectHorizon);
+      const nextModel = selectedItem.modelType || 'auto';
+      setModalModel(prev => prev === nextModel ? prev : nextModel);
+      setModalHorizon(prev => prev === projectHorizon ? prev : projectHorizon);
 
       // Outlier / sales flags
-      setIgnoreZeroSales(!selectedItem.notes?.includes('ignoreZeroSales:false'));
-      setIgnoreStockoutDays(!selectedItem.notes?.includes('ignoreStockoutDays:false'));
-      setUseHolidays(!selectedItem.notes?.includes('useHolidays:false'));
+      const nextIgnoreZero = !selectedItem.notes?.includes('ignoreZeroSales:false');
+      const nextIgnoreStockout = !selectedItem.notes?.includes('ignoreStockoutDays:false');
+      const nextUseHolidays = !selectedItem.notes?.includes('useHolidays:false');
+      setIgnoreZeroSales(prev => prev === nextIgnoreZero ? prev : nextIgnoreZero);
+      setIgnoreStockoutDays(prev => prev === nextIgnoreStockout ? prev : nextIgnoreStockout);
+      setUseHolidays(prev => prev === nextUseHolidays ? prev : nextUseHolidays);
     }
   }, [selectedItem?.id, selectedItem?.modelStatus, settings?.forecast_horizon_periods, projectDefaults]);
 
@@ -369,6 +394,7 @@ export const DemandView: React.FC<DemandViewProps> = ({
   const [totalCount, setTotalCount] = useState(0);
   const [totalPages, setTotalPages] = useState(1);
   const [paginatedItems, setPaginatedItems] = useState<InventoryItem[]>([]);
+  const [hasFetchedServerPage, setHasFetchedServerPage] = useState(false);
   const [debouncedSearch, setDebouncedSearch] = useState('');
   const [selectedCategory, setSelectedCategory] = useState<string | null>(null);
   const [treeSummaryMap, setTreeSummaryMap] = useState<Record<string, number>>({});
@@ -381,14 +407,19 @@ export const DemandView: React.FC<DemandViewProps> = ({
     setDebouncedSearch('');
     setSelectedCategory(null);
     setPaginatedItems([]);
+    setHasFetchedServerPage(false);
     setTotalCount(0);
+    prevQueryKeyRef.current = { search: '', category: null };
   }, [projectId, selectedLocation]);
 
   // Debounce tree search input (300ms)
   useEffect(() => {
     const handler = setTimeout(() => {
-      setDebouncedSearch(treeSearch);
-      setPage(1);
+      setDebouncedSearch(prev => {
+        if (prev === treeSearch) return prev;
+        setPage(1);
+        return treeSearch;
+      });
     }, 300);
     return () => clearTimeout(handler);
   }, [treeSearch]);
@@ -413,6 +444,7 @@ export const DemandView: React.FC<DemandViewProps> = ({
 
   const fetchDemandPage = useCallback(async () => {
     if (!projectId) return;
+    const reqId = ++fetchRequestIdRef.current;
     setIsLoadingList(true);
     try {
       const res = await api.getDemand({
@@ -425,10 +457,12 @@ export const DemandView: React.FC<DemandViewProps> = ({
         includeDormant: false
       });
 
-      let effectiveHorizon = approvalHorizon || '12m';
-      let effectiveSeasonality: string | number = seasonalityPattern || '12';
-      let effectiveMinDate = projectDefaults.minActualDate;
-      let effectiveMaxDate = projectDefaults.maxActualDate;
+      if (reqId !== fetchRequestIdRef.current) return;
+
+      let effectiveHorizon = approvalHorizonRef.current || '12m';
+      let effectiveSeasonality: string | number = seasonalityPatternRef.current || '12';
+      let effectiveMinDate = projectDefaultsRef.current.minActualDate;
+      let effectiveMaxDate = projectDefaultsRef.current.maxActualDate;
 
       if (res.project_defaults) {
         const normHorizon = res.project_defaults.approvalHorizon
@@ -447,11 +481,23 @@ export const DemandView: React.FC<DemandViewProps> = ({
           minActualDate: effectiveMinDate,
           maxActualDate: effectiveMaxDate,
         };
-        setProjectDefaults(pd);
-        setApprovalHorizon(normHorizon);
-        onProjectDefaultsLoaded?.(pd);
-        if (onApprovalHorizonChange && settings?.forecast_horizon_periods !== normHorizon) {
-          onApprovalHorizonChange(normHorizon);
+        setProjectDefaults(prev => {
+          if (
+            prev.seasonalityPattern === pd.seasonalityPattern &&
+            prev.seasonalityPeriod === pd.seasonalityPeriod &&
+            prev.forecastApproach === pd.forecastApproach &&
+            prev.approvalHorizon === pd.approvalHorizon &&
+            prev.minActualDate === pd.minActualDate &&
+            prev.maxActualDate === pd.maxActualDate
+          ) {
+            return prev;
+          }
+          return pd;
+        });
+        setApprovalHorizon(prev => prev === normHorizon ? prev : normHorizon);
+        onProjectDefaultsLoadedRef.current?.(pd);
+        if (onApprovalHorizonChangeRef.current && settingsHorizonRef.current !== normHorizon) {
+          onApprovalHorizonChangeRef.current(normHorizon);
         }
       }
 
@@ -465,26 +511,44 @@ export const DemandView: React.FC<DemandViewProps> = ({
         return i;
       });
       setPaginatedItems(hydrated);
+      setHasFetchedServerPage(true);
       setTotalCount(res.total_count ?? hydrated.length);
       setTotalPages(res.total_pages ?? Math.max(1, Math.ceil((res.total_count || 1) / pageSize)));
+
+      const queryChanged =
+        prevQueryKeyRef.current.search !== debouncedSearch ||
+        prevQueryKeyRef.current.category !== selectedCategory;
+      prevQueryKeyRef.current = { search: debouncedSearch, category: selectedCategory };
+
+      const skipAutoSelect = skipNextAutoSelectRef.current;
+      skipNextAutoSelectRef.current = false;
+
       const currentSelected = rawSelectedItemRef.current;
       if (hydrated.length > 0) {
         const found = currentSelected ? hydrated.find(x => x.id === currentSelected.id) : undefined;
         if (found) {
-          selectItemFn(recalcFn && shouldAutoRecalculateItem(found)
-            ? recalcFn(found, undefined, undefined, effectiveHorizon, effectiveSeasonality, dateBounds)
-            : found
-          );
-        } else if (!currentSelected || debouncedSearch.trim().length > 0 || Boolean(selectedCategory)) {
+          const needsSync =
+            !currentSelected ||
+            currentSelected.periods?.length !== found.periods?.length ||
+            currentSelected.modelType !== found.modelType ||
+            currentSelected.seasonalityPattern !== found.seasonalityPattern ||
+            currentSelected.approvalHorizon !== found.approvalHorizon ||
+            currentSelected.accuracy !== found.accuracy;
+          if (needsSync) {
+            selectItemFn(found);
+          }
+        } else if (!skipAutoSelect && (!currentSelected || (queryChanged && (debouncedSearch.trim().length > 0 || Boolean(selectedCategory))))) {
           selectItemFn(hydrated[0]);
         }
       }
     } catch (err) {
       console.warn('Failed to load server-side demand page:', err);
     } finally {
-      setIsLoadingList(false);
+      if (reqId === fetchRequestIdRef.current) {
+        setIsLoadingList(false);
+      }
     }
-  }, [projectId, page, pageSize, debouncedSearch, selectedCategory, selectedLocation, onProjectDefaultsLoaded, approvalHorizon, seasonalityPattern, projectDefaults.minActualDate, projectDefaults.maxActualDate, onApprovalHorizonChange, settings?.forecast_horizon_periods]);
+  }, [projectId, page, pageSize, debouncedSearch, selectedCategory, selectedLocation]);
 
   useEffect(() => {
     fetchDemandPage();
@@ -492,11 +556,11 @@ export const DemandView: React.FC<DemandViewProps> = ({
 
   // Strict Defensive Exclusion: Filter out any dormant SKUs (onHand <= 0 && totalSales <= 0)
   const activeItems = useMemo(() => {
-    if (paginatedItems.length > 0) return paginatedItems;
+    if (hasFetchedServerPage || paginatedItems.length > 0) return paginatedItems;
     const base = (items || []).filter(isAnalyzableItem);
     if (!selectedLocation || selectedLocation === 'ALL') return base.slice(0, 50);
     return base.filter(i => (i.location || '').toLowerCase().trim() === selectedLocation.toLowerCase().trim()).slice(0, 50);
-  }, [paginatedItems, items, selectedLocation]);
+  }, [hasFetchedServerPage, paginatedItems, items, selectedLocation]);
 
   // Categories group
   const categories = useMemo(() => {
@@ -709,7 +773,17 @@ export const DemandView: React.FC<DemandViewProps> = ({
   const handleSaveEdit = (date: string) => {
     if (!selectedItem) return;
     const val = tempOverride.trim() === '' ? undefined : parseFloat(tempOverride);
-    onOverrideChange(selectedItem.id, date, isNaN(val as any) ? undefined : val);
+    const cleanVal = isNaN(val as any) ? undefined : val;
+    onOverrideChange(selectedItem.id, date, cleanVal);
+    setPaginatedItems(prev => prev.map(item => {
+      if (item.id !== selectedItem.id) return item;
+      return {
+        ...item,
+        periods: item.periods.map(p =>
+          p.date === date ? { ...p, override: cleanVal, forecast: cleanVal !== undefined ? cleanVal : p.forecast } : p
+        )
+      };
+    }));
     setEditingPeriod(null);
   };
 
@@ -1756,7 +1830,13 @@ export const DemandView: React.FC<DemandViewProps> = ({
                 <label className="block text-slate-500 mb-1 font-medium">{t.demand.inspector.modelType}</label>
                 <select
                   value={selectedItem.modelType}
-                  onChange={e => onModelChange(selectedItem.id, e.target.value as ModelType)}
+                  onChange={e => {
+                    const nextModel = e.target.value as ModelType;
+                    onModelChange(selectedItem.id, nextModel);
+                    setPaginatedItems(prev => prev.map(item =>
+                      item.id === selectedItem.id ? { ...item, modelType: nextModel } : item
+                    ));
+                  }}
                   className="w-full px-2 py-1 border border-[#CBD5E1] rounded text-[11px] focus:outline-none focus:border-[#2196F3] bg-white font-semibold text-slate-800 cursor-pointer"
                 >
                   <option value="auto">{isAr ? 'اختيار آلي للنموذج (Auto)' : 'Auto Model Selection'}</option>
@@ -2004,7 +2084,11 @@ export const DemandView: React.FC<DemandViewProps> = ({
                           ? recalculateItem(item, undefined, undefined, effHorizon, effSeason, dateBounds)
                           : item;
                         onSelectItem(recalculated);
-                        if (item.category) setSelectedCategory(item.category);
+                        if (item.category && item.category !== selectedCategory) {
+                          skipNextAutoSelectRef.current = true;
+                          setSelectedCategory(item.category);
+                          setPage(1);
+                        }
                         setIsQuickSearchOpen(false);
                       }}
                       className="flex items-center justify-between p-2 rounded-lg border border-slate-100 hover:border-blue-300 hover:bg-blue-50/50 cursor-pointer transition"
